@@ -1,0 +1,309 @@
+import os
+import time
+import requests
+import re
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import csv
+
+SAVE_DIR = os.path.abspath("saved_pdfs")
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+class FocusedSelfStudysScraper:
+    def __init__(self):
+        self.driver = None
+        self.base_url = "https://www.selfstudys.com"
+        self.setup_driver()
+        
+    def setup_driver(self):
+        """Setup Chrome driver"""
+        chrome_options = Options()
+        chrome_options.add_argument("--start-maximized")
+        chrome_options.add_argument("--disable-notifications")
+        chrome_options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        
+        prefs = {
+            "download.default_directory": SAVE_DIR,
+            "download.prompt_for_download": False,
+        }
+        chrome_options.add_experimental_option("prefs", prefs)
+        
+        self.driver = webdriver.Chrome(options=chrome_options)
+    
+    def get_pdf_viewer_urls(self):
+        """Get direct PDF viewer URLs (the ones we know work)"""
+        # These are the actual PDF viewer URLs that contain the /advance-pdf-viewer/ pattern
+        pdf_viewer_urls = [
+            # NCERT Solutions - Class 11 Mathematics
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/11th/class-11-mathematics/chapter-1-sets/20361",
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/11th/class-11-mathematics/chapter-2-relations-and-functions/20362",
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/11th/class-11-mathematics/chapter-3-trigonometric-functions/20363",
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/11th/class-11-mathematics/chapter-4-principle-of-mathematical-induction/20364",
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/11th/class-11-mathematics/chapter-5-complex-numbers-and-quadratic-equations/20365",
+            
+            # NCERT Solutions - Class 12 Mathematics
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/12th/class-12-mathematics/chapter-1-relations-and-functions/20451",
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/12th/class-12-mathematics/chapter-2-inverse-trigonometric-functions/20452",
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/12th/class-12-mathematics/chapter-3-matrices/20453",
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/12th/class-12-mathematics/chapter-4-determinants/20454",
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/12th/class-12-mathematics/chapter-5-continuity-and-differentiability/20455",
+            
+            # NCERT Solutions - Class 11 Physics
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/11th/class-11-physics/chapter-1-units-and-measurements/20371",
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/11th/class-11-physics/chapter-2-motion-in-a-straight-line/20372",
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/11th/class-11-physics/chapter-3-motion-in-a-plane/20373",
+            
+            # NCERT Solutions - Class 12 Physics
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/12th/class-12-physics/chapter-1-electric-charges-and-fields/20461",
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/12th/class-12-physics/chapter-2-electrostatic-potential-and-capacitance/20462",
+            "https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/12th/class-12-physics/chapter-3-current-electricity/20463",
+            
+            # Competitive Exams - JEE
+            "https://www.selfstudys.com/advance-pdf-viewer/competitive-exams/jee/mathematics/chapter-1-sets-relations-and-functions/20501",
+            "https://www.selfstudys.com/advance-pdf-viewer/competitive-exams/jee/physics/chapter-1-units-and-measurements/20551",
+            
+            # Competitive Exams - NEET
+            "https://www.selfstudys.com/advance-pdf-viewer/competitive-exams/neet/physics/chapter-1-units-and-measurements/20601",
+            "https://www.selfstudys.com/advance-pdf-viewer/competitive-exams/neet/chemistry/chapter-1-some-basic-concepts-of-chemistry/20651",
+            
+            # State Boards - Rajasthan Board
+            "https://www.selfstudys.com/advance-pdf-viewer/state-board/english/rbse/class-12-mathematics/chapter-1-relations-and-functions/20701",
+            
+            # State Boards - UP Board
+            "https://www.selfstudys.com/advance-pdf-viewer/state-board/english/upboard/class-12-mathematics/chapter-1-relations-and-functions/20751",
+        ]
+        return pdf_viewer_urls
+    
+    def generate_more_urls(self, base_patterns):
+        """Generate more URLs based on patterns"""
+        generated_urls = []
+        
+        # NCERT Class 11 Mathematics (Chapters 1-16)
+        for chapter in range(1, 17):
+            url = f"https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/11th/class-11-mathematics/chapter-{chapter}/2036{chapter}"
+            generated_urls.append(url)
+        
+        # NCERT Class 12 Mathematics (Chapters 1-13)
+        for chapter in range(1, 14):
+            url = f"https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/12th/class-12-mathematics/chapter-{chapter}/2045{chapter}"
+            generated_urls.append(url)
+        
+        # NCERT Class 11 Physics (Chapters 1-15)
+        for chapter in range(1, 16):
+            url = f"https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/11th/class-11-physics/chapter-{chapter}/2037{chapter}"
+            generated_urls.append(url)
+        
+        # NCERT Class 12 Physics (Chapters 1-15)
+        for chapter in range(1, 16):
+            url = f"https://www.selfstudys.com/advance-pdf-viewer/ncert-solution/english/12th/class-12-physics/chapter-{chapter}/2046{chapter}"
+            generated_urls.append(url)
+        
+        return generated_urls
+    
+    def download_pdf(self, viewer_url):
+        """Download PDF from a viewer page"""
+        try:
+            print(f"\n[PROCESSING] {viewer_url}")
+            
+            self.driver.get(viewer_url)
+            time.sleep(3)
+            
+            # Setup network monitoring
+            self.driver.execute_script("""
+                window.pdfUrls = [];
+                const originalOpen = XMLHttpRequest.prototype.open;
+                XMLHttpRequest.prototype.open = function() {
+                    this.addEventListener('load', function() {
+                        if (this.responseURL && this.responseURL.includes('/sitepdfs/')) {
+                            window.pdfUrls.push(this.responseURL);
+                        }
+                    });
+                    originalOpen.apply(this, arguments);
+                };
+                
+                // Also monitor fetch requests
+                const originalFetch = window.fetch;
+                window.fetch = function() {
+                    return originalFetch.apply(this, arguments).then(response => {
+                        if (response.url && response.url.includes('/sitepdfs/')) {
+                            window.pdfUrls.push(response.url);
+                        }
+                        return response;
+                    });
+                };
+            """)
+            
+            # Try to click download button if available
+            try:
+                download_btn = WebDriverWait(self.driver, 5).until(
+                    EC.element_to_be_clickable((By.XPATH, 
+                        "//button[contains(text(), 'Download')] | " +
+                        "//a[contains(text(), 'Download')] | " +
+                        "//button[contains(@class, 'download')] | " +
+                        "//a[contains(@class, 'download')]"))
+                )
+                self.driver.execute_script("arguments[0].click();", download_btn)
+                print("[INFO] Clicked download button")
+                time.sleep(2)
+            except:
+                print("[INFO] No download button found")
+            
+            # Wait for PDF to load
+            time.sleep(5)
+            
+            # Try to get PDF URL from network requests
+            pdf_urls = self.driver.execute_script("return window.pdfUrls || [];")
+            
+            if pdf_urls:
+                pdf_url = pdf_urls[0]
+                print(f"[FOUND] PDF URL: {pdf_url}")
+                
+                filename = self.generate_filename(viewer_url)
+                success = self.download_pdf_file(pdf_url, filename)
+                
+                if success:
+                    self.save_metadata(viewer_url, pdf_url, filename)
+                    return True
+            
+            # Fallback: Try to find PDF URL in page source
+            page_source = self.driver.page_source
+            pdf_patterns = [
+                r'https?://[^\s"<>]*?sitepdfs/[^\s"<>]*',
+                r'/sitepdfs/[^\s"<>]*'
+            ]
+            
+            for pattern in pdf_patterns:
+                matches = re.findall(pattern, page_source)
+                for match in matches:
+                    pdf_url = match if match.startswith('http') else f"{self.base_url}{match}"
+                    
+                    filename = self.generate_filename(viewer_url)
+                    success = self.download_pdf_file(pdf_url, filename)
+                    
+                    if success:
+                        self.save_metadata(viewer_url, pdf_url, filename)
+                        return True
+            
+            print("[WARNING] Could not find PDF URL")
+            return False
+            
+        except Exception as e:
+            print(f"[ERROR] Download failed: {e}")
+            return False
+    
+    def download_pdf_file(self, pdf_url, filename):
+        """Download the actual PDF file"""
+        try:
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': self.base_url,
+                'Accept': 'application/pdf, */*'
+            }
+            
+            print(f"[DOWNLOADING] {filename}")
+            response = requests.get(pdf_url, headers=headers, stream=True, timeout=30)
+            
+            if response.status_code == 200:
+                filepath = os.path.join(SAVE_DIR, filename)
+                with open(filepath, 'wb') as f:
+                    for chunk in response.iter_content(chunk_size=8192):
+                        f.write(chunk)
+                
+                print(f"[SUCCESS] Downloaded: {filename}")
+                return True
+            else:
+                print(f"[ERROR] HTTP {response.status_code}")
+                return False
+                
+        except Exception as e:
+            print(f"[ERROR] Download failed: {e}")
+            return False
+    
+    def generate_filename(self, url):
+        """Generate a clean filename from URL"""
+        # Extract meaningful parts
+        parts = url.split('/')
+        meaningful_parts = []
+        
+        for part in parts:
+            if (part and part not in ['https:', '', 'www.selfstudys.com', 'advance-pdf-viewer'] and 
+                not part.isdigit() or len(part) > 4):
+                # Clean the part
+                clean_part = re.sub(r'[^a-zA-Z0-9]', '_', part)
+                meaningful_parts.append(clean_part)
+        
+        # Use last 3-4 meaningful parts
+        if len(meaningful_parts) > 4:
+            filename = "_".join(meaningful_parts[-4:])
+        else:
+            filename = "_".join(meaningful_parts)
+        
+        if not filename:
+            filename = f"document_{int(time.time())}"
+        
+        return filename[:60] + '.pdf'
+    
+    def save_metadata(self, viewer_url, pdf_url, filename):
+        """Save download metadata to CSV"""
+        csv_file = os.path.join(SAVE_DIR, 'downloads_metadata.csv')
+        file_exists = os.path.isfile(csv_file)
+        
+        with open(csv_file, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            if not file_exists:
+                writer.writerow(['Timestamp', 'Viewer_URL', 'PDF_URL', 'Filename'])
+            
+            writer.writerow([
+                time.strftime('%Y-%m-%d %H:%M:%S'),
+                viewer_url,
+                pdf_url,
+                filename
+            ])
+    
+    def run_scraping(self, max_urls=10):
+        """Run the scraping process"""
+        print("🚀 Starting Focused SelfStudys PDF Scraping...")
+        print("=" * 60)
+        
+        # Get the PDF viewer URLs we know work
+        pdf_urls = self.get_pdf_viewer_urls()
+        
+        # Generate more URLs based on patterns
+        additional_urls = self.generate_more_urls([])
+        pdf_urls.extend(additional_urls)
+        
+        print(f"Total URLs to try: {len(pdf_urls)}")
+        
+        successful_downloads = 0
+        failed_downloads = 0
+        
+        # Process each URL
+        for i, url in enumerate(pdf_urls[:max_urls]):
+            print(f"\n[{i+1}/{min(len(pdf_urls), max_urls)}]")
+            
+            if self.download_pdf(url):
+                successful_downloads += 1
+            else:
+                failed_downloads += 1
+            
+            # Be polite - wait between requests
+            time.sleep(2)
+        
+        # Print summary
+        print("\n" + "=" * 60)
+        print("📊 SCRAPING SUMMARY")
+        print(f"Total URLs processed: {min(len(pdf_urls), max_urls)}")
+        print(f"Successful downloads: {successful_downloads}")
+        print(f"Failed downloads: {failed_downloads}")
+        print(f"Success rate: {(successful_downloads/min(len(pdf_urls), max_urls)*100):.1f}%")
+        print(f"Files saved in: {SAVE_DIR}")
+        
+        self.driver.quit()
+
+# Run the scraper
+if __name__ == "__main__":
+    scraper = FocusedSelfStudysScraper()
+    scraper.run_scraping(max_urls=20)  # Start with 20 URLs to test
