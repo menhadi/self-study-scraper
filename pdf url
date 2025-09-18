@@ -1,0 +1,648 @@
+import os
+import time
+import requests
+import re
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+import csv
+from urllib.parse import urlparse, unquote
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import signal
+import sys
+import psutil
+import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import random
+import json
+from typing import Set, List, Dict
+import hashlib
+
+# Set the save directory to E:\pdf
+SAVE_DIR = r"E:\pdf"
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(SAVE_DIR, 'metadata_scraper.log')),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class MetadataSelfStudysScraper:
+    def __init__(self, max_workers=15):
+        self.driver_pool = []
+        self.base_url = "https://www.selfstudys.com"
+        self.metadata_file = os.path.join(SAVE_DIR, 'metadata_collection.csv')  # Moved this line up
+        self.processed_urls = self.load_processed_urls()
+        self.interrupted = False
+        self.start_time = time.time()
+        self.session = self.create_session()
+        self.max_workers = max_workers
+        
+        # Setup signal handler for graceful interruption
+        signal.signal(signal.SIGINT, self.signal_handler)
+    
+    def create_session(self):
+        """Create a requests session with retry logic"""
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=2,
+            backoff_factor=0.3,
+            status_forcelist=[429, 500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(max_retries=retry_strategy, pool_connections=100, pool_maxsize=100)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+    
+    def signal_handler(self, sig, frame):
+        """Handle Ctrl+C interruption gracefully"""
+        logger.info("\n\n⚠️  Interruption received. Saving progress and shutting down gracefully...")
+        self.interrupted = True
+        self.save_progress()
+        self.cleanup_drivers()
+        sys.exit(0)
+    
+    def setup_driver(self):
+        """Setup Chrome driver with optimized settings for speed"""
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--disable-gpu")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-extensions")
+        
+        # Performance optimizations for speed
+        chrome_options.add_argument("--disable-background-timer-throttling")
+        chrome_options.add_argument("--disable-backgrounding-occluded-windows")
+        chrome_options.add_argument("--disable-renderer-backgrounding")
+        chrome_options.add_argument("--aggressive-cache-discard")
+        chrome_options.add_argument("--disable-cache")
+        chrome_options.add_argument("--disable-application-cache")
+        chrome_options.add_argument("--disk-cache-size=0")
+        chrome_options.add_argument("--media-cache-size=0")
+        
+        # Timeout optimizations
+        chrome_options.add_argument("--page-load-strategy=eager")
+        
+        prefs = {
+            "profile.default_content_setting_values.notifications": 2,
+            "profile.managed_default_content_settings.images": 2,
+            "profile.managed_default_content_settings.javascript": 1,
+            "profile.managed_default_content_settings.css": 2,
+        }
+        chrome_options.add_experimental_option("prefs", prefs)
+        
+        return webdriver.Chrome(options=chrome_options)
+    
+    def get_driver(self):
+        """Get a driver from the pool or create a new one"""
+        if self.driver_pool:
+            return self.driver_pool.pop()
+        return self.setup_driver()
+    
+    def return_driver(self, driver):
+        """Return a driver to the pool"""
+        try:
+            driver.get("about:blank")
+            self.driver_pool.append(driver)
+        except:
+            try:
+                driver.quit()
+            except:
+                pass
+    
+    def cleanup_drivers(self):
+        """Clean up all drivers"""
+        for driver in self.driver_pool:
+            try:
+                driver.quit()
+            except:
+                pass
+        self.driver_pool = []
+    
+    def load_processed_urls(self) -> Set[str]:
+        """Load already processed URLs from metadata file"""
+        processed_urls = set()
+        
+        if os.path.exists(self.metadata_file):
+            try:
+                with open(self.metadata_file, 'r', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    next(reader, None)  # Skip header
+                    for row in reader:
+                        if len(row) > 0:
+                            processed_urls.add(row[0])  # URL is in the first column
+            except Exception as e:
+                logger.error(f"Error reading metadata file: {e}")
+        
+        logger.info(f"Loaded {len(processed_urls)} processed URLs from metadata")
+        return processed_urls
+    
+    def hash_url(self, url: str) -> str:
+        """Create a hash of the URL for efficient storage and comparison"""
+        return hashlib.md5(url.encode()).hexdigest()
+    
+    def read_urls_from_file(self, filename: str) -> List[str]:
+        """Read URLs from external text file efficiently"""
+        urls = []
+        try:
+            with open(filename, 'r', encoding='utf-8') as f:
+                for line in f:
+                    url = line.strip()
+                    if url and not url.startswith('#'):
+                        urls.append(url)
+            logger.info(f"Loaded {len(urls)} URLs from {filename}")
+        except FileNotFoundError:
+            logger.error(f"Error: File {filename} not found.")
+        
+        return urls
+    
+    def load_checkpoint(self) -> int:
+        """Load checkpoint data to resume from where we left off"""
+        checkpoint_file = os.path.join(SAVE_DIR, 'metadata_checkpoint.txt')
+        last_processed_index = 0
+        
+        if os.path.exists(checkpoint_file):
+            try:
+                with open(checkpoint_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if line.startswith('Last_Processed_Index:'):
+                            last_processed_index = int(line.split(':')[1].strip())
+                            break
+                logger.info(f"Resuming from index {last_processed_index}")
+            except:
+                logger.info("Could not read checkpoint file, starting from beginning")
+        
+        return last_processed_index
+    
+    def save_checkpoint(self, index: int, total_urls: int):
+        """Save current progress to checkpoint file"""
+        checkpoint_file = os.path.join(SAVE_DIR, 'metadata_checkpoint.txt')
+        try:
+            with open(checkpoint_file, 'w', encoding='utf-8') as f:
+                f.write(f"Last_Run: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Last_Processed_Index: {index}\n")
+                f.write(f"Total_URLs: {total_urls}\n")
+                f.write(f"Processed_URLs: {len(self.processed_urls)}\n")
+                elapsed = time.time() - self.start_time
+                urls_per_hour = (index / elapsed) * 3600 if elapsed > 0 else 0
+                f.write(f"URLs_Per_Hour: {urls_per_hour:.2f}\n")
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {e}")
+    
+    def filter_new_urls(self, urls: List[str], start_index: int = 0) -> List[str]:
+        """Filter out URLs that have already been processed"""
+        # Only process URLs from the start_index onward
+        urls_to_process = urls[start_index:]
+        
+        # Filter out URLs that have been processed
+        new_urls = [url for url in urls_to_process if url not in self.processed_urls]
+        
+        logger.info(f"Starting from index {start_index}, {len(new_urls)} new URLs to process")
+        return new_urls, start_index
+    
+    def is_sitepdfs_url(self, url: str) -> bool:
+        """Check if the URL is a sitepdfs URL"""
+        return '/sitepdfs/' in url
+    
+    def is_direct_pdf_url(self, url: str) -> bool:
+        """Check if the URL points directly to a PDF file"""
+        return url.lower().endswith('.pdf') or '.pdf?' in url.lower() or self.is_sitepdfs_url(url)
+    
+    def clean_filename(self, filename: str) -> str:
+        """Clean filename to remove problematic characters"""
+        # Remove problematic characters but allow dots, hyphens, and spaces
+        clean_name = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        clean_name = clean_name.strip()
+        
+        # Replace multiple spaces/underscores with single underscore
+        clean_name = re.sub(r'[\s_]+', '_', clean_name)
+        
+        # Limit length
+        return clean_name[:150]
+    
+    def fast_extract_document_title(self, driver) -> str:
+        """Fast document title extraction using JavaScript"""
+        try:
+            # Use JavaScript to quickly extract potential titles
+            title_script = """
+            // Look for the most likely title elements first
+            var title = '';
+            var selectors = [
+                'h1', 'h2', 'h3',
+                '[class*="title"]',
+                '[class*="heading"]', 
+                '.document-title',
+                '.pdf-title',
+                '.book-title',
+                'title'
+            ];
+            
+            for (var i = 0; i < selectors.length; i++) {
+                var elements = document.querySelectorAll(selectors[i]);
+                for (var j = 0; j < elements.length; j++) {
+                    var text = elements[j].textContent.trim();
+                    if (text && text.length > 10 && !text.toLowerCase().includes('download')) {
+                        return text;
+                    }
+                }
+            }
+            
+            // Fallback: look for meta tags
+            var metaTags = document.querySelectorAll('meta[property="og:title"], meta[name="title"]');
+            for (var k = 0; k < metaTags.length; k++) {
+                var content = metaTags[k].getAttribute('content');
+                if (content && content.length > 10) {
+                    return content;
+                }
+            }
+            
+            return '';
+            """
+            
+            title = driver.execute_script(title_script)
+            if title:
+                return title
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting document title: {e}")
+            return None
+    
+    def fast_extract_pdf_url(self, driver) -> str:
+        """Fast PDF URL extraction using JavaScript"""
+        try:
+            # Use JavaScript to quickly extract PDF URLs
+            pdf_script = """
+            // Look for PDF URLs in various places
+            var pdfUrl = '';
+            
+            // 1. Check for data attributes
+            var elementsWithData = document.querySelectorAll('[data-pdf-url], [data-url], [data-src]');
+            for (var i = 0; i < elementsWithData.length; i++) {
+                var url = elementsWithData[i].getAttribute('data-pdf-url') || 
+                         elementsWithData[i].getAttribute('data-url') || 
+                         elementsWithData[i].getAttribute('data-src');
+                if (url && url.toLowerCase().includes('.pdf')) {
+                    return url;
+                }
+            }
+            
+            // 2. Check for iframes
+            var iframes = document.querySelectorAll('iframe');
+            for (var j = 0; j < iframes.length; j++) {
+                var src = iframes[j].getAttribute('src');
+                if (src && src.toLowerCase().includes('.pdf')) {
+                    return src;
+                }
+            }
+            
+            // 3. Check for script tags with PDF URLs
+            var scripts = document.querySelectorAll('script');
+            for (var k = 0; k < scripts.length; k++) {
+                var scriptContent = scripts[k].textContent;
+                if (scriptContent) {
+                    var pdfMatch = scriptContent.match(/https?:\\/\\/[^"']*\\.pdf[^"']*/i);
+                    if (pdfMatch) {
+                        return pdfMatch[0];
+                    }
+                    
+                    var sitepdfsMatch = scriptContent.match(/https?:\\/\\/[^"']*\\/sitepdfs\\/[^"']*/i);
+                    if (sitepdfsMatch) {
+                        return sitepdfsMatch[0];
+                    }
+                }
+            }
+            
+            // 4. Check for embed tags
+            var embeds = document.querySelectorAll('embed');
+            for (var l = 0; l < embeds.length; l++) {
+                var src = embeds[l].getAttribute('src');
+                if (src && src.toLowerCase().includes('.pdf')) {
+                    return src;
+                }
+            }
+            
+            // 5. Check for object tags
+            var objects = document.querySelectorAll('object');
+            for (var m = 0; m < objects.length; m++) {
+                var data = objects[m].getAttribute('data');
+                if (data && data.toLowerCase().includes('.pdf')) {
+                    return data;
+                }
+            }
+            
+            return '';
+            """
+            
+            pdf_url = driver.execute_script(pdf_script)
+            if pdf_url:
+                # Ensure the URL is absolute
+                if pdf_url.startswith('//'):
+                    pdf_url = 'https:' + pdf_url
+                elif pdf_url.startswith('/'):
+                    pdf_url = 'https://www.selfstudys.com' + pdf_url
+                
+                return pdf_url
+            
+            return None
+            
+        except Exception as e:
+            logger.error(f"Error extracting PDF URL: {e}")
+            return None
+    
+    def generate_filename_from_title(self, title: str, url: str) -> str:
+        """Generate filename from document title with improved character handling"""
+        if title:
+            # Clean the title for filename use - allow dots, hyphens, and spaces
+            clean_title = re.sub(r'[<>:"/\\|?*]', '_', title)
+            clean_title = clean_title.strip()
+            
+            # Replace multiple spaces with single space
+            clean_title = re.sub(r'\s+', ' ', clean_title)
+            
+            # Limit length and ensure it ends with .pdf
+            filename = clean_title[:150] + '.pdf'
+            return filename
+        else:
+            # Fallback to URL-based filename if title not found
+            return self.generate_filename_from_url(url)
+    
+    def generate_filename_from_url(self, url: str) -> str:
+        """Generate filename from URL as fallback with improved character handling"""
+        # For direct PDF URLs, extract filename from URL
+        if self.is_direct_pdf_url(url):
+            parsed_url = urlparse(url)
+            path_segments = [p for p in parsed_url.path.split('/') if p]
+            
+            if path_segments:
+                filename = unquote(path_segments[-1])
+                if not filename.lower().endswith('.pdf'):
+                    filename += '.pdf'
+                return self.clean_filename(filename)
+        
+        # For regular URLs, use the previous logic
+        parsed = urlparse(url)
+        path_parts = [p for p in parsed.path.split('/') if p and p != 'advance-pdf-viewer']
+        
+        # Use the last 2-3 parts to create the filename
+        if len(path_parts) >= 2:
+            filename = "_".join(path_parts[-2:])
+        else:
+            filename = path_parts[-1] if path_parts else "document"
+        
+        # Clean the filename - allow dots, hyphens, and spaces
+        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+        filename = filename.strip('_')
+        
+        # Replace multiple underscores with single underscore
+        filename = re.sub(r'_+', '_', filename)
+        
+        # Ensure the filename ends with .pdf
+        if not filename.endswith('.pdf'):
+            filename += '.pdf'
+        
+        # Limit filename length
+        return self.clean_filename(filename)
+    
+    def collect_metadata(self, viewer_url: str) -> bool:
+        """Collect metadata for a URL without downloading the PDF"""
+        # Check if this is a direct PDF URL or sitepdfs URL
+        if self.is_direct_pdf_url(viewer_url):
+            logger.info(f"Direct PDF URL detected: {viewer_url}")
+            filename = self.generate_filename_from_url(viewer_url)
+            self.save_metadata(viewer_url, viewer_url, filename, "direct_pdf")
+            self.processed_urls.add(viewer_url)
+            return True
+        
+        driver = None
+        try:
+            # Get a driver from the pool
+            driver = self.get_driver()
+            
+            # Set a short page load timeout
+            driver.set_page_load_timeout(15)
+            
+            try:
+                driver.get(viewer_url)
+                # Wait briefly for essential elements
+                WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.TAG_NAME, "body"))
+                )
+            except:
+                # Page load timeout, but we might still have the source
+                pass
+            
+            # Check if this is actually a direct PDF page that loaded in the browser
+            current_url = driver.current_url
+            if self.is_direct_pdf_url(current_url):
+                logger.info(f"Page redirected to direct PDF: {current_url}")
+                filename = self.generate_filename_from_url(current_url)
+                self.save_metadata(viewer_url, current_url, filename, "redirected_pdf")
+                self.processed_urls.add(viewer_url)
+                self.return_driver(driver)
+                return True
+            
+            # Fast title extraction
+            document_title = self.fast_extract_document_title(driver)
+            
+            # Fast PDF URL extraction
+            pdf_url = self.fast_extract_pdf_url(driver)
+            
+            if pdf_url:
+                # Generate filename from document title or URL
+                filename = self.generate_filename_from_title(document_title, viewer_url)
+                
+                self.save_metadata(viewer_url, pdf_url, filename, "extracted_pdf")
+                self.processed_urls.add(viewer_url)
+                self.return_driver(driver)
+                return True
+            else:
+                logger.warning(f"Could not find PDF URL for: {viewer_url}")
+                # Try to find download buttons or links
+                try:
+                    download_buttons = driver.find_elements(By.XPATH, "//a[contains(translate(., 'DOWNLOAD', 'download'), 'download')] | //button[contains(translate(., 'DOWNLOAD', 'download'), 'download')]")
+                    if download_buttons:
+                        logger.info(f"Found {len(download_buttons)} download buttons/links")
+                        # Just record that we found buttons but don't click them
+                        filename = self.generate_filename_from_url(viewer_url)
+                        self.save_metadata(viewer_url, "unknown", filename, "has_download_buttons")
+                        self.processed_urls.add(viewer_url)
+                        self.return_driver(driver)
+                        return True
+                except Exception as e:
+                    logger.error(f"Error finding download buttons: {e}")
+            
+            # If we couldn't find any PDF URL, still record the metadata
+            filename = self.generate_filename_from_url(viewer_url)
+            self.save_metadata(viewer_url, "unknown", filename, "no_pdf_found")
+            self.processed_urls.add(viewer_url)
+            self.return_driver(driver)
+            return True
+            
+        except Exception as e:
+            logger.error(f"Metadata collection failed for {viewer_url}: {e}")
+            if driver:
+                try:
+                    driver.quit()
+                except:
+                    pass
+            
+            # Even if failed, record the URL to avoid reprocessing
+            filename = self.generate_filename_from_url(viewer_url)
+            self.save_metadata(viewer_url, "error", filename, f"error: {str(e)}")
+            self.processed_urls.add(viewer_url)
+            return False
+    
+    def save_metadata(self, viewer_url: str, pdf_url: str, filename: str, status: str):
+        """Save download metadata to CSV efficiently"""
+        file_exists = os.path.isfile(self.metadata_file)
+        
+        try:
+            with open(self.metadata_file, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(['Viewer_URL', 'PDF_URL', 'Filename', 'Status', 'Timestamp'])
+                
+                writer.writerow([
+                    viewer_url,
+                    pdf_url,
+                    filename,
+                    status,
+                    time.strftime('%Y-%m-%d %H:%M:%S')
+                ])
+        except Exception as e:
+            logger.error(f"Error saving metadata: {e}")
+    
+    def process_url_batch(self, urls_batch: List[str], batch_num: int, total_batches: int):
+        """Process a batch of URLs"""
+        successful = 0
+        failed = 0
+        
+        for i, url in enumerate(urls_batch):
+            if self.interrupted:
+                break
+                
+            if i % 50 == 0:  # Reduced logging frequency
+                logger.info(f"Batch {batch_num}/{total_batches}: Processed {i}/{len(urls_batch)} URLs")
+            
+            if self.collect_metadata(url):
+                successful += 1
+            else:
+                failed += 1
+            
+            # Add a very small random delay to avoid detection
+            time.sleep(random.uniform(0.05, 0.15))
+        
+        return successful, failed
+    
+    def save_progress(self):
+        """Save progress to a checkpoint file"""
+        checkpoint_file = os.path.join(SAVE_DIR, 'metadata_checkpoint.txt')
+        try:
+            with open(checkpoint_file, 'w', encoding='utf-8') as f:
+                f.write(f"Last_Run: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Processed_URLs: {len(self.processed_urls)}\n")
+        except Exception as e:
+            logger.error(f"Error saving progress: {e}")
+    
+    def run_metadata_collection(self, url_file: str, batch_size: int = 500):
+        """Run the metadata collection process with parallel processing"""
+        logger.info("🚀 Starting SelfStudys Metadata Collection (No Downloads)...")
+        logger.info("=" * 60)
+        logger.info(f"Metadata will be saved to: {self.metadata_file}")
+        logger.info(f"Max workers: {self.max_workers}")
+        logger.info("=" * 60)
+        
+        # Read URLs from file
+        all_urls = self.read_urls_from_file(url_file)
+        
+        if not all_urls:
+            logger.info("No URLs to process. Exiting.")
+            return
+        
+        # Load checkpoint to resume from where we left off
+        start_index = self.load_checkpoint()
+        
+        # Filter out already processed URLs
+        new_urls, current_index = self.filter_new_urls(all_urls, start_index)
+        
+        if not new_urls:
+            logger.info("All URLs have already been processed. Exiting.")
+            return
+        
+        logger.info(f"URLs to process: {len(new_urls)}")
+        
+        # Create batches
+        batches = [new_urls[i:i+batch_size] for i in range(0, len(new_urls), batch_size)]
+        total_batches = len(batches)
+        
+        total_successful = 0
+        total_failed = 0
+        
+        # Process batches in parallel
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            futures = []
+            
+            for batch_num, batch in enumerate(batches):
+                if self.interrupted:
+                    break
+                    
+                logger.info(f"Submitting batch {batch_num+1}/{total_batches} ({len(batch)} URLs)")
+                futures.append(executor.submit(self.process_url_batch, batch, batch_num+1, total_batches))
+            
+            # Process results as they complete
+            for future in as_completed(futures):
+                if self.interrupted:
+                    break
+                    
+                successful, failed = future.result()
+                total_successful += successful
+                total_failed += failed
+                
+                # Save progress
+                current_index = start_index + total_successful + total_failed
+                self.save_checkpoint(current_index, len(all_urls))
+        
+        # Print final summary
+        logger.info("=" * 60)
+        logger.info("📊 METADATA COLLECTION SUMMARY")
+        logger.info(f"Total URLs processed: {len(new_urls)}")
+        logger.info(f"Successful metadata collection: {total_successful}")
+        logger.info(f"Failed metadata collection: {total_failed}")
+        if len(new_urls) > 0:
+            success_rate = (total_successful/len(new_urls))*100
+            logger.info(f"Success rate: {success_rate:.1f}%")
+        
+        # Calculate and display performance metrics
+        elapsed = time.time() - self.start_time
+        hours = elapsed / 3600
+        if hours > 0:
+            urls_per_hour = total_successful / hours
+            logger.info(f"Processing speed: {urls_per_hour:.2f} URLs/hour")
+        
+        logger.info(f"Metadata saved in: {self.metadata_file}")
+        
+        # Clean up drivers
+        self.cleanup_drivers()
+
+# Run the metadata collector
+if __name__ == "__main__":
+    # Configuration - adjust based on your system capabilities
+    URL_FILE = "selfstudys_show_pdf_urls.txt"
+    MAX_WORKERS = 10  # Increased worker count for parallel processing
+    BATCH_SIZE = 200  # URLs per batch
+    
+    scraper = MetadataSelfStudysScraper(max_workers=MAX_WORKERS)
+    scraper.run_metadata_collection(url_file=URL_FILE, batch_size=BATCH_SIZE)
