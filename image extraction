@@ -1,0 +1,79 @@
+import fitz  # PyMuPDF
+import cv2
+import numpy as np
+import os
+
+def extract_diagrams(pdf_path, output_folder, zoom=4):
+    """
+    Extracts likely diagram regions from a PDF by finding non-text (non-white) areas.
+    
+    Args:
+        pdf_path (str): Path to the PDF file.
+        output_folder (str): Folder to save extracted diagram images.
+        zoom (int): Zoom factor for higher resolution rendering. Default=4.
+    """
+    # Open the PDF document
+    doc = fitz.open(pdf_path)
+    
+    # Create output folder if it doesn't exist
+    if not os.path.exists(output_folder):
+        os.makedirs(output_folder)
+    
+    # Process each page in the document
+    for page_num in range(len(doc)):
+        page = doc.load_page(page_num)
+        
+        # Calculate a high-resolution matrix for rendering
+        mat = fitz.Matrix(zoom, zoom)  # High resolution: zoom factor of 4
+        pix = page.get_pixmap(matrix=mat)
+        img_data = pix.tobytes("png")
+        
+        # Convert Pixmap data to an OpenCV image (numpy array)
+        nparr = np.frombuffer(img_data, np.uint8)
+        img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Apply a binary threshold to create a mask for non-white areas
+        # Adjust the threshold value (255 is white) if needed. Here, we threshold everything that is not very white.
+        _, thresh = cv2.threshold(gray, 230, 255, cv2.THRESH_BINARY_INV)
+        
+        # Find contours of the non-white regions
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Filter contours by area to avoid small noise (adjust area_threshold as needed)
+        diagram_count = 0
+        for contour in contours:
+            area = cv2.contourArea(contour)
+            # Set a minimum area threshold to ignore small specks/noise
+            if area > 5000:  # This value might need adjustment based on your PDF's resolution
+                diagram_count += 1
+                # Get the bounding rectangle for the contour
+                x, y, w, h = cv2.boundingRect(contour)
+                
+                # Add a small margin around the crop (optional)
+                margin = 10
+                x = max(0, x - margin)
+                y = max(0, y - margin)
+                w = min(img.shape[1] - x, w + 2 * margin)
+                h = min(img.shape[0] - y, h + 2 * margin)
+                
+                # Crop the original image using the bounding rectangle
+                crop = img[y:y+h, x:x+w]
+                
+                # Save the cropped image
+                output_filename = os.path.join(output_folder, f"page_{page_num+1}_diagram_{diagram_count}.png")
+                cv2.imwrite(output_filename, crop)
+                print(f"Saved: {output_filename} (Area: {area})")
+        
+        print(f"Page {page_num+1}: Found {diagram_count} potential diagrams.")
+
+    doc.close()
+    print("Diagram extraction complete.")
+
+# --- Main Execution ---
+if __name__ == "__main__":
+    pdf_filename = "Document_Pdf_25.pdf"  # Replace with your PDF's name
+    output_dir = "extracted_diagrams"     # Folder where images will be saved
+
+    extract_diagrams(pdf_filename, output_dir)
