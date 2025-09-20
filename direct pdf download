@@ -14,8 +14,8 @@ import random
 import pandas as pd
 from typing import List, Tuple
 
-# Set the save directory to C:\Users\menha\Downloads\urls\test for maximum speed
-SAVE_DIR = r"C:\Users\menha\Downloads\urls\test"
+# Set the save directory to D:\Self Study\Pdf for maximum speed
+SAVE_DIR = r"D:\Self Study\Pdf"
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # Configure logging
