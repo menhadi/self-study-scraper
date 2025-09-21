@@ -1,0 +1,489 @@
+import os
+import time
+import requests
+import re
+import csv
+from urllib.parse import urlparse, unquote
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import signal
+import sys
+import logging
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import random
+import pandas as pd
+from typing import List, Tuple
+import glob
+import math
+
+# Set the save directory to D:\Self Study\Pdf for maximum speed
+SAVE_DIR = r"D:\Self Study\Pdf"
+EXCEL_FILES_DIR = r"D:\Self Study"  # Directory containing Excel files
+os.makedirs(SAVE_DIR, exist_ok=True)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler(os.path.join(SAVE_DIR, 'scraper.log')),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+class UltraFastPDFDownloader:
+    def __init__(self, max_workers=100):
+        self.downloaded_urls = self.load_downloaded_urls()
+        self.interrupted = False
+        self.start_time = time.time()
+        self.session = self.create_session()
+        self.max_workers = max_workers
+        self.excel_files = self.get_excel_files()
+        self.failed_urls = set()
+        
+        # Setup signal handler
+        signal.signal(signal.SIGINT, self.signal_handler)
+    
+    def get_excel_files(self):
+        """Get all Excel files in the specified directory"""
+        excel_files = glob.glob(os.path.join(EXCEL_FILES_DIR, "*.xlsx")) + glob.glob(os.path.join(EXCEL_FILES_DIR, "*.xls"))
+        excel_files.sort()  # Sort alphabetically
+        logger.info(f"Found {len(excel_files)} Excel files to process")
+        return excel_files
+    
+    def create_session(self):
+        """Create optimized requests session with better retry strategy"""
+        session = requests.Session()
+        
+        # More robust retry strategy
+        retry_strategy = Retry(
+            total=3,  # Increased retries
+            backoff_factor=0.5,  # Increased backoff
+            status_forcelist=[429, 500, 502, 503, 504],
+            allowed_methods=["GET", "HEAD"],
+            respect_retry_after_header=True
+        )
+        
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy, 
+            pool_connections=200,  # Reduced from 500 to avoid connection issues
+            pool_maxsize=200
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        
+        # Set default headers
+        session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/pdf, */*',
+            'Accept-Encoding': 'gzip, deflate',
+            'Connection': 'keep-alive'
+        })
+        
+        return session
+    
+    def signal_handler(self, sig, frame):
+        """Handle interruption"""
+        logger.info("\nInterruption received. Shutting down gracefully...")
+        self.interrupted = True
+        self.save_failed_urls()  # Save failed URLs before exiting
+        sys.exit(0)
+    
+    def load_downloaded_urls(self):
+        """Load downloaded URLs quickly"""
+        downloaded_urls = set()
+        csv_file = os.path.join(SAVE_DIR, 'downloads_metadata.csv')
+        
+        if os.path.exists(csv_file):
+            try:
+                # Use pandas for faster CSV reading
+                df = pd.read_csv(csv_file)
+                if 'Viewer_URL' in df.columns:
+                    downloaded_urls = set(df['Viewer_URL'].dropna().astype(str).values)
+                logger.info(f"Loaded {len(downloaded_urls)} previously downloaded URLs")
+            except Exception as e:
+                logger.error(f"Error reading metadata: {e}")
+        
+        return downloaded_urls
+    
+    def read_urls_from_excel(self, excel_file: str) -> List[Tuple[str, str, str]]:
+        """Read URLs and filenames from Excel file"""
+        urls_data = []
+        try:
+            # Read Excel file with optimized parameters
+            df = pd.read_excel(excel_file)
+            
+            # Check if required columns exist
+            required_columns = ['Viewer_URL', 'PDF_URL', 'Filename']
+            for col in required_columns:
+                if col not in df.columns:
+                    logger.error(f"Column '{col}' not found in Excel file: {excel_file}")
+                    return []
+            
+            # Process each row efficiently
+            for _, row in df.iterrows():
+                viewer_url = str(row['Viewer_URL']).strip()
+                pdf_url = str(row['PDF_URL']).strip()
+                filename = str(row['Filename']).strip()
+                
+                if viewer_url and viewer_url != 'nan' and pdf_url and pdf_url != 'nan':
+                    # Ensure filename has .pdf extension
+                    if filename and filename != 'nan':
+                        if not filename.lower().endswith('.pdf'):
+                            filename += '.pdf'
+                        # Clean filename
+                        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+                        filename = filename.strip()[:150]
+                    else:
+                        # Generate filename from URL if not provided
+                        filename = self.generate_filename_from_url(pdf_url)
+                    
+                    urls_data.append((viewer_url, pdf_url, filename))
+            
+            logger.info(f"Loaded {len(urls_data)} URLs from Excel file: {os.path.basename(excel_file)}")
+            
+        except Exception as e:
+            logger.error(f"Error reading Excel file {excel_file}: {e}")
+        
+        return urls_data
+    
+    def load_checkpoint(self):
+        """Load checkpoint"""
+        checkpoint_file = os.path.join(SAVE_DIR, 'checkpoint.txt')
+        checkpoint_data = {
+            'last_processed_index': 0,
+            'current_file_index': 0
+        }
+        
+        if os.path.exists(checkpoint_file):
+            try:
+                with open(checkpoint_file, 'r', encoding='utf-8') as f:
+                    for line in f:
+                        if line.startswith('Last_Processed_Index:'):
+                            checkpoint_data['last_processed_index'] = int(line.split(':')[1].strip())
+                        elif line.startswith('Current_File_Index:'):
+                            checkpoint_data['current_file_index'] = int(line.split(':')[1].strip())
+                logger.info(f"Resuming from file index {checkpoint_data['current_file_index']}, URL index {checkpoint_data['last_processed_index']}")
+            except:
+                logger.info("Starting from beginning")
+        
+        return checkpoint_data
+    
+    def save_checkpoint(self, url_index: int, file_index: int, total_urls: int):
+        """Save checkpoint"""
+        checkpoint_file = os.path.join(SAVE_DIR, 'checkpoint.txt')
+        try:
+            with open(checkpoint_file, 'w', encoding='utf-8') as f:
+                f.write(f"Last_Run: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
+                f.write(f"Last_Processed_Index: {url_index}\n")
+                f.write(f"Current_File_Index: {file_index}\n")
+                f.write(f"Total_URLs: {total_urls}\n")
+                f.write(f"Downloaded_URLs: {len(self.downloaded_urls)}\n")
+                elapsed = time.time() - self.start_time
+                urls_per_hour = (url_index / elapsed) * 3600 if elapsed > 0 else 0
+                f.write(f"URLs_Per_Hour: {urls_per_hour:.2f}\n")
+                f.write(f"Current_File: {os.path.basename(self.excel_files[file_index]) if file_index < len(self.excel_files) else 'COMPLETED'}\n")
+        except Exception as e:
+            logger.error(f"Error saving checkpoint: {e}")
+    
+    def save_failed_urls(self):
+        """Save failed URLs for later retry"""
+        failed_file = os.path.join(SAVE_DIR, 'failed_urls.txt')
+        try:
+            with open(failed_file, 'w', encoding='utf-8') as f:
+                for url in self.failed_urls:
+                    f.write(f"{url}\n")
+            logger.info(f"Saved {len(self.failed_urls)} failed URLs to {failed_file}")
+        except Exception as e:
+            logger.error(f"Error saving failed URLs: {e}")
+    
+    def filter_new_urls(self, urls_data, start_index=0):
+        """Filter out already downloaded URLs"""
+        urls_to_process = urls_data[start_index:]
+        new_urls = [(viewer_url, pdf_url, filename) for viewer_url, pdf_url, filename in urls_to_process 
+                   if viewer_url not in self.downloaded_urls]
+        logger.info(f"Starting from index {start_index}, {len(new_urls)} URLs to download")
+        return new_urls, start_index
+    
+    def generate_filename_from_url(self, url):
+        """Generate filename from URL as fallback"""
+        parsed = urlparse(url)
+        path_parts = [p for p in parsed.path.split('/') if p]
+        
+        if path_parts:
+            filename = "_".join(path_parts[-2:]) if len(path_parts) >= 2 else path_parts[-1]
+        else:
+            filename = "document"
+        
+        filename = re.sub(r'[^a-zA-Z0-9_-]', '_', filename)
+        filename = filename.strip('_')
+        
+        if not filename.endswith('.pdf'):
+            filename += '.pdf'
+        
+        return filename[:100]
+    
+    def download_pdf_with_retry(self, pdf_url: str, filename: str, max_retries: int = 3) -> bool:
+        """Download PDF with custom retry logic"""
+        for attempt in range(max_retries):
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Referer': 'https://www.selfstudys.com/',
+                }
+                
+                # Exponential backoff: wait longer between retries
+                if attempt > 0:
+                    wait_time = math.pow(2, attempt)  # 2, 4, 8 seconds
+                    logger.info(f"Retry {attempt}/{max_retries} for {pdf_url} after {wait_time} seconds")
+                    time.sleep(wait_time)
+                
+                # Slightly longer timeout with streaming for better performance
+                response = self.session.get(pdf_url, headers=headers, timeout=5, stream=True)
+                
+                if response.status_code == 200:
+                    filepath = os.path.join(SAVE_DIR, filename)
+                    
+                    # Stream content to file
+                    with open(filepath, 'wb') as f:
+                        for chunk in response.iter_content(chunk_size=8192):
+                            if chunk:
+                                f.write(chunk)
+                    
+                    # Quick validation
+                    if os.path.getsize(filepath) > 1024:
+                        with open(filepath, 'rb') as f:
+                            header = f.read(5)
+                            if header.startswith(b'%PDF'):
+                                return True
+                            else:
+                                os.remove(filepath)
+                                return False
+                return False
+                
+            except requests.exceptions.Timeout:
+                logger.warning(f"Timeout downloading (attempt {attempt+1}/{max_retries}): {pdf_url}")
+                if attempt == max_retries - 1:
+                    return False
+            except requests.exceptions.ConnectionError:
+                logger.warning(f"Connection error (attempt {attempt+1}/{max_retries}): {pdf_url}")
+                if attempt == max_retries - 1:
+                    return False
+            except Exception as e:
+                logger.error(f"Error downloading {pdf_url} (attempt {attempt+1}/{max_retries}): {e}")
+                if attempt == max_retries - 1:
+                    return False
+        
+        return False
+    
+    def save_metadata(self, viewer_url: str, pdf_url: str, filename: str):
+        """Save download metadata to CSV"""
+        csv_file = os.path.join(SAVE_DIR, 'downloads_metadata.csv')
+        file_exists = os.path.isfile(csv_file)
+        
+        try:
+            with open(csv_file, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                if not file_exists:
+                    writer.writerow(['Timestamp', 'Viewer_URL', 'PDF_URL', 'Filename'])
+                
+                writer.writerow([
+                    time.strftime('%Y-%m-%d %H:%M:%S'),
+                    viewer_url,
+                    pdf_url,
+                    filename
+                ])
+        except Exception as e:
+            logger.error(f"Error saving metadata: {e}")
+    
+    def process_single_url(self, viewer_url: str, pdf_url: str, filename: str) -> bool:
+        """Process a single URL with error handling"""
+        if viewer_url in self.downloaded_urls:
+            return True
+        
+        # Check if file already exists to avoid re-downloading
+        filepath = os.path.join(SAVE_DIR, filename)
+        if os.path.exists(filepath) and os.path.getsize(filepath) > 1024:
+            # Validate it's a PDF
+            try:
+                with open(filepath, 'rb') as f:
+                    header = f.read(5)
+                    if header.startswith(b'%PDF'):
+                        self.downloaded_urls.add(viewer_url)
+                        self.save_metadata(viewer_url, pdf_url, filename)
+                        return True
+            except:
+                pass
+        
+        # Download the file with retry logic
+        success = self.download_pdf_with_retry(pdf_url, filename, max_retries=3)
+        
+        if success:
+            self.downloaded_urls.add(viewer_url)
+            self.save_metadata(viewer_url, pdf_url, filename)
+        else:
+            self.failed_urls.add(viewer_url)
+            
+        return success
+    
+    def process_url_batch(self, urls_batch, batch_num, total_batches):
+        """Process a batch of URLs with controlled parallelism"""
+        successful = 0
+        failed = 0
+        
+        # Use ThreadPoolExecutor with controlled parallelism
+        with ThreadPoolExecutor(max_workers=min(50, len(urls_batch))) as batch_executor:
+            futures = {}
+            
+            for i, (viewer_url, pdf_url, filename) in enumerate(urls_batch):
+                if self.interrupted:
+                    break
+                
+                future = batch_executor.submit(self.process_single_url, viewer_url, pdf_url, filename)
+                futures[future] = (viewer_url, pdf_url, filename)
+            
+            # Process results as they complete
+            for future in as_completed(futures):
+                if self.interrupted:
+                    break
+                
+                viewer_url, pdf_url, filename = futures[future]
+                try:
+                    if future.result():
+                        successful += 1
+                    else:
+                        failed += 1
+                except Exception as e:
+                    logger.error(f"Error processing {viewer_url}: {e}")
+                    failed += 1
+                    self.failed_urls.add(viewer_url)
+                
+                # Log progress every 50 URLs
+                if (successful + failed) % 50 == 0:
+                    logger.info(f"Batch {batch_num}/{total_batches}: Processed {successful + failed}/{len(urls_batch)} URLs")
+        
+        return successful, failed
+    
+    def run_ultra_fast_download(self, batch_size: int = 2000):
+        """Run the optimized download process for all Excel files"""
+        logger.info("🚀 Starting Optimized PDF Downloader...")
+        logger.info("=" * 60)
+        logger.info(f"PDFs will be saved to: {SAVE_DIR}")
+        logger.info(f"Excel files directory: {EXCEL_FILES_DIR}")
+        logger.info(f"Found {len(self.excel_files)} Excel files to process")
+        logger.info(f"Max workers: {self.max_workers}")
+        logger.info("=" * 60)
+        
+        if not self.excel_files:
+            logger.info("No Excel files found. Exiting.")
+            return
+        
+        # Load checkpoint to resume from where we left off
+        checkpoint_data = self.load_checkpoint()
+        current_file_index = checkpoint_data['current_file_index']
+        start_index = checkpoint_data['last_processed_index']
+        
+        total_successful_all_files = 0
+        total_failed_all_files = 0
+        
+        # Process each Excel file sequentially
+        for file_index in range(current_file_index, len(self.excel_files)):
+            if self.interrupted:
+                break
+                
+            current_file = self.excel_files[file_index]
+            logger.info(f"Processing file {file_index + 1}/{len(self.excel_files)}: {os.path.basename(current_file)}")
+            
+            # Read URLs from current Excel file
+            all_urls_data = self.read_urls_from_excel(current_file)
+            
+            if not all_urls_data:
+                logger.info(f"No URLs found in {os.path.basename(current_file)}. Moving to next file.")
+                continue
+            
+            # Filter out already downloaded URLs
+            new_urls_data, current_url_index = self.filter_new_urls(all_urls_data, start_index)
+            
+            if not new_urls_data:
+                logger.info(f"All URLs in {os.path.basename(current_file)} have already been downloaded. Moving to next file.")
+                start_index = 0  # Reset for next file
+                continue
+            
+            logger.info(f"URLs to download from this file: {len(new_urls_data)}")
+            
+            # Create optimized batch sizes
+            batch_size = min(batch_size, 2000)  # Reduced batch size for better stability
+            batches = [new_urls_data[i:i+batch_size] for i in range(0, len(new_urls_data), batch_size)]
+            total_batches = len(batches)
+            
+            total_successful = 0
+            total_failed = 0
+            
+            # Process batches with controlled concurrency
+            for batch_num, batch in enumerate(batches):
+                if self.interrupted:
+                    break
+                    
+                logger.info(f"Processing batch {batch_num+1}/{total_batches} ({len(batch)} URLs)")
+                successful, failed = self.process_url_batch(batch, batch_num+1, total_batches)
+                
+                total_successful += successful
+                total_failed += failed
+                
+                # Save progress
+                current_url_index = start_index + total_successful + total_failed
+                self.save_checkpoint(current_url_index, file_index, len(all_urls_data))
+                
+                # Log batch progress
+                logger.info(f"Batch {batch_num+1}/{total_batches} completed: {successful} successful, {failed} failed")
+                
+                # Small delay between batches to avoid overwhelming the server
+                if batch_num < total_batches - 1:
+                    time.sleep(1)
+            
+            # Update totals for all files
+            total_successful_all_files += total_successful
+            total_failed_all_files += total_failed
+            
+            # Print summary for this file
+            logger.info(f"Completed file: {os.path.basename(current_file)}")
+            logger.info(f"Successful downloads: {total_successful}")
+            logger.info(f"Failed downloads: {total_failed}")
+            
+            # Reset start index for next file
+            start_index = 0
+        
+        # Print final summary
+        logger.info("=" * 60)
+        logger.info("📊 DOWNLOAD SUMMARY")
+        logger.info(f"Total Excel files processed: {len(self.excel_files)}")
+        logger.info(f"Total URLs processed: {total_successful_all_files + total_failed_all_files}")
+        logger.info(f"Successful downloads: {total_successful_all_files}")
+        logger.info(f"Failed downloads: {total_failed_all_files}")
+        logger.info(f"Failed URLs saved to: {os.path.join(SAVE_DIR, 'failed_urls.txt')}")
+        
+        if (total_successful_all_files + total_failed_all_files) > 0:
+            success_rate = (total_successful_all_files / (total_successful_all_files + total_failed_all_files)) * 100
+            logger.info(f"Success rate: {success_rate:.1f}%")
+        
+        # Calculate and display performance metrics
+        elapsed = time.time() - self.start_time
+        hours = elapsed / 3600
+        if hours > 0:
+            urls_per_hour = total_successful_all_files / hours
+            logger.info(f"Download speed: {urls_per_hour:.2f} URLs/hour")
+        
+        logger.info(f"Files saved in: {SAVE_DIR}")
+        
+        # Save failed URLs
+        self.save_failed_urls()
+
+# Run the downloader
+if __name__ == "__main__":
+    # Optimized configuration
+    MAX_WORKERS = 50  # Reduced worker count for better stability
+    BATCH_SIZE = 2000  # Smaller batches for better error handling
+    
+    downloader = UltraFastPDFDownloader(max_workers=MAX_WORKERS)
+    downloader.run_ultra_fast_download(batch_size=BATCH_SIZE)
