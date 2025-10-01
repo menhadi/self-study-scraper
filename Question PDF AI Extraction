@@ -1,0 +1,385 @@
+import os
+import base64
+import requests
+import pdfplumber
+import fitz  # PyMuPDF
+import re
+import json
+import pandas as pd
+from pathlib import Path
+import time
+import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+class DeepSeekQuestionExtractor:
+    def __init__(self, api_key=None):
+        self.api_key = api_key
+        self.pages_per_batch = 3  # Reduced for API limits
+        self.base_url = "https://api.deepseek.com/v1/chat/completions"
+        self.image_counter = 0
+        
+    def encode_image(self, image_path):
+        """Encode image to base64"""
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    
+    def call_deepseek_api(self, prompt, images=None, max_tokens=4000):
+        """Call DeepSeek API with text and optional images"""
+        if not self.api_key:
+            print("DeepSeek API key not provided. Using fallback extraction.")
+            return None
+            
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        
+        messages = [{"role": "user", "content": []}]
+        
+        # Add text prompt
+        messages[0]["content"].append({
+            "type": "text",
+            "text": prompt
+        })
+        
+        # Add images if provided
+        if images:
+            for image_path in images:
+                base64_image = self.encode_image(image_path)
+                messages[0]["content"].append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{base64_image}"
+                    }
+                })
+        
+        payload = {
+            "model": "deepseek-chat",
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.1
+        }
+        
+        try:
+            response = requests.post(self.base_url, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            print(f"DeepSeek API Error: {e}")
+            return None
+    
+    def extract_with_ai(self, text, images, page_range):
+        """Use AI to extract structured questions"""
+        prompt = f"""
+        Analyze this exam paper content from pages {page_range} and extract ALL questions with their complete information.
+
+        EXTRACTION FORMAT - Return ONLY valid JSON:
+        {{
+            "questions": [
+                {{
+                    "question_number": "1",
+                    "instruction": "any instructional text before question",
+                    "question": "main question text here",
+                    "options": {{
+                        "A": "option A text",
+                        "B": "option B text", 
+                        "C": "option C text",
+                        "D": "option D text",
+                        "E": "option E text if exists",
+                        "F": "option F text if exists"
+                    }},
+                    "correct_option": "A or B or C etc",
+                    "explanation": "any answer explanation if provided",
+                    "has_image": true/false
+                }}
+            ]
+        }}
+
+        IMPORTANT RULES:
+        1. Extract ALL questions you find
+        2. Preserve mathematical equations and chemical formulas exactly as written
+        3. If options are missing, leave them empty
+        4. For correct_option, use the letter(s) like "A", "B", "C", "AB", etc.
+        5. Include any diagrams, graphs, or images in the analysis
+        6. Separate instructions from main questions
+        7. Be thorough and don't miss any content
+
+        CONTENT TO ANALYZE:
+        {text[:15000]}  # Limit text length
+
+        Return ONLY the JSON, no other text.
+        """
+        
+        # Convert images to paths for API
+        image_paths = [img['filepath'] for img in images] if images else None
+        
+        response = self.call_deepseek_api(prompt, image_paths)
+        
+        if response:
+            try:
+                # Extract JSON from response
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                if json_match:
+                    return json.loads(json_match.group())
+            except Exception as e:
+                print(f"Error parsing AI response: {e}")
+        
+        return {"questions": []}
+    
+    def extract_images_from_pages(self, pdf_path, page_numbers, output_dir):
+        """Extract high-quality images from specific pages"""
+        images = []
+        try:
+            doc = fitz.open(pdf_path)
+            for page_num in page_numbers:
+                if page_num < len(doc):
+                    page = doc.load_page(page_num)
+                    image_list = page.get_images()
+                    
+                    for img_index, img in enumerate(image_list):
+                        xref = img[0]
+                        pix = fitz.Pixmap(doc, xref)
+                        
+                        if pix.n - pix.alpha < 4:  # Check if RGB or CMYK
+                            self.image_counter += 1
+                            img_filename = f"img_{self.image_counter:04d}.png"
+                            img_path = output_dir / img_filename
+                            
+                            # Save high-quality image
+                            pix.save(img_path)
+                            
+                            img_data = {
+                                'page': page_num + 1,
+                                'image_reference': img_filename,
+                                'filepath': img_path,
+                                'width': pix.width,
+                                'height': pix.height
+                            }
+                            images.append(img_data)
+                            print(f"    Extracted image: {img_filename} ({pix.width}x{pix.height})")
+                        
+                        pix = None  # Free memory
+            doc.close()
+        except Exception as e:
+            print(f"Error extracting images: {e}")
+        
+        return images
+    
+    def extract_text_with_pdfplumber(self, pdf_path, start_page, end_page):
+        """Extract text using pdfplumber with table support"""
+        text = ""
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_num in range(start_page, end_page):
+                    if page_num < len(pdf.pages):
+                        page = pdf.pages[page_num]
+                        
+                        # Extract text
+                        page_text = page.extract_text() or ""
+                        
+                        # Extract tables
+                        tables_text = ""
+                        for table in page.extract_tables():
+                            for row in table:
+                                tables_text += " | ".join([str(cell) if cell else "" for cell in row]) + "\n"
+                        
+                        text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
+                        if tables_text.strip():
+                            text += f"TABLES:\n{tables_text}\n"
+                            
+        except Exception as e:
+            print(f"Error extracting text: {e}")
+        
+        return text
+    
+    def fallback_extraction(self, text, page_range):
+        """Fallback extraction if AI fails"""
+        questions = []
+        
+        # Simple pattern matching as fallback
+        question_pattern = r'(\d+)[\.\)]\s*(.*?)(?=\d+[\.\)]|Answer:|$|Explanation:)'
+        matches = re.finditer(question_pattern, text, re.DOTALL | re.IGNORECASE)
+        
+        for match in matches:
+            question_number = match.group(1)
+            question_content = match.group(2)
+            
+            questions.append({
+                "question_number": question_number,
+                "instruction": "",
+                "question": question_content.strip(),
+                "options": {},
+                "correct_option": "",
+                "explanation": "",
+                "has_image": False
+            })
+        
+        return {"questions": questions}
+    
+    def process_batch(self, pdf_path, start_page, end_page, output_dir):
+        """Process a batch of pages with AI enhancement"""
+        print(f"    Processing pages {start_page + 1} to {end_page} with AI...")
+        
+        # Create images directory
+        images_dir = output_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        
+        # Extract text and images
+        text = self.extract_text_with_pdfplumber(pdf_path, start_page, end_page)
+        page_numbers = list(range(start_page, end_page))
+        images = self.extract_images_from_pages(pdf_path, page_numbers, images_dir)
+        
+        page_range = f"{start_page + 1}-{end_page}"
+        
+        # Use AI for extraction
+        if self.api_key and text.strip():
+            ai_result = self.extract_with_ai(text, images, page_range)
+            questions = ai_result.get("questions", [])
+            
+            # Add image references
+            for question in questions:
+                if question.get('has_image') and images:
+                    question['image_reference'] = images[0]['image_reference']
+                else:
+                    question['image_reference'] = ''
+        else:
+            # Fallback to basic extraction
+            questions = self.fallback_extraction(text, page_range).get("questions", [])
+        
+        print(f"    AI extracted {len(questions)} questions")
+        return questions
+    
+    def process_pdf(self, pdf_path, output_dir):
+        """Process a single PDF file"""
+        print(f"Processing: {os.path.basename(pdf_path)}")
+        
+        all_questions = []
+        
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                total_pages = len(pdf.pages)
+                print(f"  Total pages: {total_pages}")
+                
+                # Process in batches
+                for batch_start in range(0, total_pages, self.pages_per_batch):
+                    batch_end = min(batch_start + self.pages_per_batch, total_pages)
+                    
+                    batch_questions = self.process_batch(pdf_path, batch_start, batch_end, output_dir)
+                    all_questions.extend(batch_questions)
+                    
+                    # Add delay to respect API limits
+                    time.sleep(2)
+        
+        except Exception as e:
+            print(f"Error processing {pdf_path}: {e}")
+        
+        return all_questions
+    
+    def save_to_csv(self, questions, output_path):
+        """Save questions to CSV in the required format"""
+        with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            
+            # Write header
+            headers = [
+                'Question Number', 'Instruction', 'Question', 
+                'Option A', 'Option B', 'Option C', 'Option D', 'Option E', 'Option F',
+                'Correct Option', 'Answer/Explanation', 'Image Reference'
+            ]
+            writer.writerow(headers)
+            
+            # Write data
+            for q in questions:
+                options = q.get('options', {})
+                row = [
+                    q.get('question_number', ''),
+                    q.get('instruction', ''),
+                    q.get('question', ''),
+                    options.get('A', ''),
+                    options.get('B', ''),
+                    options.get('C', ''),
+                    options.get('D', ''),
+                    options.get('E', ''),
+                    options.get('F', ''),
+                    q.get('correct_option', ''),
+                    q.get('explanation', ''),
+                    q.get('image_reference', '')
+                ]
+                writer.writerow(row)
+    
+    def process_folder(self, folder_path, output_dir=None, max_workers=2):
+        """Process all PDFs in a folder with parallel processing"""
+        folder_path = Path(folder_path)
+        pdf_files = list(folder_path.glob("*.pdf"))
+        
+        if not pdf_files:
+            print(f"No PDF files found in {folder_path}")
+            return []
+        
+        print(f"Found {len(pdf_files)} PDF files to process")
+        
+        # Create output directory
+        if output_dir is None:
+            output_dir = folder_path / "ai_extracted_questions"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(exist_ok=True)
+        
+        all_questions = []
+        
+        # Process files with limited parallelism
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_pdf = {
+                executor.submit(self.process_pdf, pdf_file, output_dir): pdf_file 
+                for pdf_file in pdf_files
+            }
+            
+            for future in as_completed(future_to_pdf):
+                pdf_file = future_to_pdf[future]
+                try:
+                    questions = future.result()
+                    all_questions.extend(questions)
+                    
+                    # Save individual CSV
+                    individual_csv = output_dir / f"{pdf_file.stem}_questions.csv"
+                    self.save_to_csv(questions, individual_csv)
+                    
+                    print(f"✓ Completed: {pdf_file.name}")
+                    print(f"  - Questions extracted: {len(questions)}")
+                    print(f"  - Output: {individual_csv}")
+                    
+                except Exception as e:
+                    print(f"✗ Failed to process {pdf_file}: {e}")
+        
+        # Save combined CSV
+        if all_questions:
+            combined_csv = output_dir / "ALL_QUESTIONS_COMBINED.csv"
+            self.save_to_csv(all_questions, combined_csv)
+            print(f"\n✓ Combined CSV saved: {combined_csv}")
+            print(f"  Total questions across all files: {len(all_questions)}")
+        
+        return all_questions
+
+# Usage example
+if __name__ == "__main__":
+    # Initialize with your DeepSeek API key
+    DEEPSEEK_API_KEY = "sk-a74954e77779423297e2abbc4ef0b7cd"  # Replace with your actual API key
+    
+    extractor = DeepSeekQuestionExtractor(api_key=DEEPSEEK_API_KEY)
+    
+    # Process all PDFs in the folder
+    folder_path = r"C:\Users\menha\Downloads\test"
+    
+    print("Starting AI-enhanced PDF processing...")
+    print("=" * 60)
+    print("Using DeepSeek API for advanced document understanding")
+    print("This will handle:")
+    print("- Mathematical equations and chemical formulas")
+    print("- Complex formatting and tables") 
+    print("- Image analysis and references")
+    print("- Better question-option separation")
+    print("=" * 60)
+    
+    results = extractor.process_folder(folder_path)
+    
+    print("\n" + "=" * 60)
+    print("AI Processing completed!")
