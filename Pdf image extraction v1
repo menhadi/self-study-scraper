@@ -9,7 +9,7 @@ import csv
 import re
 import time
 
-class ContextAwareImageExtractor:
+class ImprovedContextImageExtractor:
     def __init__(self, api_key):
         self.api_key = api_key
         self.base_url = "https://api.deepseek.com/v1/chat/completions"
@@ -43,131 +43,104 @@ class ContextAwareImageExtractor:
             print(f"      API call failed: {e}")
             return None
     
-    def analyze_page_context(self, page_text, page_num):
-        """Use AI to analyze page content and identify questions/options/solutions"""
-        prompt = f"""Analyze this exam paper page content and identify all questions, options, and solutions. Return ONLY valid JSON:
-
-PAGE CONTENT:
-{page_text[:8000]}  # Limit text length
-
-IMPORTANT: Return ONLY this JSON format:
-{{
-    "page_analysis": [
-        {{
-            "question_number": "1",
-            "context_type": "question/option_a/option_b/option_c/option_d/solution/explanation",
-            "content_preview": "brief content preview",
-            "confidence": "high/medium/low"
-        }}
-    ]
-}}
-
-Rules:
-1. Identify question numbers (1, 2, 3, etc.)
-2. For options, use: option_a, option_b, option_c, option_d
-3. For solutions/answers, use: solution
-4. For explanations, use: explanation
-5. Include confidence level
-6. Return empty array if no questions found"""
-
-        response = self.call_deepseek_api(prompt)
-        
-        if response:
-            try:
-                # Extract JSON from response
-                json_match = re.search(r'\{.*\}', response, re.DOTALL)
-                if json_match:
-                    return json.loads(json_match.group())
-                else:
-                    return {"page_analysis": []}
-            except Exception as e:
-                print(f"      JSON parsing error: {e}")
-        
-        return {"page_analysis": []}
-    
-    def extract_images_with_context(self, pdf_path, output_dir, pdf_name):
-        """Extract images and assign contextual names"""
+    def extract_all_images_comprehensive(self, pdf_path, output_dir, pdf_name):
+        """Comprehensive image extraction - gets ALL images first, then assigns context"""
         images_data = []
         
         try:
             doc = fitz.open(pdf_path)
-            print(f"📄 Context-Aware Extraction: {pdf_name}")
+            print(f"📄 Comprehensive Extraction: {pdf_name}")
             print(f"📖 Total pages: {len(doc)}")
             
+            # First pass: Extract ALL images without context
+            all_images = []
             for page_num in range(len(doc)):
                 page = doc.load_page(page_num)
-                print(f"    🔍 Page {page_num+1}: Extracting with context...")
-                
-                # Step 1: Extract page text for context analysis
-                page_text = page.get_text()
-                
-                # Step 2: Analyze page context with AI
-                context_analysis = self.analyze_page_context(page_text, page_num)
-                contexts = context_analysis.get("page_analysis", [])
-                print(f"      AI identified {len(contexts)} context areas")
-                
-                # Step 3: Extract images
                 image_list = page.get_images()
-                print(f"      Found {len(image_list)} embedded images")
                 
                 for img_index, img in enumerate(image_list):
                     xref = img[0]
-                    
                     try:
                         base_image = doc.extract_image(xref)
-                        
                         if base_image and base_image.get("image"):
-                            self.image_counter += 1
-                            
-                            width = base_image.get("width", 0)
-                            height = base_image.get("height", 0)
-                            image_data = base_image["image"]
-                            size_kb = len(image_data) / 1024
-                            
-                            # Step 4: Determine image context
-                            image_bbox = self._get_image_bbox(page, xref)
-                            image_context = self._determine_image_context(image_bbox, contexts, page_text)
-                            
-                            # Step 5: Create contextual filename
-                            img_ext = base_image.get("ext", "png")
-                            contextual_filename = self._create_contextual_filename(
-                                pdf_name, page_num + 1, self.image_counter, 
-                                image_context, img_ext
-                            )
-                            img_path = output_dir / contextual_filename
-                            
-                            # Save image
-                            with open(img_path, "wb") as img_file:
-                                img_file.write(image_data)
-                            
-                            if self._is_substantial_image(width, height, size_kb):
-                                image_info = {
-                                    'pdf_name': pdf_name,
-                                    'page_number': page_num + 1,
-                                    'image_number': self.image_counter,
-                                    'filename': contextual_filename,
-                                    'filepath': str(img_path),
-                                    'width': width,
-                                    'height': height,
-                                    'size_kb': round(size_kb, 2),
-                                    'question_number': image_context.get('question_number', ''),
-                                    'context_type': image_context.get('context_type', 'unknown'),
-                                    'confidence': image_context.get('confidence', 'low'),
-                                    'type': 'embedded_image',
-                                    'image_format': base_image.get("ext", "unknown"),
-                                    'xref': xref
-                                }
-                                images_data.append(image_info)
-                                print(f"      ✅ {contextual_filename}")
-                                print(f"        Context: Q{image_context.get('question_number', '?')} {image_context.get('context_type', 'unknown')}")
-                            else:
-                                os.remove(img_path)
-                        
+                            all_images.append({
+                                'page_num': page_num,
+                                'page': page,
+                                'xref': xref,
+                                'base_image': base_image,
+                                'img_index': img_index
+                            })
                     except Exception as e:
-                        print(f"      ⚠️ Image {img_index} error: {e}")
+                        print(f"      Image extraction error: {e}")
+            
+            print(f"    🔍 Found {len(all_images)} total images in PDF")
+            
+            # Second pass: Process images with context
+            for img_data in all_images:
+                self.image_counter += 1
+                page_num = img_data['page_num']
+                page = img_data['page']
+                xref = img_data['xref']
+                base_image = img_data['base_image']
                 
-                # Add delay to avoid rate limiting
-                time.sleep(1)
+                try:
+                    width = base_image.get("width", 0)
+                    height = base_image.get("height", 0)
+                    image_data = base_image["image"]
+                    size_kb = len(image_data) / 1024
+                    img_ext = base_image.get("ext", "png")
+                    
+                    # Get page text for context analysis
+                    page_text = page.get_text()
+                    
+                    # Analyze context for this specific page
+                    context_analysis = self.analyze_page_context_detailed(page_text, page_num + 1)
+                    contexts = context_analysis.get("page_analysis", [])
+                    
+                    # Determine image context
+                    image_context = self._determine_best_context(contexts, self.image_counter)
+                    
+                    # Create contextual filename
+                    contextual_filename = self._create_contextual_filename(
+                        pdf_name, page_num + 1, self.image_counter, 
+                        image_context, img_ext
+                    )
+                    img_path = output_dir / contextual_filename
+                    
+                    # Save image
+                    with open(img_path, "wb") as img_file:
+                        img_file.write(image_data)
+                    
+                    if self._is_substantial_image(width, height, size_kb):
+                        image_info = {
+                            'pdf_name': pdf_name,
+                            'page_number': page_num + 1,
+                            'image_number': self.image_counter,
+                            'filename': contextual_filename,
+                            'filepath': str(img_path),
+                            'width': width,
+                            'height': height,
+                            'size_kb': round(size_kb, 2),
+                            'question_number': image_context.get('question_number', 'unknown'),
+                            'context_type': image_context.get('context_type', 'unknown'),
+                            'confidence': image_context.get('confidence', 'low'),
+                            'type': 'embedded_image',
+                            'image_format': base_image.get("ext", "unknown"),
+                            'xref': xref
+                        }
+                        images_data.append(image_info)
+                        print(f"      ✅ {contextual_filename}")
+                        print(f"        Context: Q{image_context.get('question_number', '?')} {image_context.get('context_type', 'unknown')} ({width}x{height})")
+                    else:
+                        os.remove(img_path)
+                        print(f"      ❌ Small image removed: {contextual_filename}")
+                
+                except Exception as e:
+                    print(f"      ⚠️ Image processing error: {e}")
+                    continue
+                
+                # Small delay between API calls
+                time.sleep(0.5)
             
             doc.close()
             
@@ -178,24 +151,82 @@ Rules:
         
         return images_data
     
-    def _get_image_bbox(self, page, xref):
-        """Get approximate bounding box of image on page"""
-        # This is a simplified approach - images don't have direct bbox in PyMuPDF
-        # We'll use a fallback: assume images are near text with similar characteristics
-        return fitz.Rect(0, 0, 100, 100)  # Default small bbox
+    def analyze_page_context_detailed(self, page_text, page_num):
+        """Use AI to analyze page content with focus on options and images"""
+        prompt = f"""Analyze this exam paper page content and identify ALL questions, options (A, B, C, D), solutions, and any images/diagrams mentioned. Return ONLY valid JSON:
+
+PAGE CONTENT:
+{page_text[:12000]}  # Increased text limit
+
+IMPORTANT: Return ONLY this JSON format:
+{{
+    "page_analysis": [
+        {{
+            "question_number": "1",
+            "context_type": "question/option_a/option_b/option_c/option_d/solution/explanation/diagram",
+            "content_preview": "brief content preview mentioning if there are images",
+            "contains_image": true/false,
+            "confidence": "high/medium/low"
+        }}
+    ]
+}}
+
+SPECIFIC RULES:
+1. Identify ALL question numbers
+2. For options, use: option_a, option_b, option_c, option_d, option_e
+3. Mark contains_image: true if the context mentions diagrams, figures, or has image indicators
+4. Include solutions and explanations
+5. Be thorough - don't miss any questions or options
+6. Return empty array only if truly no questions found"""
+
+        response = self.call_deepseek_api(prompt)
+        
+        if response:
+            try:
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                if json_match:
+                    return json.loads(json_match.group())
+                else:
+                    print(f"      No JSON found in AI response")
+                    return {"page_analysis": []}
+            except Exception as e:
+                print(f"      JSON parsing error: {e}")
+                print(f"      Response: {response[:200]}...")
+        
+        return {"page_analysis": []}
     
-    def _determine_image_context(self, image_bbox, contexts, page_text):
-        """Determine which question/option the image belongs to"""
+    def _determine_best_context(self, contexts, image_number):
+        """Determine the best context for an image"""
         if not contexts:
-            return {"question_number": "unknown", "context_type": "unknown", "confidence": "low"}
+            return {"question_number": str(image_number), "context_type": "unknown", "confidence": "low"}
         
-        # Simple heuristic: use the first high-confidence context
-        high_confidence = [ctx for ctx in contexts if ctx.get('confidence') == 'high']
-        if high_confidence:
-            return high_confidence[0]
+        # Priority: options with images > questions with images > solutions > others
+        priority_order = [
+            ('option_a', True), ('option_b', True), ('option_c', True), ('option_d', True), ('option_e', True),
+            ('option_a', False), ('option_b', False), ('option_c', False), ('option_d', False), ('option_e', False),
+            ('question', True), ('solution', True), ('explanation', True),
+            ('diagram', True), ('question', False), ('solution', False), ('explanation', False)
+        ]
         
-        # Fallback to first context
-        return contexts[0] if contexts else {"question_number": "unknown", "context_type": "unknown", "confidence": "low"}
+        for context_type, needs_image in priority_order:
+            for ctx in contexts:
+                if (ctx.get('context_type') == context_type and 
+                    ctx.get('contains_image', False) == needs_image and
+                    ctx.get('confidence') in ['high', 'medium']):
+                    return ctx
+        
+        # Fallback to first context with image mention
+        for ctx in contexts:
+            if ctx.get('contains_image', False):
+                return ctx
+        
+        # Fallback to first high-confidence context
+        for ctx in contexts:
+            if ctx.get('confidence') == 'high':
+                return ctx
+        
+        # Final fallback
+        return contexts[0] if contexts else {"question_number": str(image_number), "context_type": "unknown", "confidence": "low"}
     
     def _create_contextual_filename(self, pdf_name, page_num, img_num, context, extension):
         """Create filename with question context"""
@@ -204,7 +235,6 @@ Rules:
         
         # Clean and format the context type
         if context_type.startswith('option_'):
-            # option_a -> A, option_b -> B, etc.
             option_letter = context_type.replace('option_', '').upper()
             context_str = f"q{question_num}_{option_letter}"
         elif context_type == 'solution':
@@ -213,14 +243,16 @@ Rules:
             context_str = f"q{question_num}_explanation"
         elif context_type == 'question':
             context_str = f"q{question_num}_question"
+        elif context_type == 'diagram':
+            context_str = f"q{question_num}_diagram"
         else:
             context_str = f"q{question_num}_{context_type}"
         
         return f"{pdf_name}_p{page_num}_{context_str}_img{img_num:03d}.{extension}"
     
     def _is_substantial_image(self, width, height, size_kb, 
-                            min_width=100, min_height=100, min_size_kb=5):
-        """Check if image is substantial"""
+                            min_width=50, min_height=50, min_size_kb=2):
+        """More lenient image filtering"""
         return (width >= min_width and 
                 height >= min_height and 
                 size_kb >= min_size_kb)
@@ -263,63 +295,70 @@ Rules:
     def process_pdf(self, pdf_path, output_dir):
         """Process a single PDF"""
         pdf_name = Path(pdf_path).stem
-        images_dir = output_dir / "contextual_images"
+        images_dir = output_dir / "comprehensive_images"
         images_dir.mkdir(exist_ok=True)
         
         print(f"\n{'='*60}")
-        print(f"🔄 Context-Aware Processing: {pdf_name}")
+        print(f"🔄 Comprehensive Processing: {pdf_name}")
         print(f"{'='*60}")
         
         # Reset counter
         self.image_counter = 0
         
-        images = self.extract_images_with_context(pdf_path, images_dir, pdf_name)
+        images = self.extract_all_images_comprehensive(pdf_path, images_dir, pdf_name)
         
         if images:
-            csv_path = output_dir / f"{pdf_name}_contextual_images.csv"
+            csv_path = output_dir / f"{pdf_name}_comprehensive_images.csv"
             self.create_images_csv(images, csv_path)
             
-            print(f"\n📊 Contextual Results:")
-            print(f"   ✅ Images with context: {len(images)}")
+            print(f"\n📊 Comprehensive Results:")
+            print(f"   ✅ Total images extracted: {len(images)}")
             
-            # Show context breakdown
-            contexts = {}
+            # Show detailed context breakdown
+            context_stats = {}
             for image in images:
-                ctx = f"Q{image.get('question_number', '?')}_{image.get('context_type', '?')}"
-                contexts[ctx] = contexts.get(ctx, 0) + 1
+                key = f"Q{image.get('question_number', '?')}_{image.get('context_type', '?')}"
+                context_stats[key] = context_stats.get(key, 0) + 1
             
-            for ctx, count in contexts.items():
+            print(f"   📊 Context Distribution:")
+            for ctx, count in sorted(context_stats.items()):
                 print(f"     • {ctx}: {count}")
             
+            # Show image statistics
+            total_size = sum(img.get('size_kb', 0) for img in images)
+            print(f"   💾 Total size: {total_size:.1f} KB")
             print(f"   📁 Folder: {images_dir}")
         else:
-            print(f"   ❌ No contextual images found")
+            print(f"   ❌ No images found")
         
         return images
 
-# FALLBACK: Simple extractor without API
-class SimpleContextImageExtractor:
+# FALLBACK: Guaranteed image extraction without context
+class GuaranteedImageExtractor:
     def __init__(self):
         self.image_counter = 0
     
-    def extract_with_simple_context(self, pdf_path, output_dir, pdf_name):
-        """Simple extraction without AI - uses basic pattern matching"""
+    def extract_all_images_guaranteed(self, pdf_path, output_dir, pdf_name):
+        """Extract ALL images guaranteed, with simple numbering"""
         images_data = []
         
         try:
             doc = fitz.open(pdf_path)
-            print(f"📄 Simple Context Extraction: {pdf_name}")
+            print(f"📄 Guaranteed Extraction: {pdf_name}")
+            
+            total_images = 0
+            for page_num in range(len(doc)):
+                page = doc.load_page(page_num)
+                image_list = page.get_images()
+                total_images += len(image_list)
+            
+            print(f"📊 Total images in PDF: {total_images}")
             
             for page_num in range(len(doc)):
                 page = doc.load_page(page_num)
-                print(f"    🔍 Page {page_num+1}: Simple context analysis...")
-                
-                # Extract text and find question patterns
-                page_text = page.get_text()
-                questions = self._find_questions_simple(page_text)
-                
                 image_list = page.get_images()
-                print(f"      Found {len(image_list)} images, {len(questions)} question patterns")
+                
+                print(f"    📄 Page {page_num+1}: Extracting {len(image_list)} images...")
                 
                 for img_index, img in enumerate(image_list):
                     xref = img[0]
@@ -333,38 +372,33 @@ class SimpleContextImageExtractor:
                             height = base_image.get("height", 0)
                             image_data = base_image["image"]
                             size_kb = len(image_data) / 1024
-                            
-                            # Simple context assignment
-                            context = self._assign_simple_context(questions, img_index)
-                            
                             img_ext = base_image.get("ext", "png")
-                            filename = self._create_simple_filename(
-                                pdf_name, page_num + 1, self.image_counter, context, img_ext
-                            )
+                            
+                            # Simple sequential naming
+                            filename = f"{pdf_name}_p{page_num+1}_img{self.image_counter:03d}.{img_ext}"
                             img_path = output_dir / filename
                             
                             with open(img_path, "wb") as img_file:
                                 img_file.write(image_data)
                             
-                            if self._is_substantial_image(width, height, size_kb):
-                                images_data.append({
-                                    'pdf_name': pdf_name,
-                                    'page_number': page_num + 1,
-                                    'image_number': self.image_counter,
-                                    'filename': filename,
-                                    'filepath': str(img_path),
-                                    'width': width,
-                                    'height': height,
-                                    'size_kb': round(size_kb, 2),
-                                    'question_number': context['question'],
-                                    'context_type': context['type'],
-                                    'confidence': 'low',
-                                    'type': 'embedded_image'
-                                })
-                                print(f"      ✅ {filename}")
+                            images_data.append({
+                                'pdf_name': pdf_name,
+                                'page_number': page_num + 1,
+                                'image_number': self.image_counter,
+                                'filename': filename,
+                                'filepath': str(img_path),
+                                'width': width,
+                                'height': height,
+                                'size_kb': round(size_kb, 2),
+                                'question_number': 'unknown',
+                                'context_type': 'extracted',
+                                'confidence': 'high',
+                                'image_format': img_ext
+                            })
+                            print(f"      ✅ {filename} ({width}x{height}, {size_kb:.1f}KB)")
                     
                     except Exception as e:
-                        print(f"      Image error: {e}")
+                        print(f"      ⚠️ Image {img_index} error: {e}")
             
             doc.close()
             
@@ -372,55 +406,20 @@ class SimpleContextImageExtractor:
             print(f"❌ Error: {e}")
         
         return images_data
-    
-    def _find_questions_simple(self, text):
-        """Simple question pattern matching"""
-        questions = []
-        # Look for patterns like "1.", "Q1", "Question 1", etc.
-        patterns = [
-            r'(\d+)\.\s',  # "1. "
-            r'[Qq]\.?\s*(\d+)',  # "Q1", "Q.1"
-            r'Question\s*(\d+)',  # "Question 1"
-        ]
-        
-        for pattern in patterns:
-            matches = re.finditer(pattern, text)
-            for match in matches:
-                questions.append({
-                    'question_number': match.group(1),
-                    'position': match.start()
-                })
-        
-        return questions
-    
-    def _assign_simple_context(self, questions, img_index):
-        """Simple context assignment based on image order"""
-        if questions and img_index < len(questions):
-            q = questions[img_index]
-            return {'question': q['question_number'], 'type': 'question'}
-        else:
-            return {'question': str(img_index + 1), 'type': 'unknown'}
-    
-    def _create_simple_filename(self, pdf_name, page_num, img_num, context, extension):
-        """Create simple contextual filename"""
-        return f"{pdf_name}_p{page_num}_q{context['question']}_{context['type']}_img{img_num:03d}.{extension}"
-    
-    def _is_substantial_image(self, width, height, size_kb, 
-                            min_width=100, min_height=100, min_size_kb=5):
-        return (width >= min_width and height >= min_height and size_kb >= min_size_kb)
 
 # USAGE
 if __name__ == "__main__":
-    API_KEY = "sk-a74954e77779423297e2abbc4ef0b7cd"  # Your DeepSeek API key
+    API_KEY = "sk-a74954e77779423297e2abbc4ef0b7cd"
     
-    print("🚀 Choose Context-Aware Extraction:")
-    print("1. AI-Powered (with DeepSeek API) - Better context")
-    print("2. Simple Pattern-Based - No API required")
+    print("🚀 Choose Extraction Method:")
+    print("1. AI-Powered Comprehensive (Context + All Images)")
+    print("2. Guaranteed Extraction (All Images, No Context)")
+    print("3. Try Comprehensive, Fallback to Guaranteed")
     
-    choice = input("Enter choice (1 or 2): ").strip()
+    choice = input("Enter choice (1, 2, or 3): ").strip()
     
     folder_path = r"C:\Users\menha\Downloads\test"
-    output_dir = Path(folder_path) / "contextual_image_extraction"
+    output_dir = Path(folder_path) / "improved_image_extraction"
     output_dir.mkdir(exist_ok=True)
     
     pdf_files = list(Path(folder_path).glob("*.pdf"))
@@ -429,38 +428,61 @@ if __name__ == "__main__":
         print("No PDF files found!")
         exit()
     
-    if choice == "1":
-        extractor = ContextAwareImageExtractor(api_key=API_KEY)
-        print("\n" + "="*60)
-        print("🤖 AI-POWERED CONTEXT EXTRACTION")
-        print("Using DeepSeek API for intelligent context analysis")
-        print("="*60)
-    else:
-        extractor = SimpleContextImageExtractor()
-        print("\n" + "="*60)
-        print("🔍 SIMPLE CONTEXT EXTRACTION")
-        print("Using pattern matching for basic context")
-        print("="*60)
-    
     all_images = []
     
     for pdf_file in pdf_files:
+        pdf_name = pdf_file.stem
+        
         if choice == "1":
+            extractor = ImprovedContextImageExtractor(api_key=API_KEY)
+            print(f"\n{'='*60}")
+            print(f"🤖 COMPREHENSIVE EXTRACTION: {pdf_name}")
+            print("="*60)
             images = extractor.process_pdf(pdf_file, output_dir)
-        else:
-            images = extractor.extract_with_simple_context(pdf_file, output_dir, pdf_file.stem)
+            
+        elif choice == "2":
+            extractor = GuaranteedImageExtractor()
+            print(f"\n{'='*60}")
+            print(f"🔍 GUARANTEED EXTRACTION: {pdf_name}")
+            print("="*60)
+            images = extractor.extract_all_images_guaranteed(pdf_file, output_dir, pdf_name)
+            
+        else:  # Choice 3
+            print(f"\n{'='*60}")
+            print(f"🔄 COMPREHENSIVE + FALLBACK: {pdf_name}")
+            print("="*60)
+            
+            # Try comprehensive first
+            comprehensive_extractor = ImprovedContextImageExtractor(api_key=API_KEY)
+            images = comprehensive_extractor.process_pdf(pdf_file, output_dir)
+            
+            # If no images found, try guaranteed
+            if not images:
+                print("    🔄 Comprehensive failed, trying guaranteed extraction...")
+                guaranteed_extractor = GuaranteedImageExtractor()
+                images = guaranteed_extractor.extract_all_images_guaranteed(pdf_file, output_dir, pdf_name)
         
         all_images.extend(images)
         print()
     
+    # Create combined CSV
     if all_images:
-        print("🎉 CONTEXTUAL EXTRACTION COMPLETED!")
-        print(f"📊 Total contextual images: {len(all_images)}")
+        combined_csv = output_dir / "ALL_EXTRACTED_IMAGES.csv"
+        
+        headers = ['PDF Name', 'Page Number', 'Image Number', 'Filename', 'Question Number', 'Context Type', 'Confidence', 'Width', 'Height', 'Size (KB)', 'Image Format', 'Filepath']
+        with open(combined_csv, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow(headers)
+            for image in all_images:
+                writer.writerow([image.get(h.lower().replace(' ', '_'), '') for h in headers])
+        
+        print("🎉 EXTRACTION COMPLETED!")
+        print(f"📊 Total images extracted: {len(all_images)}")
         print(f"📁 Output: {output_dir}")
         
-        # Show filename examples
-        print(f"📝 Sample filenames:")
-        for img in all_images[:3]:  # Show first 3
-            print(f"   • {img['filename']}")
+        # Final summary
+        option_images = len([img for img in all_images if 'option' in img.get('context_type', '')])
+        print(f"📝 Option images found: {option_images}")
+        
     else:
-        print("❌ No images found with context")
+        print("❌ No images found in any PDF")
