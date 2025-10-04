@@ -1,0 +1,151 @@
+import requests
+import os
+import time
+import json
+import re
+from bs4 import BeautifulSoup
+
+class AdvancedSelfStudysPDFDownloader:
+    def __init__(self, base_url, download_folder):
+        self.base_url = base_url
+        self.download_folder = download_folder
+        self.session = requests.Session()
+        self.session.headers.update({
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        })
+        os.makedirs(download_folder, exist_ok=True)
+    
+    def discover_pdf_ids_from_website(self):
+        """Discover PDF IDs by scanning the website for sitepdfs links"""
+        print("Scanning website for PDF IDs...")
+        
+        # Common pages that might contain PDF links
+        scan_pages = [
+            "",
+            "books",
+            "notes", 
+            "mcq",
+            "sample-papers",
+            "previous-year-papers",
+            "study-material"
+        ]
+        
+        discovered_ids = set()
+        
+        for page in scan_pages:
+            url = f"https://www.selfstudys.com/{page}"
+            try:
+                print(f"Scanning: {url}")
+                response = self.session.get(url, timeout=10)
+                soup = BeautifulSoup(response.content, 'html.parser')
+                
+                # Find all links containing sitepdfs
+                links = soup.find_all('a', href=re.compile(r'sitepdfs/([a-zA-Z0-9]+)'))
+                
+                for link in links:
+                    href = link.get('href', '')
+                    match = re.search(r'sitepdfs/([a-zA-Z0-9]+)', href)
+                    if match:
+                        pdf_id = match.group(1)
+                        discovered_ids.add(pdf_id)
+                        print(f"  Found PDF ID: {pdf_id}")
+                
+                time.sleep(1)  # Be polite
+                
+            except Exception as e:
+                print(f"  Error scanning {url}: {e}")
+        
+        return list(discovered_ids)
+    
+    def download_pdf_by_id(self, pdf_id, counter):
+        """Download individual PDF by ID"""
+        pdf_url = f"https://www.selfstudys.com/sitepdfs/{pdf_id}"
+        
+        try:
+            print(f"[{counter}] Downloading: {pdf_url}")
+            
+            response = self.session.get(pdf_url, timeout=30)
+            response.raise_for_status()
+            
+            # Validate PDF
+            if not response.content.startswith(b'%PDF'):
+                print(f"✗ Invalid PDF content: {pdf_url}")
+                return None
+            
+            filename = f"{counter:02d}_{pdf_id}.pdf"
+            filepath = os.path.join(self.download_folder, filename)
+            
+            with open(filepath, 'wb') as f:
+                f.write(response.content)
+            
+            file_size = os.path.getsize(filepath)
+            print(f"✓ Downloaded: {filename} ({file_size} bytes)")
+            
+            return {
+                'filename': filename,
+                'url': pdf_url,
+                'pdf_id': pdf_id,
+                'size': file_size
+            }
+            
+        except Exception as e:
+            print(f"✗ Failed: {pdf_url} - {e}")
+            return None
+    
+    def download_multiple_pdfs(self, pdf_ids, max_files=5):
+        """Download multiple PDFs from ID list"""
+        downloaded = []
+        
+        for i, pdf_id in enumerate(pdf_ids[:max_files], 1):
+            result = self.download_pdf_by_id(pdf_id, i)
+            if result:
+                downloaded.append(result)
+            time.sleep(1)
+        
+        return downloaded
+
+def test_with_known_ids():
+    """Test with the known PDF IDs you provided"""
+    BASE_URL = "https://www.selfstudys.com/"
+    DOWNLOAD_FOLDER = r"C:\Users\menha\Downloads\test11"
+    
+    # Your provided PDF IDs
+    KNOWN_IDS = [
+        "swbAwe5PGRiEo7iE2caw",
+        "lp29JcTMDq499A8SctDp", 
+        "Ge6Vaap6NirN2Biyb0ye",
+        "w7AXf0QV0ebTbynv0JUl",
+        "3065Evt9dQcd4Gr5g2Ir",
+        "ikTp0LdpD578VvgxH3U5",
+        "8yPCHl497cLs27LkcY9O",
+        "Xg3zayZ52Ta0pX17uy8d",
+        "G7JknnSyzq3JPburreRC",
+        "4CqCzadDH5ZcP0rhlOcp"
+    ]
+    
+    downloader = AdvancedSelfStudysPDFDownloader(BASE_URL, DOWNLOAD_FOLDER)
+    
+    print("Testing with known PDF IDs...")
+    print("=" * 50)
+    
+    downloaded = downloader.download_multiple_pdfs(KNOWN_IDS, 5)
+    
+    # Save results
+    if downloaded:
+        report = {
+            'downloaded_files': downloaded,
+            'total_count': len(downloaded),
+            'total_size': sum(f['size'] for f in downloaded)
+        }
+        
+        report_file = os.path.join(DOWNLOAD_FOLDER, "test_results.json")
+        with open(report_file, 'w') as f:
+            json.dump(report, f, indent=2)
+        
+        print(f"\nTest completed! Downloaded {len(downloaded)} files.")
+        print(f"Report saved: {report_file}")
+    else:
+        print("\nNo files were downloaded. There might be an issue with the PDF URLs.")
+
+if __name__ == "__main__":
+    test_with_known_ids()
