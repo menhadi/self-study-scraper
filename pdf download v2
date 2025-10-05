@@ -18,7 +18,7 @@ import math
 
 # Set the save directory to D:\Self Study\Pdf for maximum speed
 SAVE_DIR = r"D:\Self Study\Pdf"
-EXCEL_FILES_DIR = r"D:\Self Study"  # Directory containing Excel files
+TEXT_FILES_DIR = r"D:\Self Study"  # Directory containing text files
 os.makedirs(SAVE_DIR, exist_ok=True)
 
 # Configure logging
@@ -39,18 +39,18 @@ class UltraFastPDFDownloader:
         self.start_time = time.time()
         self.session = self.create_session()
         self.max_workers = max_workers
-        self.excel_files = self.get_excel_files()
+        self.text_files = self.get_text_files()
         self.failed_urls = set()
         
         # Setup signal handler
         signal.signal(signal.SIGINT, self.signal_handler)
     
-    def get_excel_files(self):
-        """Get all Excel files in the specified directory"""
-        excel_files = glob.glob(os.path.join(EXCEL_FILES_DIR, "*.xlsx")) + glob.glob(os.path.join(EXCEL_FILES_DIR, "*.xls"))
-        excel_files.sort()  # Sort alphabetically
-        logger.info(f"Found {len(excel_files)} Excel files to process")
-        return excel_files
+    def get_text_files(self):
+        """Get all text files in the specified directory"""
+        text_files = glob.glob(os.path.join(TEXT_FILES_DIR, "*.txt"))
+        text_files.sort()  # Sort alphabetically
+        logger.info(f"Found {len(text_files)} text files to process")
+        return text_files
     
     def create_session(self):
         """Create optimized requests session with better retry strategy"""
@@ -107,46 +107,117 @@ class UltraFastPDFDownloader:
         
         return downloaded_urls
     
-    def read_urls_from_excel(self, excel_file: str) -> List[Tuple[str, str, str]]:
-        """Read URLs and filenames from Excel file"""
+    def read_urls_from_text_file(self, text_file: str) -> List[Tuple[str, str, str]]:
+        """Read URLs and filenames from text file"""
         urls_data = []
         try:
-            # Read Excel file with optimized parameters
-            df = pd.read_excel(excel_file)
+            with open(text_file, 'r', encoding='utf-8') as f:
+                lines = [line.strip() for line in f if line.strip()]
             
-            # Check if required columns exist
-            required_columns = ['Viewer_URL', 'PDF_URL', 'Filename']
-            for col in required_columns:
-                if col not in df.columns:
-                    logger.error(f"Column '{col}' not found in Excel file: {excel_file}")
-                    return []
+            logger.info(f"Read {len(lines)} lines from text file: {os.path.basename(text_file)}")
             
-            # Process each row efficiently
-            for _, row in df.iterrows():
-                viewer_url = str(row['Viewer_URL']).strip()
-                pdf_url = str(row['PDF_URL']).strip()
-                filename = str(row['Filename']).strip()
-                
-                if viewer_url and viewer_url != 'nan' and pdf_url and pdf_url != 'nan':
-                    # Ensure filename has .pdf extension
-                    if filename and filename != 'nan':
-                        if not filename.lower().endswith('.pdf'):
-                            filename += '.pdf'
-                        # Clean filename
-                        filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
-                        filename = filename.strip()[:150]
-                    else:
-                        # Generate filename from URL if not provided
-                        filename = self.generate_filename_from_url(pdf_url)
+            for line in lines:
+                if self.interrupted:
+                    break
                     
+                # Skip comment lines
+                if line.startswith('#') or line.startswith('//'):
+                    continue
+                
+                # Try different parsing methods for text file formats
+                viewer_url, pdf_url, filename = self.parse_text_line(line)
+                
+                if viewer_url and pdf_url:
                     urls_data.append((viewer_url, pdf_url, filename))
             
-            logger.info(f"Loaded {len(urls_data)} URLs from Excel file: {os.path.basename(excel_file)}")
+            logger.info(f"Parsed {len(urls_data)} URLs from text file: {os.path.basename(text_file)}")
             
         except Exception as e:
-            logger.error(f"Error reading Excel file {excel_file}: {e}")
+            logger.error(f"Error reading text file {text_file}: {e}")
         
         return urls_data
+    
+    def parse_text_line(self, line: str) -> Tuple[str, str, str]:
+        """
+        Parse a line from text file to extract viewer_url, pdf_url, and filename.
+        Supports multiple formats:
+        - CSV-like: viewer_url, pdf_url, filename
+        - JSON-like: {"viewer_url": "...", "pdf_url": "...", "filename": "..."}
+        - URL only (use as both viewer_url and pdf_url)
+        - Custom formats
+        """
+        viewer_url = ""
+        pdf_url = ""
+        filename = ""
+        
+        try:
+            # Method 1: CSV-like format (comma separated)
+            if ',' in line:
+                parts = [part.strip() for part in line.split(',')]
+                if len(parts) >= 2:
+                    viewer_url = parts[0]
+                    pdf_url = parts[1]
+                    if len(parts) >= 3:
+                        filename = parts[2]
+            
+            # Method 2: JSON-like format (simple key-value pairs)
+            elif ':' in line and '"' in line:
+                # Simple JSON parsing for common patterns
+                if 'viewer_url' in line.lower() and 'pdf_url' in line.lower():
+                    viewer_match = re.search(r'"viewer_url"\s*:\s*"([^"]+)"', line, re.IGNORECASE)
+                    pdf_match = re.search(r'"pdf_url"\s*:\s*"([^"]+)"', line, re.IGNORECASE)
+                    filename_match = re.search(r'"filename"\s*:\s*"([^"]+)"', line, re.IGNORECASE)
+                    
+                    if viewer_match:
+                        viewer_url = viewer_match.group(1)
+                    if pdf_match:
+                        pdf_url = pdf_match.group(1)
+                    if filename_match:
+                        filename = filename_match.group(1)
+            
+            # Method 3: Single URL (use as both viewer_url and pdf_url)
+            elif line.startswith('http'):
+                viewer_url = line
+                pdf_url = line
+            
+            # Method 4: Tab-separated values
+            elif '\t' in line:
+                parts = [part.strip() for part in line.split('\t')]
+                if len(parts) >= 2:
+                    viewer_url = parts[0]
+                    pdf_url = parts[1]
+                    if len(parts) >= 3:
+                        filename = parts[2]
+            
+            # Method 5: Pipe-separated values
+            elif '|' in line:
+                parts = [part.strip() for part in line.split('|')]
+                if len(parts) >= 2:
+                    viewer_url = parts[0]
+                    pdf_url = parts[1]
+                    if len(parts) >= 3:
+                        filename = parts[2]
+            
+            # Clean and validate URLs
+            viewer_url = viewer_url.strip()
+            pdf_url = pdf_url.strip()
+            filename = filename.strip()
+            
+            # Generate filename if not provided
+            if not filename and pdf_url:
+                filename = self.generate_filename_from_url(pdf_url)
+            
+            # Clean filename
+            if filename:
+                filename = re.sub(r'[<>:"/\\|?*]', '_', filename)
+                filename = filename.strip()[:150]
+                if not filename.lower().endswith('.pdf'):
+                    filename += '.pdf'
+            
+        except Exception as e:
+            logger.warning(f"Error parsing line: {line} - {e}")
+        
+        return viewer_url, pdf_url, filename
     
     def load_checkpoint(self):
         """Load checkpoint"""
@@ -183,7 +254,7 @@ class UltraFastPDFDownloader:
                 elapsed = time.time() - self.start_time
                 urls_per_hour = (url_index / elapsed) * 3600 if elapsed > 0 else 0
                 f.write(f"URLs_Per_Hour: {urls_per_hour:.2f}\n")
-                f.write(f"Current_File: {os.path.basename(self.excel_files[file_index]) if file_index < len(self.excel_files) else 'COMPLETED'}\n")
+                f.write(f"Current_File: {os.path.basename(self.text_files[file_index]) if file_index < len(self.text_files) else 'COMPLETED'}\n")
         except Exception as e:
             logger.error(f"Error saving checkpoint: {e}")
     
@@ -366,17 +437,17 @@ class UltraFastPDFDownloader:
         return successful, failed
     
     def run_ultra_fast_download(self, batch_size: int = 2000):
-        """Run the optimized download process for all Excel files"""
+        """Run the optimized download process for all text files"""
         logger.info("🚀 Starting Optimized PDF Downloader...")
         logger.info("=" * 60)
         logger.info(f"PDFs will be saved to: {SAVE_DIR}")
-        logger.info(f"Excel files directory: {EXCEL_FILES_DIR}")
-        logger.info(f"Found {len(self.excel_files)} Excel files to process")
+        logger.info(f"Text files directory: {TEXT_FILES_DIR}")
+        logger.info(f"Found {len(self.text_files)} text files to process")
         logger.info(f"Max workers: {self.max_workers}")
         logger.info("=" * 60)
         
-        if not self.excel_files:
-            logger.info("No Excel files found. Exiting.")
+        if not self.text_files:
+            logger.info("No text files found. Exiting.")
             return
         
         # Load checkpoint to resume from where we left off
@@ -387,16 +458,16 @@ class UltraFastPDFDownloader:
         total_successful_all_files = 0
         total_failed_all_files = 0
         
-        # Process each Excel file sequentially
-        for file_index in range(current_file_index, len(self.excel_files)):
+        # Process each text file sequentially
+        for file_index in range(current_file_index, len(self.text_files)):
             if self.interrupted:
                 break
                 
-            current_file = self.excel_files[file_index]
-            logger.info(f"Processing file {file_index + 1}/{len(self.excel_files)}: {os.path.basename(current_file)}")
+            current_file = self.text_files[file_index]
+            logger.info(f"Processing file {file_index + 1}/{len(self.text_files)}: {os.path.basename(current_file)}")
             
-            # Read URLs from current Excel file
-            all_urls_data = self.read_urls_from_excel(current_file)
+            # Read URLs from current text file
+            all_urls_data = self.read_urls_from_text_file(current_file)
             
             if not all_urls_data:
                 logger.info(f"No URLs found in {os.path.basename(current_file)}. Moving to next file.")
@@ -457,7 +528,7 @@ class UltraFastPDFDownloader:
         # Print final summary
         logger.info("=" * 60)
         logger.info("📊 DOWNLOAD SUMMARY")
-        logger.info(f"Total Excel files processed: {len(self.excel_files)}")
+        logger.info(f"Total text files processed: {len(self.text_files)}")
         logger.info(f"Total URLs processed: {total_successful_all_files + total_failed_all_files}")
         logger.info(f"Successful downloads: {total_successful_all_files}")
         logger.info(f"Failed downloads: {total_failed_all_files}")
