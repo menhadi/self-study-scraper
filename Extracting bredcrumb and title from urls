@@ -1,0 +1,206 @@
+import requests
+from bs4 import BeautifulSoup
+import time
+import os
+import concurrent.futures
+from threading import Lock
+
+# Thread lock for file writing
+file_lock = Lock()
+
+def extract_breadcrumb_and_title(url):
+    """
+    Extract breadcrumb and title from a given URL
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Extract breadcrumb - common patterns for selfstudys.com
+        breadcrumb = ""
+        
+        # Try multiple breadcrumb selectors
+        breadcrumb_selectors = [
+            '.breadcrumb',
+            '.breadcrumbs',
+            '.breadcrumb-nav',
+            '.page-breadcrumb',
+            '.breadcrumb-list',
+            'nav[aria-label="breadcrumb"]',
+            '.path'
+        ]
+        
+        for selector in breadcrumb_selectors:
+            breadcrumb_element = soup.select_one(selector)
+            if breadcrumb_element:
+                # Get all text from breadcrumb, clean it up
+                breadcrumb_items = breadcrumb_element.get_text(strip=True, separator=' > ')
+                breadcrumb = ' > '.join(item.strip() for item in breadcrumb_items.split('>') if item.strip())
+                break
+        
+        # If no breadcrumb found with common selectors, try to find any navigation elements
+        if not breadcrumb:
+            nav_elements = soup.find_all(['nav', 'div'], class_=lambda x: x and 'bread' in x.lower() if x else False)
+            for nav in nav_elements:
+                breadcrumb_text = nav.get_text(strip=True, separator=' > ')
+                if breadcrumb_text:
+                    breadcrumb = breadcrumb_text
+                    break
+        
+        # Extract title
+        title = ""
+        title_element = soup.find('title')
+        if title_element:
+            title = title_element.get_text(strip=True)
+        
+        # If no proper title found in <title> tag, try h1
+        if not title or title == '':
+            h1_element = soup.find('h1')
+            if h1_element:
+                title = h1_element.get_text(strip=True)
+        
+        return {
+            'url': url,
+            'breadcrumb': breadcrumb,
+            'title': title,
+            'status': 'Success'
+        }
+        
+    except requests.exceptions.RequestException as e:
+        return {
+            'url': url,
+            'breadcrumb': '',
+            'title': '',
+            'status': f'Error: {str(e)}'
+        }
+    except Exception as e:
+        return {
+            'url': url,
+            'breadcrumb': '',
+            'title': '',
+            'status': f'Error: {str(e)}'
+        }
+
+def write_result_to_file(output_file, result, counter, total_urls):
+    """
+    Write individual result to file immediately
+    """
+    with file_lock:
+        # Clean the data for tab-separated format
+        url = result['url']
+        breadcrumb = result['breadcrumb'].replace('\t', ' ').replace('\n', ' ').strip()
+        title = result['title'].replace('\t', ' ').replace('\n', ' ').strip()
+        status = result['status']
+        
+        with open(output_file, 'a', encoding='utf-8') as f:
+            f.write(f"{url}\t{breadcrumb}\t{title}\t{status}\n")
+        
+        print(f"Completed [{counter}/{total_urls}]: {result['status']} - {url}")
+
+def process_single_url(args):
+    """
+    Process single URL and return result with index for ordering
+    """
+    index, url = args
+    result = extract_breadcrumb_and_title(url)
+    return index, result
+
+def process_urls():
+    """
+    Process URLs from the specific file and save results in same folder
+    """
+    input_folder = r'C:\Users\menha\Downloads\test14'
+    input_file = os.path.join(input_folder, 'urls.txt')
+    output_file = os.path.join(input_folder, 'output_results.txt')
+    
+    # Remove existing output file
+    if os.path.exists(output_file):
+        os.remove(output_file)
+    
+    # Check if input file exists
+    if not os.path.exists(input_file):
+        print(f"Error: Input file not found at {input_file}")
+        return
+    
+    # Read URLs from file
+    try:
+        with open(input_file, 'r', encoding='utf-8') as file:
+            urls = [line.strip() for line in file if line.strip()]
+    except Exception as e:
+        print(f"Error reading file: {e}")
+        return
+    
+    print(f"Found {len(urls)} URLs to process...")
+    print(f"Input file: {input_file}")
+    print(f"Output file: {output_file}")
+    print("-" * 50)
+    
+    # Create empty output file with header immediately
+    with open(output_file, 'w', encoding='utf-8') as f:
+        f.write("URL\tBreadcrumb\tTitle\tStatus\n")
+    print("Output file created with header. Starting extraction...")
+    
+    # Process URLs with threading but maintain order
+    successful = 0
+    errors = 0
+    
+    # Use ThreadPoolExecutor for concurrent processing
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+        # Prepare arguments for each URL with their original index
+        url_args = [(i, url) for i, url in enumerate(urls)]
+        
+        # Submit all tasks and store futures with their original index
+        future_to_index = {}
+        for index, url in enumerate(urls):
+            future = executor.submit(process_single_url, (index, url))
+            future_to_index[future] = index
+        
+        # Process results in the original order
+        completed_count = 0
+        results = [None] * len(urls)  # Pre-allocate list to maintain order
+        
+        # Process completed futures and write in order
+        for future in concurrent.futures.as_completed(future_to_index):
+            index, result = future.result()
+            results[index] = result
+            
+            # Wait until we can write in order
+            # Check if we can write consecutive completed results
+            while completed_count < len(urls) and results[completed_count] is not None:
+                result_to_write = results[completed_count]
+                write_result_to_file(output_file, result_to_write, completed_count + 1, len(urls))
+                
+                # Update counters
+                if result_to_write['status'] == 'Success':
+                    successful += 1
+                else:
+                    errors += 1
+                
+                completed_count += 1
+    
+    print(f"\nProcessing complete!")
+    print(f"Results saved to: {output_file}")
+    print(f"Successfully processed: {successful}")
+    print(f"Errors: {errors}")
+
+def main():
+    """
+    Main function to run the script
+    """
+    print("SelfStudys Breadcrumb and Title Extractor")
+    print("=" * 50)
+    print("Input: C:\\Users\\menha\\Downloads\\test14\\urls.txt")
+    print("Output: C:\\Users\\menha\\Downloads\\test14\\output_results.txt")
+    print("=" * 50)
+    
+    # Process the URLs
+    process_urls()
+
+if __name__ == "__main__":
+    main()
