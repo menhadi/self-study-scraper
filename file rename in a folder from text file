@@ -1,0 +1,342 @@
+import os
+import logging
+from pathlib import Path
+import urllib.parse
+import re
+
+def setup_logging():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('rename_operations.log', encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+
+def decode_url_encoded_text(text):
+    """Decode URL-encoded text like %E0%A4%95 to proper Unicode characters"""
+    try:
+        # Decode URL-encoded characters
+        decoded = urllib.parse.unquote(text)
+        return decoded
+    except Exception as e:
+        logging.error(f"Error decoding text '{text}': {e}")
+        return text
+
+def sanitize_filename(filename):
+    """Remove or replace invalid characters for Windows filenames"""
+    # Remove invalid characters for Windows filenames
+    invalid_chars = '<>:"/\\|?*'
+    for char in invalid_chars:
+        filename = filename.replace(char, '_')
+    
+    # Remove leading/trailing spaces and dots
+    filename = filename.strip(' .')
+    
+    # Limit length to avoid path too long errors (250 chars max)
+    if len(filename) > 250:
+        name, ext = os.path.splitext(filename)
+        filename = name[:250-len(ext)] + ext
+    
+    return filename
+
+def read_mapping_file(folder_path):
+    """Look for text file in the folder and read mapping"""
+    folder = Path(folder_path)
+    text_files = list(folder.glob("*.txt"))
+    
+    if not text_files:
+        logging.error("No text file found in the folder")
+        return None, None
+    
+    # Use the first text file found
+    mapping_file = text_files[0]
+    logging.info(f"Using mapping file: {mapping_file}")
+    
+    mapping = {}
+    original_lines = []
+    
+    try:
+        with open(mapping_file, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            
+        # Skip header if it exists
+        start_index = 0
+        if lines and "PDF_URL" in lines[0] and "Name" in lines[0]:
+            start_index = 1
+            logging.info("Skipping header row")
+        
+        for line in lines[start_index:]:
+            line = line.strip()
+            if line:
+                original_lines.append(line)
+                parts = line.split('\t')  # Try tab separation first
+                if len(parts) < 2:
+                    parts = line.split()  # Try space separation
+                
+                if len(parts) >= 2:
+                    old_name = parts[0].strip()
+                    new_name = parts[1].strip()
+                    
+                    # Decode URL-encoded characters in new name
+                    new_name_decoded = decode_url_encoded_text(new_name)
+                    
+                    # Add .pdf extension if not present
+                    old_name_with_ext = old_name + '.pdf' if not old_name.endswith('.pdf') else old_name
+                    new_name_with_ext = new_name_decoded + '.pdf' if not new_name_decoded.endswith('.pdf') else new_name_decoded
+                    
+                    # Sanitize the new filename for Windows
+                    new_name_sanitized = sanitize_filename(new_name_with_ext)
+                    
+                    mapping[old_name_with_ext] = new_name_sanitized
+        
+        return mapping, original_lines
+        
+    except Exception as e:
+        logging.error(f"Error reading mapping file: {e}")
+        return None, None
+
+def rename_files(folder_path, mapping, original_lines):
+    """Rename files based on mapping and report failures"""
+    folder = Path(folder_path)
+    success_count = 0
+    total_operations = len(mapping)
+    
+    # Create backup log
+    backup_log = []
+    failed_renames = []
+    
+    print("\n" + "="*50)
+    print("RENAME OPERATIONS STARTED")
+    print("="*50)
+    
+    for old_name, new_name in mapping.items():
+        old_path = folder / old_name
+        new_path = folder / new_name
+        
+        print(f"\nProcessing: {old_name}")
+        print(f"Target: {new_name}")
+        
+        # Check if source file exists
+        if not old_path.exists():
+            print("❌ FAILED: Source file not found")
+            failed_renames.append({
+                'old_name': old_name,
+                'new_name': new_name,
+                'reason': 'Source file not found',
+                'original_line': find_original_line(old_name, original_lines)
+            })
+            continue
+            
+        # Check if target already exists
+        if new_path.exists():
+            print("❌ FAILED: Target file already exists")
+            failed_renames.append({
+                'old_name': old_name,
+                'new_name': new_name,
+                'reason': 'Target file already exists',
+                'original_line': find_original_line(old_name, original_lines)
+            })
+            continue
+            
+        try:
+            old_path.rename(new_path)
+            backup_log.append((new_name, old_name))
+            success_count += 1
+            print("✅ SUCCESS: File renamed")
+            
+        except Exception as e:
+            error_msg = str(e)
+            print(f"❌ FAILED: {error_msg}")
+            failed_renames.append({
+                'old_name': old_name,
+                'new_name': new_name,
+                'reason': error_msg,
+                'original_line': find_original_line(old_name, original_lines)
+            })
+    
+    # Save backup log
+    if backup_log:
+        with open(folder / 'rename_backup.txt', 'w', encoding='utf-8') as f:
+            f.write("# Use this to reverse the renaming\n")
+            f.write("# Format: new_name old_name\n")
+            for new_name, old_name in backup_log:
+                f.write(f"{new_name}\t{old_name}\n")
+        print(f"\nBackup log saved: {folder}/rename_backup.txt")
+    
+    # Save failed renames report
+    if failed_renames:
+        save_failed_renames_report(folder, failed_renames)
+    
+    return success_count, total_operations, failed_renames
+
+def find_original_line(old_name, original_lines):
+    """Find the original line from the text file for a given old_name"""
+    search_name = old_name.replace('.pdf', '')
+    for line in original_lines:
+        if search_name in line:
+            return line
+    return "Original line not found"
+
+def save_failed_renames_report(folder, failed_renames):
+    """Save a detailed report of failed renames"""
+    report_file = folder / 'failed_renames_report.txt'
+    
+    with open(report_file, 'w', encoding='utf-8') as f:
+        f.write("FAILED RENAMES REPORT\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Total failed: {len(failed_renames)}\n\n")
+        
+        for i, fail in enumerate(failed_renames, 1):
+            f.write(f"FAILED RENAME #{i}\n")
+            f.write(f"Original line: {fail['original_line']}\n")
+            f.write(f"Old name: {fail['old_name']}\n")
+            f.write(f"New name: {fail['new_name']}\n")
+            f.write(f"Reason: {fail['reason']}\n")
+            f.write("-" * 40 + "\n")
+    
+    print(f"\n❌ Failed renames report saved: {report_file}")
+    
+    # Also print summary to console
+    print("\n" + "="*50)
+    print("FAILED RENAMES SUMMARY:")
+    print("="*50)
+    for fail in failed_renames[:10]:  # Show first 10 only
+        print(f"\nOriginal: {fail['original_line']}")
+        print(f"Reason: {fail['reason']}")
+    if len(failed_renames) > 10:
+        print(f"\n... and {len(failed_renames) - 10} more failures")
+
+def show_folder_files(folder_path):
+    """Show all files in the folder for debugging"""
+    folder = Path(folder_path)
+    files = list(folder.glob("*.*"))
+    pdf_files = [f for f in files if f.suffix.lower() == '.pdf']
+    other_files = [f for f in files if f.suffix.lower() != '.pdf']
+    
+    print(f"\n📁 FOLDER CONTENTS: {folder_path}")
+    print(f"Total PDF files: {len(pdf_files)}")
+    print(f"Other files: {len(other_files)}")
+    
+    print("\nFirst 10 PDF Files:")
+    for file in pdf_files[:10]:
+        print(f"  {file.name}")
+    if len(pdf_files) > 10:
+        print(f"  ... and {len(pdf_files) - 10} more")
+
+def show_sample_decoding(mapping):
+    """Show sample of decoded filenames"""
+    print("\n" + "="*50)
+    print("SAMPLE DECODED FILENAMES:")
+    print("="*50)
+    
+    count = 0
+    for old_name, new_name in list(mapping.items())[:5]:
+        print(f"\nOriginal: {old_name}")
+        print(f"Decoded:  {new_name}")
+        count += 1
+        if count >= 5:
+            break
+
+def reverse_renaming(folder_path):
+    """Reverse the renaming using backup log"""
+    folder = Path(folder_path)
+    backup_file = folder / 'rename_backup.txt'
+    
+    if not backup_file.exists():
+        print("No backup file found to reverse")
+        return
+    
+    reverse_mapping = {}
+    try:
+        with open(backup_file, 'r', encoding='utf-8') as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith('#'):
+                    parts = line.split('\t')
+                    if len(parts) >= 2:
+                        reverse_mapping[parts[0]] = parts[1]
+        
+        success_count = 0
+        for new_name, old_name in reverse_mapping.items():
+            current_path = folder / new_name
+            original_path = folder / old_name
+            
+            if current_path.exists():
+                current_path.rename(original_path)
+                success_count += 1
+                print(f"✓ Reversed: {new_name} -> {old_name}")
+            else:
+                print(f"⚠️ File not found for reversal: {new_name}")
+        
+        print(f"Reversed {success_count} files")
+        
+    except Exception as e:
+        print(f"Error reversing: {e}")
+
+def main():
+    setup_logging()
+    
+    print("File Renamer with Unicode Decoding")
+    print("=" * 40)
+    
+    while True:
+        print("\n1. Rename files in folder")
+        print("2. Show folder contents")
+        print("3. Reverse renaming")
+        print("4. Exit")
+        
+        choice = input("\nChoose option (1-4): ").strip()
+        
+        if choice == '1':
+            folder_path = input("Enter folder path: ").strip()
+            
+            if not os.path.exists(folder_path):
+                print("Folder does not exist!")
+                continue
+                
+            mapping, original_lines = read_mapping_file(folder_path)
+            if not mapping:
+                print("No mapping found or error reading text file!")
+                continue
+                
+            print(f"\nFound {len(mapping)} files to rename")
+            
+            # Show sample decoded names
+            show_sample_decoding(mapping)
+            
+            # Show folder contents first
+            show_folder_files(folder_path)
+            
+            confirm = input("\nProceed with renaming? (y/n): ").lower()
+            if confirm == 'y':
+                success, total, failed = rename_files(folder_path, mapping, original_lines)
+                print(f"\n🎯 FINAL RESULT: {success}/{total} files renamed successfully")
+                if failed:
+                    print(f"❌ {len(failed)} files failed to rename")
+                    print("Check 'failed_renames_report.txt' for details")
+        
+        elif choice == '2':
+            folder_path = input("Enter folder path: ").strip()
+            if os.path.exists(folder_path):
+                show_folder_files(folder_path)
+            else:
+                print("Folder does not exist!")
+        
+        elif choice == '3':
+            folder_path = input("Enter folder path: ").strip()
+            if os.path.exists(folder_path):
+                reverse_renaming(folder_path)
+            else:
+                print("Folder does not exist!")
+        
+        elif choice == '4':
+            print("Goodbye!")
+            break
+        
+        else:
+            print("Invalid choice!")
+
+if __name__ == "__main__":
+    main()
