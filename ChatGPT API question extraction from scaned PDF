@@ -1,0 +1,169 @@
+import os
+import fitz
+import subprocess
+import time
+import pandas as pd
+import re
+from tqdm import tqdm
+from openai import OpenAI
+
+# ---------------------- CONFIG ----------------------
+PDF_FOLDER = r"C:\Users\menha\Downloads\test"
+OUTPUT_FOLDER = r"C:\Users\menha\Downloads\test"
+MODEL = "gpt-5"  # use gpt-4.1-turbo if gpt-5 unavailable
+PAGES_PER_CHUNK = 2
+API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # 🔒 your API key
+# ----------------------------------------------------
+
+client = OpenAI(api_key=API_KEY)
+
+PROMPT_REWRITE = """
+You are an expert OCR text restorer.
+Rewrite the following raw OCR text into clean, structured, human-readable content.
+Rules:
+- Preserve question numbers and options exactly.
+- Merge broken lines and fix spacing.
+- Keep (A), (B), (C), (D) properly aligned.
+- Do NOT omit or add content.
+- Output clean readable text only.
+
+Text:
+{raw_text}
+"""
+
+PROMPT_EXTRACT = """
+You are an expert question extractor.
+Extract ALL questions from the following text in EXACT CSV format:
+Question Number, Question, Option A, Option B, Option C, Option D, Correct Option, Explanation
+
+Rules:
+1. Keep line breaks and punctuation inside question text.
+2. Use semicolons instead of commas inside fields.
+3. If no options, leave A–D blank.
+4. Deduce correct option (a/b/c/d) and provide explanation.
+5. Return ONLY CSV rows — no markdown or extra text.
+
+Text:
+{page_text}
+"""
+
+# ----------------------------------------------------
+def ocr_pdf_if_needed(pdf_path):
+    """Run OCR if PDF has little or no text"""
+    doc = fitz.open(pdf_path)
+    text_len = sum(len(doc.load_page(i).get_text("text")) for i in range(min(3, len(doc))))
+    doc.close()
+
+    if text_len < 50:
+        ocr_path = pdf_path.replace(".pdf", "_ocr.pdf")
+        print(f"🧠 Running OCR on {os.path.basename(pdf_path)}...")
+        subprocess.run(["ocrmypdf", "--force-ocr", pdf_path, ocr_path], check=True)
+        print(f"✅ OCR complete: {ocr_path}")
+        return ocr_path
+    else:
+        print(f"✅ {os.path.basename(pdf_path)} already has text.")
+        return pdf_path
+
+# ----------------------------------------------------
+def extract_text_from_pdf(pdf_path):
+    """Extract text chunks from PDF"""
+    doc = fitz.open(pdf_path)
+    chunks = []
+    for i in range(0, len(doc), PAGES_PER_CHUNK):
+        text = ""
+        for j in range(i, min(i + PAGES_PER_CHUNK, len(doc))):
+            text += doc.load_page(j).get_text("text") + "\n"
+        chunks.append(text.strip())
+        print(f"   🔍 Extracted {len(text)} chars from pages {i+1}-{min(i+PAGES_PER_CHUNK, len(doc))}")
+    doc.close()
+    return chunks
+
+# ----------------------------------------------------
+def call_gpt(prompt):
+    """Call GPT model and return cleaned response"""
+    response = client.chat.completions.create(
+        model=MODEL,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    text = response.choices[0].message.content.strip()
+    # clean out markdown
+    text = re.sub(r"^```.*?csv", "", text, flags=re.IGNORECASE | re.DOTALL)
+    text = re.sub(r"```$", "", text).strip()
+    return text
+
+# ----------------------------------------------------
+def rewrite_text(raw_text):
+    """Rewrite OCR text cleanly using GPT"""
+    prompt = PROMPT_REWRITE.format(raw_text=raw_text)
+    return call_gpt(prompt)
+
+# ----------------------------------------------------
+def extract_csv(clean_text):
+    """Extract structured questions into CSV"""
+    prompt = PROMPT_EXTRACT.format(page_text=clean_text)
+    return call_gpt(prompt)
+
+# ----------------------------------------------------
+def process_pdf(pdf_path):
+    print(f"\n📘 Processing: {os.path.basename(pdf_path)}")
+    pdf_path = ocr_pdf_if_needed(pdf_path)
+
+    # Extract text
+    text_chunks = extract_text_from_pdf(pdf_path)
+    csv_results = []
+
+    for chunk in tqdm(text_chunks, desc="Processing pages"):
+        # Step 1: Rewrite OCR text
+        rewritten = rewrite_text(chunk)
+        # Step 2: Extract CSV
+        csv_output = extract_csv(rewritten)
+        csv_results.append(csv_output)
+        time.sleep(1.5)
+
+    all_csv = "\n".join(csv_results)
+    csv_path = os.path.join(
+        OUTPUT_FOLDER,
+        os.path.splitext(os.path.basename(pdf_path))[0] + "_extracted.csv"
+    )
+
+    with open(csv_path, "w", encoding="utf-8") as f:
+        f.write(all_csv)
+    print(f"✅ Saved structured CSV: {csv_path}")
+
+    return csv_path
+
+# ----------------------------------------------------
+def merge_csvs():
+    """Merge all individual CSVs into one master file"""
+    csv_files = [f for f in os.listdir(OUTPUT_FOLDER) if f.endswith("_extracted.csv")]
+    all_data = []
+    for f in csv_files:
+        try:
+            df = pd.read_csv(os.path.join(OUTPUT_FOLDER, f))
+            all_data.append(df)
+        except Exception:
+            print(f"⚠️ Skipped malformed CSV: {f}")
+    if all_data:
+        merged = pd.concat(all_data, ignore_index=True)
+        merged_path = os.path.join(OUTPUT_FOLDER, "all_extracted.csv")
+        merged.to_csv(merged_path, index=False)
+        print(f"📊 Merged CSV saved: {merged_path}")
+
+# ----------------------------------------------------
+def main():
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    pdfs = [os.path.join(PDF_FOLDER, f) for f in os.listdir(PDF_FOLDER) if f.lower().endswith(".pdf")]
+
+    if not pdfs:
+        print("⚠️ No PDFs found.")
+        return
+
+    for pdf in pdfs:
+        process_pdf(pdf)
+
+    merge_csvs()
+    print("\n🎉 All PDFs processed successfully!")
+
+# ----------------------------------------------------
+if __name__ == "__main__":
+    main()
