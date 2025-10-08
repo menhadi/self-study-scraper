@@ -1,169 +1,388 @@
-import os
-import fitz
-import subprocess
-import time
-import pandas as pd
-import re
+import os, re, fitz, subprocess, asyncio, aiofiles, pandas as pd, random, time, shutil
 from tqdm import tqdm
-from openai import OpenAI
+from openai import AsyncOpenAI
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font
 
-# ---------------------- CONFIG ----------------------
+# -------------------- CONFIG --------------------
 PDF_FOLDER = r"C:\Users\menha\Downloads\test"
 OUTPUT_FOLDER = r"C:\Users\menha\Downloads\test"
-MODEL = "gpt-5"  # use gpt-4.1-turbo if gpt-5 unavailable
-PAGES_PER_CHUNK = 2
-API_KEY = "sk-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"  # 🔒 your API key
-# ----------------------------------------------------
+DONE_FOLDER = os.path.join(OUTPUT_FOLDER, "done")
 
-client = OpenAI(api_key=API_KEY)
 
-PROMPT_REWRITE = """
-You are an expert OCR text restorer.
-Rewrite the following raw OCR text into clean, structured, human-readable content.
-Rules:
-- Preserve question numbers and options exactly.
-- Merge broken lines and fix spacing.
-- Keep (A), (B), (C), (D) properly aligned.
-- Do NOT omit or add content.
-- Output clean readable text only.
+# Models to try in order (fallback)
+MODEL_PRIORITY = ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"]
+# How many pages per GPT rewrite chunk (reduce if you hit context limits)
+CHUNK_PAGES = 8
+MAX_RETRIES = 3
+# Provide API key here or set OPENAI_API_KEY env var
+API_KEY = os.getenv("OPENAI_API_KEY", "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")
+# -------------------------------------------------
 
-Text:
-{raw_text}
+client = AsyncOpenAI(api_key=API_KEY)
+
+# ---------------- PROMPTS ----------------
+# Strict rewrite prompt: ask GPT to produce predictable blocks.
+REWRITE_PROMPT = """
+You are an expert OCR text restorer and formatter for exam papers.
+
+Task:
+Rewrite the following OCR text into a strict block format so it can be parsed deterministically.
+Rules (IMPORTANT):
+1. Each question must be a self-contained block separated by a blank line (one blank line between blocks).
+2. If a "statement" / "linked instruction" applies to following questions, put it as a separate block that starts with "Instruction: " followed by the text.
+3. Each question block MUST contain:
+   - A question number line starting with "Q." or "Q" followed by the number, e.g. "Q.82" or "Q82".
+   - Then the question text on one or more lines.
+   - Then four option lines, each starting on a new line exactly as:
+       (A) <text>
+       (B) <text>
+       (C) <text>
+       (D) <text>
+   - Optionally, at the end of the block you may include:
+       Correct Option: <A/B/C/D>   (if you can deduce it)
+       Explanation: <short explanation or blank>
+       Has Image: Yes/No
+4. Replace commas inside any field with semicolons (so CSV later won't break).
+5. Convert any math / formula to LaTeX (use $...$ or inline LaTeX).
+6. DO NOT output CSV here. Output ONLY the readable blocks described above.
+7. Keep the order exactly as the text.
+
+Now rewrite the text below following the rules exactly.
+
+=== OCR TEXT START ===
+{chunk_text}
+=== OCR TEXT END ===
 """
 
-PROMPT_EXTRACT = """
-You are an expert question extractor.
-Extract ALL questions from the following text in EXACT CSV format:
-Question Number, Question, Option A, Option B, Option C, Option D, Correct Option, Explanation
+# ---------------- Helper functions ----------------
+def repair_pdf(pdf_path):
+    """Repair PDF with Ghostscript if needed. Returns path (repaired or original)."""
+    repaired_path = pdf_path.replace(".pdf", "_fixed.pdf")
+    try:
+        cmd = [
+            "gswin64c", "-o", repaired_path,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            "-dPDFSETTINGS=/prepress",
+            "-dNOPAUSE", "-dBATCH", pdf_path
+        ]
+        subprocess.run(cmd, check=False)
+        if os.path.exists(repaired_path):
+            return repaired_path
+    except Exception:
+        pass
+    return pdf_path
 
-Rules:
-1. Keep line breaks and punctuation inside question text.
-2. Use semicolons instead of commas inside fields.
-3. If no options, leave A–D blank.
-4. Deduce correct option (a/b/c/d) and provide explanation.
-5. Return ONLY CSV rows — no markdown or extra text.
+def ocr_pdf(pdf_path):
+    """Run OCR (ocrmypdf) robustly. Returns OCRed path or original on failure."""
+    ocr_path = pdf_path.replace(".pdf", "_ocr.pdf")
+    repaired = repair_pdf(pdf_path)
+    try:
+        subprocess.run([
+            "ocrmypdf", "--force-ocr", "--skip-big", "--optimize", "0",
+            "--jpeg-quality", "80", "--continue-on-failure", "--output-type", "pdfa",
+            repaired, ocr_path
+        ], check=False)
+        if os.path.exists(ocr_path):
+            return ocr_path
+    except Exception:
+        pass
+    return repaired
 
-Text:
-{page_text}
-"""
-
-# ----------------------------------------------------
-def ocr_pdf_if_needed(pdf_path):
-    """Run OCR if PDF has little or no text"""
+def extract_pages_text(pdf_path):
+    """Return list of page text strings and image flags: [(page_no, text, has_image), ...]"""
     doc = fitz.open(pdf_path)
-    text_len = sum(len(doc.load_page(i).get_text("text")) for i in range(min(3, len(doc))))
+    pages = []
+    for i, page in enumerate(doc):
+        text = page.get_text("text").strip()
+        has_img = len(page.get_images()) > 0
+        pages.append((i + 1, text, has_img))
     doc.close()
+    return pages
 
-    if text_len < 50:
-        ocr_path = pdf_path.replace(".pdf", "_ocr.pdf")
-        print(f"🧠 Running OCR on {os.path.basename(pdf_path)}...")
-        subprocess.run(["ocrmypdf", "--force-ocr", pdf_path, ocr_path], check=True)
-        print(f"✅ OCR complete: {ocr_path}")
-        return ocr_path
-    else:
-        print(f"✅ {os.path.basename(pdf_path)} already has text.")
-        return pdf_path
+async def call_gpt_with_fallback(prompt):
+    """Try models in priority with a retry/backoff loop."""
+    for model in MODEL_PRIORITY:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = await client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                if resp and hasattr(resp, "choices") and resp.choices:
+                    return resp.choices[0].message.content
+                else:
+                    break
+            except Exception as e:
+                wait = (2 ** attempt) + random.random()
+                print(f"⚠️ GPT call failed (model={model}, attempt={attempt}): {e}")
+                print(f"⏳ Retrying in {wait:.1f}s...")
+                await asyncio.sleep(wait)
+                continue
+    # if all fail:
+    return ""
 
-# ----------------------------------------------------
-def extract_text_from_pdf(pdf_path):
-    """Extract text chunks from PDF"""
-    doc = fitz.open(pdf_path)
-    chunks = []
-    for i in range(0, len(doc), PAGES_PER_CHUNK):
-        text = ""
-        for j in range(i, min(i + PAGES_PER_CHUNK, len(doc))):
-            text += doc.load_page(j).get_text("text") + "\n"
-        chunks.append(text.strip())
-        print(f"   🔍 Extracted {len(text)} chars from pages {i+1}-{min(i+PAGES_PER_CHUNK, len(doc))}")
-    doc.close()
-    return chunks
+def clean_chunk_text_for_prompt(text):
+    """Light cleaning before sending to GPT (reduce weird chars)."""
+    # Replace multiple spaces and repeated newlines
+    t = text.replace("\r", "\n")
+    t = re.sub(r"\n{4,}", "\n\n", t)
+    t = re.sub(r"[ \t]{2,}", " ", t)
+    return t.strip()
 
-# ----------------------------------------------------
-def call_gpt(prompt):
-    """Call GPT model and return cleaned response"""
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}]
-    )
-    text = response.choices[0].message.content.strip()
-    # clean out markdown
-    text = re.sub(r"^```.*?csv", "", text, flags=re.IGNORECASE | re.DOTALL)
-    text = re.sub(r"```$", "", text).strip()
-    return text
+# ---------------- Parser (deterministic) ----------------
+def parse_rewritten_blocks(all_text):
+    """
+    Parse blocks written by GPT into exact 10-column rows.
+    Blocks expected:
+      - Instruction: text...
+      - Q.NN line...
+      - question lines...
+      - (A) option A text
+      - (B) option B text
+      - (C) option C text
+      - (D) option D text
+      - Correct Option: X
+      - Explanation: text
+      - Has Image: Yes/No
+    Returns list of dicts with fields:
+    Instruction, QuestionNumber, Question, OptionA..D, CorrectOption, Explanation, HasImage
+    """
+    rows = []
+    current_instruction = ""  # carry-forward instruction for following questions if applicable
 
-# ----------------------------------------------------
-def rewrite_text(raw_text):
-    """Rewrite OCR text cleanly using GPT"""
-    prompt = PROMPT_REWRITE.format(raw_text=raw_text)
-    return call_gpt(prompt)
+    # Normalize newlines and split into blocks by two or more newlines
+    blocks = re.split(r'\n\s*\n', all_text.strip())
+    for block in blocks:
+        b = block.strip()
+        if not b:
+            continue
 
-# ----------------------------------------------------
-def extract_csv(clean_text):
-    """Extract structured questions into CSV"""
-    prompt = PROMPT_EXTRACT.format(page_text=clean_text)
-    return call_gpt(prompt)
+        # Instruction block detection
+        if re.match(r'^(Instruction:|Statement|Statement for)', b, re.I):
+            # store as current instruction to apply to next question(s)
+            # strip the leading label
+            instr = re.sub(r'^(Instruction:|Statement for|Statement:)\s*', '', b, flags=re.I).strip()
+            # combine if multi-line
+            current_instruction = instr.replace('\n', ' ').strip()
+            continue
 
-# ----------------------------------------------------
-def process_pdf(pdf_path):
+        # Now a question block
+        # default row template
+        row = {
+            "Instruction": current_instruction or "",
+            "Question Number": "",
+            "Question": "",
+            "Option A": "",
+            "Option B": "",
+            "Option C": "",
+            "Option D": "",
+            "Correct Option": "",
+            "Explanation": "",
+            "Has Image": "No"
+        }
+
+        lines = [ln.strip() for ln in b.splitlines() if ln.strip()]
+
+        # Find question number line (first line that contains Q. or Q or starts with a number)
+        qline_idx = None
+        for i, ln in enumerate(lines[:2]):  # usually first or second line
+            m = re.search(r'(Q\.?\s*\d+|Q\d+|\bQ\s*\d+\b|\b\d+\b)', ln, re.I)
+            if m:
+                qline_idx = i
+                qnum = m.group(0)
+                # normalize Q.82 -> Q.82
+                qnum = re.sub(r'\s+', '', qnum)
+                row["Question Number"] = qnum
+                # question text starts after the qnum in this same line
+                question_text = re.sub(re.escape(m.group(0)), '', ln, count=1).strip()
+                # collect following lines until we hit option (A)
+                qtext_lines = []
+                if question_text:
+                    qtext_lines.append(question_text)
+                # append subsequent lines until option pattern
+                j = i + 1
+                while j < len(lines) and not re.match(r'^\(?A\)?\s*[)\.\-:]', lines[j], re.I) and not re.match(r'^\(A\)', lines[j], re.I):
+                    qtext_lines.append(lines[j])
+                    j += 1
+                row["Question"] = ' '.join(qtext_lines).replace(',', ';').strip()
+                # Now from j parse options
+                k = j
+                opt_map = {}
+                while k < len(lines):
+                    mopt = re.match(r'^\(?([A-D])\)?[\)\.\-:]*\s*(.*)$', lines[k], re.I)
+                    if mopt:
+                        opt_label = mopt.group(1).upper()
+                        opt_text = mopt.group(2).strip()
+                        # if option spans multiple lines: collect subsequent lines until next option or Correct or Explanation or Has Image
+                        k2 = k + 1
+                        more = []
+                        while k2 < len(lines) and not re.match(r'^\(?[A-D]\)?[\)\.\-:]', lines[k2], re.I) and not re.match(r'^(Correct Option:|Explanation:|Has Image:)', lines[k2], re.I):
+                            more.append(lines[k2])
+                            k2 += 1
+                        if more:
+                            opt_text = (opt_text + ' ' + ' '.join(more)).strip()
+                        opt_map[opt_label] = opt_text.replace(',', ';').strip()
+                        k = k2
+                        continue
+                    # Correct Option
+                    mco = re.match(r'^Correct Option\s*:\s*([A-Da-d])', lines[k], re.I)
+                    if mco:
+                        row["Correct Option"] = mco.group(1).upper()
+                        k += 1
+                        continue
+                    # Explanation
+                    mex = re.match(r'^Explanation\s*:\s*(.*)$', lines[k], re.I)
+                    if mex:
+                        row["Explanation"] = mex.group(1).replace(',', ';').strip()
+                        # collect trailing explanation lines if any
+                        k2 = k + 1
+                        expl_more = []
+                        while k2 < len(lines) and not re.match(r'^(Has Image:)', lines[k2], re.I):
+                            expl_more.append(lines[k2])
+                            k2 += 1
+                        if expl_more:
+                            row["Explanation"] += ' ' + ' '.join(expl_more)
+                        row["Explanation"] = row["Explanation"].strip()
+                        k = k2
+                        continue
+                    # Has Image
+                    mhi = re.match(r'^Has Image\s*:\s*(Yes|No)', lines[k], re.I)
+                    if mhi:
+                        row["Has Image"] = "Yes" if mhi.group(1).lower() == 'yes' else "No"
+                        k += 1
+                        continue
+                    # if nothing matched, increment
+                    k += 1
+                # after loop put options into row
+                row["Option A"] = opt_map.get('A', '')
+                row["Option B"] = opt_map.get('B', '')
+                row["Option C"] = opt_map.get('C', '')
+                row["Option D"] = opt_map.get('D', '')
+                # If question number was not detected but the block contains just a question, try to find it
+                if not row["Question Number"]:
+                    # try first token Q.x
+                    m2 = re.match(r'^(Q\.?\s*\d+|\b\d+\b)', lines[0], re.I)
+                    if m2:
+                        row["Question Number"] = re.sub(r'\s+', '', m2.group(0))
+                rows.append(row)
+                # Once a question parsed, we clear instruction (so instruction doesn't automatically apply forever)
+                current_instruction = ""
+                break
+
+        # If block didn't match a question but had a short note, ignore or treat as residual instruction (already handled above)
+    return rows
+
+# ------------------- Main processing flow -------------------
+async def process_pdf_file(pdf_path):
     print(f"\n📘 Processing: {os.path.basename(pdf_path)}")
-    pdf_path = ocr_pdf_if_needed(pdf_path)
+    # step 1: OCR (if scanned)
+    pages = extract_pages_text(pdf_path)
+    # if very few characters on first pages, run OCR
+    sample_chars = sum(len(t) for (_, t, _) in pages[:3]) if pages else 0
+    if sample_chars < 50:
+        print("🔍 Low text detected -> running OCR")
+        ocr_path = ocr_pdf(pdf_path)
+        pages = extract_pages_text(ocr_path)
+    # chunk pages to avoid hitting model limits
+    chunks = []
+    cur = []
+    cur_pages_idx = []
+    for idx, (pno, text, has_img) in enumerate(pages):
+        cur.append((pno, text, has_img))
+        cur_pages_idx.append(pno)
+        if len(cur) >= CHUNK_PAGES:
+            chunks.append(cur)
+            cur = []
+            cur_pages_idx = []
+    if cur:
+        chunks.append(cur)
 
-    # Extract text
-    text_chunks = extract_text_from_pdf(pdf_path)
-    csv_results = []
+    rewritten_blocks_by_chunk = []
+    # For each chunk ask GPT to rewrite into strict blocks
+    for chunk in tqdm(chunks, desc="Rewriting chunks"):
+        chunk_text = "\n\n".join([t for (_, t, _) in chunk])
+        chunk_text = clean_chunk_text_for_prompt(chunk_text)
+        prompt = REWRITE_PROMPT.format(chunk_text=chunk_text)
+        rewritten = await call_gpt_with_fallback(prompt)
+        if not rewritten:
+            print("⚠️ GPT rewrite returned empty for a chunk — continuing with raw text fallback")
+            # fallback: use raw chunk text but try to add separators heuristically
+            # convert lines with (A) etc into separated lines
+            raw_fallback = chunk_text
+            raw_fallback = re.sub(r'\s*\(A\)\s*', '\n(A) ', raw_fallback)
+            raw_fallback = re.sub(r'\s*\(B\)\s*', '\n(B) ', raw_fallback)
+            raw_fallback = re.sub(r'\s*\(C\)\s*', '\n(C) ', raw_fallback)
+            raw_fallback = re.sub(r'\s*\(D\)\s*', '\n(D) ', raw_fallback)
+            rewritten = raw_fallback
+        rewritten_blocks_by_chunk.append(rewritten)
 
-    for chunk in tqdm(text_chunks, desc="Processing pages"):
-        # Step 1: Rewrite OCR text
-        rewritten = rewrite_text(chunk)
-        # Step 2: Extract CSV
-        csv_output = extract_csv(rewritten)
-        csv_results.append(csv_output)
-        time.sleep(1.5)
+    # Combine rewritten chunks in original order
+    combined_text = "\n\n".join(rewritten_blocks_by_chunk)
 
-    all_csv = "\n".join(csv_results)
-    csv_path = os.path.join(
-        OUTPUT_FOLDER,
-        os.path.splitext(os.path.basename(pdf_path))[0] + "_extracted.csv"
-    )
+    # Parse combined text deterministically
+    rows = parse_rewritten_blocks(combined_text)
+    # Build DataFrame with exact column order
+    df = pd.DataFrame(rows, columns=[
+        "Instruction", "Question Number", "Question",
+        "Option A", "Option B", "Option C", "Option D",
+        "Correct Option", "Explanation", "Has Image"
+    ])
 
-    with open(csv_path, "w", encoding="utf-8") as f:
-        f.write(all_csv)
-    print(f"✅ Saved structured CSV: {csv_path}")
+    # Save per-PDF CSV
+    base = os.path.splitext(os.path.basename(pdf_path))[0]
+    csv_path = os.path.join(OUTPUT_FOLDER, base + "_extracted.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"✅ Saved: {csv_path}")
+
+    # Move processed PDF to done folder
+    os.makedirs(DONE_FOLDER, exist_ok=True)
+    try:
+        shutil.move(pdf_path, os.path.join(DONE_FOLDER, os.path.basename(pdf_path)))
+    except Exception:
+        pass
 
     return csv_path
 
-# ----------------------------------------------------
-def merge_csvs():
-    """Merge all individual CSVs into one master file"""
+async def merge_all_csvs():
     csv_files = [f for f in os.listdir(OUTPUT_FOLDER) if f.endswith("_extracted.csv")]
-    all_data = []
+    frames = []
     for f in csv_files:
         try:
-            df = pd.read_csv(os.path.join(OUTPUT_FOLDER, f))
-            all_data.append(df)
-        except Exception:
-            print(f"⚠️ Skipped malformed CSV: {f}")
-    if all_data:
-        merged = pd.concat(all_data, ignore_index=True)
-        merged_path = os.path.join(OUTPUT_FOLDER, "all_extracted.csv")
-        merged.to_csv(merged_path, index=False)
-        print(f"📊 Merged CSV saved: {merged_path}")
+            frames.append(pd.read_csv(os.path.join(OUTPUT_FOLDER, f)))
+        except Exception as e:
+            print(f"⚠️ Skipping malformed CSV {f}: {e}")
+    if frames:
+        merged = pd.concat(frames, ignore_index=True)
+        out = os.path.join(OUTPUT_FOLDER, "all_extracted.xlsx")
+        merged.to_excel(out, index=False)
+        # style header
+        wb = load_workbook(out)
+        ws = wb.active
+        header_fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF", fill_type="solid")
+        bold_font = Font(bold=True)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = bold_font
+        wb.save(out)
+        print(f"📊 Merged Excel saved: {out}")
 
-# ----------------------------------------------------
-def main():
+async def main():
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     pdfs = [os.path.join(PDF_FOLDER, f) for f in os.listdir(PDF_FOLDER) if f.lower().endswith(".pdf")]
-
     if not pdfs:
-        print("⚠️ No PDFs found.")
+        print("⚠️ No PDF files found.")
         return
 
     for pdf in pdfs:
-        process_pdf(pdf)
+        try:
+            await process_pdf_file(pdf)
+        except Exception as e:
+            print(f"❌ Error processing {pdf}: {e}")
 
-    merge_csvs()
-    print("\n🎉 All PDFs processed successfully!")
+    await merge_all_csvs()
+    print("\n🎉 All done!")
 
-# ----------------------------------------------------
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
