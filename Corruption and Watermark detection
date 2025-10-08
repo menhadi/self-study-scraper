@@ -1,0 +1,309 @@
+import os
+import PyPDF2
+import fitz  # PyMuPDF
+from pathlib import Path
+import logging
+
+def setup_logging():
+    """Setup logging configuration"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('pdf_analysis_report.log', encoding='utf-8'),
+            logging.StreamHandler()
+        ]
+    )
+
+def check_pdf_corruption(pdf_path):
+    """Check if PDF is corrupted using multiple methods"""
+    corruption_issues = []
+    
+    try:
+        # Method 1: Try to open with PyPDF2
+        with open(pdf_path, 'rb') as file:
+            reader = PyPDF2.PdfReader(file)
+            if len(reader.pages) == 0:
+                corruption_issues.append("No pages found")
+            # Try to read some text from first page
+            if len(reader.pages) > 0:
+                page = reader.pages[0]
+                text = page.extract_text()
+    except Exception as e:
+        corruption_issues.append(f"PyPDF2 error: {str(e)}")
+    
+    try:
+        # Method 2: Try to open with PyMuPDF
+        doc = fitz.open(pdf_path)
+        if doc.is_encrypted:
+            corruption_issues.append("Encrypted PDF")
+        if doc.needs_pass:
+            corruption_issues.append("Password protected")
+        doc.close()
+    except Exception as e:
+        corruption_issues.append(f"PyMuPDF error: {str(e)}")
+    
+    return corruption_issues
+
+def detect_watermarks(pdf_path):
+    """Detect potential watermarks in PDF and extract watermark text"""
+    watermark_indicators = []
+    watermark_texts = set()  # Use set to avoid duplicates
+    
+    try:
+        doc = fitz.open(pdf_path)
+        
+        # Common watermark phrases to look for
+        watermark_keywords = [
+            'sample', 'demo', 'draft', 'confidential', 'copyright',
+            'do not copy', 'watermark', 'preview', 'evaluation',
+            'unauthorized', 'property of', '©', '®', '™', 'not for distribution',
+            'for review only', 'classified', 'internal use', 'proprietary',
+            'restricted', 'personal copy', 'void', 'trial', 'test document'
+        ]
+        
+        for page_num in range(len(doc)):
+            page = doc[page_num]
+            
+            # Check for images (common watermark method)
+            image_list = page.get_images()
+            if image_list:
+                watermark_indicators.append(f"Page {page_num+1}: {len(image_list)} images found")
+            
+            # Check for semi-transparent text or graphics
+            drawings = page.get_drawings()
+            if drawings:
+                for draw in drawings:
+                    if 'fill_opacity' in draw and draw['fill_opacity'] < 1.0:
+                        watermark_indicators.append(f"Page {page_num+1}: Semi-transparent elements found")
+                        break
+            
+            # Extract all text and check for watermark keywords
+            text = page.get_text()
+            text_lower = text.lower()
+            
+            # Look for watermark keywords in the text
+            found_keywords = []
+            for keyword in watermark_keywords:
+                if keyword in text_lower:
+                    found_keywords.append(keyword)
+                    
+                    # Extract the actual watermark text (not just keyword)
+                    lines = text.split('\n')
+                    for line in lines:
+                        line_lower = line.lower()
+                        if keyword in line_lower:
+                            # Clean up the text and add to watermark texts
+                            clean_text = line.strip()
+                            if len(clean_text) > 3 and len(clean_text) < 100:  # Reasonable length for watermark
+                                watermark_texts.add(clean_text)
+            
+            if found_keywords:
+                watermark_indicators.append(f"Page {page_num+1}: Watermark keywords found: {', '.join(found_keywords)}")
+            
+            # Check for diagonal/rotated text (common watermark placement)
+            text_instances = page.get_text("words")
+            rotated_texts = []
+            for inst in text_instances:
+                # If text is rotated, it might be a watermark
+                if abs(inst[3] - inst[1]) > 5:  # Check if text is rotated
+                    rotated_text = inst[4].strip()
+                    if len(rotated_text) > 3 and len(rotated_text) < 100:
+                        rotated_texts.append(rotated_text)
+                        watermark_texts.add(rotated_text)
+            
+            if rotated_texts:
+                watermark_indicators.append(f"Page {page_num+1}: Rotated text found: {', '.join(rotated_texts[:3])}")  # Show first 3
+        
+        doc.close()
+        
+    except Exception as e:
+        watermark_indicators.append(f"Error analyzing: {str(e)}")
+    
+    return watermark_indicators, list(watermark_texts)
+
+def analyze_pdf_folder(folder_path):
+    """Analyze all PDFs in folder for corruption and watermarks"""
+    folder = Path(folder_path)
+    
+    if not folder.exists():
+        logging.error(f"Folder not found: {folder_path}")
+        return
+    
+    pdf_files = list(folder.glob("*.pdf"))
+    
+    if not pdf_files:
+        logging.error("No PDF files found in the folder")
+        return
+    
+    logging.info(f"Found {len(pdf_files)} PDF files to analyze")
+    
+    corrupted_files = []
+    watermarked_files = []
+    clean_files = []
+    
+    print(f"\nAnalyzing {len(pdf_files)} PDF files...")
+    print("=" * 60)
+    
+    for i, pdf_file in enumerate(pdf_files, 1):
+        print(f"Processing {i}/{len(pdf_files)}: {pdf_file.name}")
+        
+        # Check for corruption
+        corruption_issues = check_pdf_corruption(pdf_file)
+        if corruption_issues:
+            corrupted_files.append({
+                'filename': pdf_file.name,
+                'issues': corruption_issues
+            })
+            logging.warning(f"Corrupted: {pdf_file.name} - {corruption_issues}")
+            continue
+        
+        # Check for watermarks
+        watermark_indicators, watermark_texts = detect_watermarks(pdf_file)
+        
+        if watermark_indicators:
+            watermarked_files.append({
+                'filename': pdf_file.name,
+                'indicators': watermark_indicators,
+                'watermark_texts': watermark_texts
+            })
+            logging.info(f"Watermarked: {pdf_file.name} - Texts: {watermark_texts}")
+        else:
+            clean_files.append({
+                'filename': pdf_file.name,
+                'watermark_texts': []
+            })
+            logging.info(f"Clean: {pdf_file.name}")
+    
+    # Generate reports
+    generate_reports(folder, corrupted_files, watermarked_files, clean_files)
+    
+    return corrupted_files, watermarked_files, clean_files
+
+def generate_reports(folder, corrupted_files, watermarked_files, clean_files):
+    """Generate text file reports in table format"""
+    
+    # Report 1: Watermark Table Report (Main Request)
+    with open(folder / 'watermark_table_report.txt', 'w', encoding='utf-8') as f:
+        f.write("WATERMARK ANALYSIS REPORT - TABLE FORMAT\n")
+        f.write("=" * 100 + "\n")
+        f.write(f"{'File Name':<60} {'Watermark':<12} {'Watermark Text':<50}\n")
+        f.write("-" * 100 + "\n")
+        
+        # Add watermarked files
+        for file_info in watermarked_files:
+            filename = file_info['filename']
+            watermark_texts = file_info['watermark_texts']
+            
+            if len(filename) > 59:
+                filename = filename[:56] + "..."
+            
+            if watermark_texts:
+                # Join first 3 watermark texts (or all if less than 3)
+                text_display = ", ".join(watermark_texts[:3])
+                if len(watermark_texts) > 3:
+                    text_display += f" ... (+{len(watermark_texts)-3} more)"
+            else:
+                text_display = "Text not extractable"
+                
+            if len(text_display) > 49:
+                text_display = text_display[:46] + "..."
+                
+            f.write(f"{filename:<60} {'Yes':<12} {text_display:<50}\n")
+        
+        # Add clean files
+        for file_info in clean_files:
+            filename = file_info['filename']
+            if len(filename) > 59:
+                filename = filename[:56] + "..."
+            f.write(f"{filename:<60} {'No':<12} {'':<50}\n")
+        
+        f.write("-" * 100 + "\n")
+        f.write(f"Total files: {len(watermarked_files) + len(clean_files)}\n")
+        f.write(f"With watermarks: {len(watermarked_files)}\n")
+        f.write(f"Without watermarks: {len(clean_files)}\n")
+    
+    # Report 2: Detailed Watermark Report
+    with open(folder / 'watermark_detailed_report.txt', 'w', encoding='utf-8') as f:
+        f.write("DETAILED WATERMARK ANALYSIS REPORT\n")
+        f.write("=" * 80 + "\n")
+        f.write(f"Total watermarked files: {len(watermarked_files)}\n\n")
+        
+        for file_info in watermarked_files:
+            f.write(f"File: {file_info['filename']}\n")
+            f.write("Watermark texts found:\n")
+            for text in file_info['watermark_texts']:
+                f.write(f"  - '{text}'\n")
+            f.write("Detection indicators:\n")
+            for indicator in file_info['indicators']:
+                f.write(f"  - {indicator}\n")
+            f.write("-" * 80 + "\n")
+    
+    # Report 3: Corrupted PDFs
+    with open(folder / 'corrupted_pdfs_report.txt', 'w', encoding='utf-8') as f:
+        f.write("CORRUPTED PDF FILES REPORT\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Total corrupted files: {len(corrupted_files)}\n\n")
+        
+        for file_info in corrupted_files:
+            f.write(f"File: {file_info['filename']}\n")
+            f.write("Issues found:\n")
+            for issue in file_info['issues']:
+                f.write(f"  - {issue}\n")
+            f.write("-" * 40 + "\n")
+    
+    # Report 4: Clean PDFs
+    with open(folder / 'clean_pdfs_report.txt', 'w', encoding='utf-8') as f:
+        f.write("CLEAN PDF FILES REPORT\n")
+        f.write("=" * 50 + "\n")
+        f.write(f"Total clean files: {len(clean_files)}\n\n")
+        
+        for file_info in clean_files:
+            f.write(f"{file_info['filename']}\n")
+    
+    # Summary report
+    with open(folder / 'pdf_analysis_summary.txt', 'w', encoding='utf-8') as f:
+        f.write("PDF ANALYSIS SUMMARY\n")
+        f.write("=" * 50 + "\n")
+        total_files = len(corrupted_files) + len(watermarked_files) + len(clean_files)
+        f.write(f"Total PDF files analyzed: {total_files}\n")
+        f.write(f"Corrupted files: {len(corrupted_files)}\n")
+        f.write(f"Watermarked files: {len(watermarked_files)}\n")
+        f.write(f"Clean files: {len(clean_files)}\n")
+        f.write("\nReport files generated:\n")
+        f.write("- watermark_table_report.txt (Main table format)\n")
+        f.write("- watermark_detailed_report.txt\n")
+        f.write("- corrupted_pdfs_report.txt\n")
+        f.write("- clean_pdfs_report.txt\n")
+        f.write("- pdf_analysis_summary.txt\n")
+    
+    # Print summary to console
+    print("\n" + "=" * 60)
+    print("ANALYSIS COMPLETE")
+    print("=" * 60)
+    print(f"Total PDFs analyzed: {total_files}")
+    print(f"✅ Clean files: {len(clean_files)}")
+    print(f"⚠️  Watermarked files: {len(watermarked_files)}")
+    print(f"❌ Corrupted files: {len(corrupted_files)}")
+    print(f"\nMain report: watermark_table_report.txt")
+    print(f"All reports saved in: {folder}")
+
+def main():
+    setup_logging()
+    
+    print("PDF Analysis Tool - Corruption & Watermark Detection")
+    print("=" * 50)
+    
+    folder_path = input("Enter PDF folder path: ").strip()
+    
+    if not os.path.exists(folder_path):
+        print("Folder does not exist!")
+        return
+    
+    analyze_pdf_folder(folder_path)
+
+if __name__ == "__main__":
+    # Install required packages first:
+    # pip install pypdf2 pymupdf
+    
+    main()
