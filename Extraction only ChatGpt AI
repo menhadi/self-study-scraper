@@ -1,0 +1,258 @@
+import os, re, fitz, subprocess, asyncio, pandas as pd, random, shutil
+from tqdm import tqdm
+from openai import AsyncOpenAI
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font
+
+# ---------------- CONFIG ----------------
+PDF_FOLDER = r"C:\Users\menha\Downloads\test"
+OUTPUT_FOLDER = r"C:\Users\menha\Downloads\test"
+DONE_FOLDER = os.path.join(OUTPUT_FOLDER, "done")
+
+OPENAI_MODELS = ["gpt-4o", "gpt-4o-mini"]
+CHUNK_PAGES = 8
+MAX_RETRIES = 3
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "tk4Tvy50y5OhgPlTuUzVWtvibcjt_iqPOqaFr8wPlNLwJ5jTQFAigdF36uvpRazk4Glc43ee5lT3BlbkFJsP_8hzWxqUiOgkCOoRDni_QqbYA6C4CVtsQrvpMD0GnCTPcXGzaXgO1sKkRrllFr97F5Zh0BwA")
+
+client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+# ---------------- PROMPTS ----------------
+REWRITE_PROMPT = """
+You are an expert at converting exam OCR text into structured, machine-readable form.
+
+Extract the content into **strictly labeled sections** as shown below.
+Include all details, equations, and explanations exactly as they appear. 
+Preserve all line breaks and symbols.
+
+---
+
+### REQUIRED OUTPUT FORMAT (NO VARIATION)
+
+Instruction → <text before Q1; if none, leave blank>
+
+Q<number> → <question number>
+Question Text → <entire question text till first option>
+Option (A) → <text of option A>
+Option (B) → <text of option B>
+Option (C) → <text of option C>
+Option (D) → <text of option D>
+Correct Option → <A/B/C/D; leave blank if not available>
+Explanation → <full explanation; include multiple lines if given, else blank>
+Image Present → <Yes/No>
+
+---
+
+### RULES
+- Use exactly the key names shown (e.g., "Option (A) →").
+- Each field must appear even if blank.
+- Each question block separated by one blank line.
+- Preserve all text formatting, math symbols, and line breaks.
+- If instructions appear for a group of questions, repeat them in each relevant block.
+- If no explanation or image info is found, leave blank.
+
+---
+
+=== OCR TEXT START ===
+{chunk_text}
+=== OCR TEXT END ===
+"""
+
+REPAIR_PROMPT = """
+The previous output was missing some fields or text (especially Instruction or Explanation). 
+Reformat and re-emit it in the same exact schema. 
+Do not drop any content. Merge multi-line parts into the same field if needed.
+
+Format to follow:
+
+Instruction → <...>
+Q<number> → <...>
+Question Text → <...>
+Option (A) → <...>
+Option (B) → <...>
+Option (C) → <...>
+Option (D) → <...>
+Correct Option → <...>
+Explanation → <...>
+Image Present → <Yes/No>
+
+Here is your previous output:
+===
+{previous_output}
+===
+"""
+
+# ---------------- UTILITIES ----------------
+def extract_pages_text(pdf_path):
+    doc = fitz.open(pdf_path)
+    pages = []
+    for i, page in enumerate(doc):
+        text = page.get_text("text").strip()
+        has_img = len(page.get_images()) > 0
+        pages.append((i + 1, text, has_img))
+    doc.close()
+    return pages
+
+def preprocess_text(text):
+    text = text.replace("\r", "\n")
+    text = re.sub(r"(Q\.?\s*\d+)\s*\n", r"\1 ", text)
+    text = re.sub(r"\s*\(?A\)?[\)\.\-:]\s*", r"\n(A) ", text)
+    text = re.sub(r"\s*\(?B\)?[\)\.\-:]\s*", r"\n(B) ", text)
+    text = re.sub(r"\s*\(?C\)?[\)\.\-:]\s*", r"\n(C) ", text)
+    text = re.sub(r"\s*\(?D\)?[\)\.\-:]\s*", r"\n(D) ", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+async def call_openai(prompt, model):
+    resp = await client.chat.completions.create(
+        model=model,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.1
+    )
+    return resp.choices[0].message.content if resp and resp.choices else ""
+
+async def call_openai_with_fallback(prompt):
+    for model in OPENAI_MODELS:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                print(f"🔍 Calling {model} (attempt {attempt})...")
+                out = await call_openai(prompt, model)
+                if out:
+                    print(f"✅ Success with {model}")
+                    return out
+            except Exception as e:
+                wait = (2 ** attempt) + random.random()
+                print(f"⚠️ {model} error: {e} — retry in {wait:.1f}s")
+                await asyncio.sleep(wait)
+    return ""
+
+# ---------------- ENHANCED PARSER ----------------
+def parse_extracted_text(all_text):
+    """Capture multi-line fields and keep structure stable"""
+    rows, current = [], {}
+    lines = [ln.rstrip() for ln in all_text.splitlines() if ln.strip()]
+    key_pattern = re.compile(r"^(Instruction|Q\d+|Question Text|Option\s*\([A-D]\)|Correct Option|Explanation|Image Present)\s*→")
+
+    def commit():
+        if current:
+            for k in [
+                "Instruction", "Question Number", "Question Text",
+                "Option (A)", "Option (B)", "Option (C)", "Option (D)",
+                "Correct Option", "Explanation", "Image Present"
+            ]:
+                current.setdefault(k, "")
+            rows.append({
+                "Instruction": current["Instruction"],
+                "Question Number": current["Question Number"],
+                "Question": current["Question Text"],
+                "Option A": current["Option (A)"],
+                "Option B": current["Option (B)"],
+                "Option C": current["Option (C)"],
+                "Option D": current["Option (D)"],
+                "Correct Option": current["Correct Option"],
+                "Explanation": current["Explanation"],
+                "Image Present": current["Image Present"]
+            })
+
+    current_key = None
+    for line in lines:
+        if key_pattern.match(line):
+            key, val = line.split("→", 1)
+            key, val = key.strip(), val.strip()
+            if re.match(r"^Q\d+", key):
+                if "Question Number" in current:
+                    commit()
+                    current = {}
+                current["Question Number"] = key
+                current_key = "Question Text"  # next lines are likely question text
+            elif key.startswith("Instruction"):
+                if current: commit()
+                current = {"Instruction": val}
+                current_key = "Instruction"
+            elif key.startswith("Option ("):
+                current[key] = val
+                current_key = key
+            elif key.startswith("Question Text"):
+                current["Question Text"] = val
+                current_key = "Question Text"
+            elif key.startswith("Correct Option"):
+                current["Correct Option"] = val
+                current_key = "Correct Option"
+            elif key.startswith("Explanation"):
+                current["Explanation"] = val
+                current_key = "Explanation"
+            elif key.startswith("Image Present"):
+                current["Image Present"] = val
+                current_key = "Image Present"
+        else:
+            # continuation of previous multi-line field
+            if current_key:
+                current[current_key] = (current.get(current_key, "") + "\n" + line.strip()).strip()
+    commit()
+    return pd.DataFrame(rows)
+
+def verify_output_format(text):
+    """Check if GPT output contains all key markers"""
+    must = ["Question Text →", "Option (A) →", "Option (B) →", "Option (C) →", "Option (D) →", "Image Present →"]
+    return all(m in text for m in must)
+
+# ---------------- MAIN ----------------
+async def process_pdf_file(pdf_path):
+    print(f"\n📘 Processing: {os.path.basename(pdf_path)}")
+    doc_pages = extract_pages_text(pdf_path)
+    chunks = [doc_pages[i:i+CHUNK_PAGES] for i in range(0, len(doc_pages), CHUNK_PAGES)]
+    all_text = ""
+
+    for chunk in tqdm(chunks, desc="ChatGPT Extraction"):
+        chunk_text = "\n\n".join([t for (_, t, _) in chunk])
+        prompt = REWRITE_PROMPT.format(chunk_text=preprocess_text(chunk_text))
+        result = await call_openai_with_fallback(prompt)
+
+        if not verify_output_format(result):
+            print("⚠️ Auto-repair triggered for missing/incomplete fields...")
+            repair_prompt = REPAIR_PROMPT.format(previous_output=result)
+            result = await call_openai_with_fallback(repair_prompt)
+
+        all_text += "\n\n" + result
+
+    df = parse_extracted_text(all_text)
+    base = os.path.splitext(os.path.basename(pdf_path))[0]
+    excel_path = os.path.join(OUTPUT_FOLDER, base + "_chatgpt_extracted.xlsx")
+    df.to_excel(excel_path, index=False)
+
+    # Format header
+    wb = load_workbook(excel_path)
+    ws = wb.active
+    fill = PatternFill(start_color="E8EAF6", end_color="E8EAF6", fill_type="solid")
+    font = Font(bold=True)
+    for cell in ws[1]:
+        cell.fill = fill
+        cell.font = font
+    wb.save(excel_path)
+    print(f"✅ Saved verified Excel: {excel_path}")
+    return excel_path
+
+async def main():
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    pdfs = [os.path.join(PDF_FOLDER, f) for f in os.listdir(PDF_FOLDER) if f.lower().endswith(".pdf")]
+    if not pdfs:
+        print("⚠️ No PDF files found.")
+        return
+
+    merged = []
+    for pdf in pdfs:
+        try:
+            xlsx = await process_pdf_file(pdf)
+            merged.append(pd.read_excel(xlsx))
+        except Exception as e:
+            print(f"❌ Error in {pdf}: {e}")
+
+    if merged:
+        final = pd.concat(merged, ignore_index=True)
+        merged_path = os.path.join(OUTPUT_FOLDER, "All_ChatGPT_Extracted.xlsx")
+        final.to_excel(merged_path, index=False)
+        print(f"📊 Merged file saved: {merged_path}")
+
+    print("\n🎯 Extraction complete with enhanced multi-line capture and repair.")
+
+if __name__ == "__main__":
+    asyncio.run(main())
