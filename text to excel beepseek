@@ -1,0 +1,384 @@
+import pandas as pd
+import re
+import requests
+import json
+from pathlib import Path
+import time
+
+class DeepSeekParser:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api.deepseek.com/v1/chat/completions"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+    
+    def parse_questions_with_ai(self, text_content):
+        """
+        Use DeepSeek API to properly parse questions with mathematical notation
+        """
+        prompt = """
+        I have a text from an aerospace engineering question paper that contains questions with mathematical notation using backslashes (like \frac, \partial, etc.). 
+        Please parse this text and extract ALL questions (Q.1 to Q.85) with their complete options.
+
+        IMPORTANT: 
+        1. Preserve ALL mathematical notation including backslashes exactly as they appear
+        2. Extract the question text and all four options (A, B, C, D) for each question
+        3. If an option starts with a backslash, include the entire option text including the backslash
+        4. Return the data in JSON format with this structure:
+        {
+            "questions": [
+                {
+                    "question_number": 1,
+                    "question_text": "complete question text here",
+                    "option_a": "complete option A text",
+                    "option_b": "complete option B text", 
+                    "option_c": "complete option C text",
+                    "option_d": "complete option D text"
+                }
+            ]
+        }
+
+        Here is the text content:
+        """
+        
+        # Split content into chunks if too large
+        max_chunk_size = 12000
+        if len(text_content) > max_chunk_size:
+            chunks = self.split_content(text_content, max_chunk_size)
+            all_questions = []
+            
+            for i, chunk in enumerate(chunks):
+                print(f"  Processing chunk {i+1}/{len(chunks)} with AI...")
+                chunk_questions = self.process_chunk_with_ai(chunk, i)
+                all_questions.extend(chunk_questions)
+                time.sleep(1)  # Rate limiting
+            
+            return all_questions
+        else:
+            return self.process_chunk_with_ai(text_content, 0)
+    
+    def split_content(self, content, chunk_size):
+        """Split content into manageable chunks"""
+        chunks = []
+        current_chunk = ""
+        
+        # Split by questions to keep them intact
+        question_parts = re.split(r'(Q\.\s*\d+)', content)
+        
+        for i in range(0, len(question_parts), 2):
+            if i + 1 < len(question_parts):
+                question_block = question_parts[i] + question_parts[i + 1]
+                
+                if len(current_chunk) + len(question_block) > chunk_size and current_chunk:
+                    chunks.append(current_chunk)
+                    current_chunk = question_block
+                else:
+                    current_chunk += question_block
+        
+        if current_chunk:
+            chunks.append(current_chunk)
+        
+        return chunks
+    
+    def process_chunk_with_ai(self, chunk, chunk_index):
+        """Process a single chunk with AI"""
+        prompt = f"""
+        Extract all questions from this text chunk. Preserve ALL mathematical notation including backslashes.
+        Return as JSON with this exact structure:
+        {{
+            "questions": [
+                {{
+                    "question_number": 1,
+                    "question_text": "full question text with all math notation",
+                    "option_a": "full option A text", 
+                    "option_b": "full option B text",
+                    "option_c": "full option C text",
+                    "option_d": "full option D text"
+                }}
+            ]
+        }}
+        
+        Text chunk:
+        {chunk}
+        """
+        
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You are an expert at parsing technical question papers. You preserve all mathematical notation exactly as written, including backslashes in LaTeX commands."
+                },
+                {
+                    "role": "user", 
+                    "content": prompt
+                }
+            ],
+            "temperature": 0.1,
+            "max_tokens": 4000,
+            "response_format": {"type": "json_object"}
+        }
+        
+        try:
+            response = requests.post(self.base_url, headers=self.headers, json=payload)
+            response.raise_for_status()
+            result = response.json()
+            
+            content = result['choices'][0]['message']['content']
+            
+            # Parse the JSON response
+            parsed_data = json.loads(content)
+            return parsed_data.get('questions', [])
+            
+        except Exception as e:
+            print(f"Error calling DeepSeek API: {e}")
+            return []
+
+def extract_questions_from_page2_onward(text_content):
+    """Extract questions starting from Page 2"""
+    pages = re.split(r'===== Page \d+ =====', text_content)
+    
+    if len(pages) < 2:
+        return text_content
+    
+    content_from_page2 = ''.join(pages[1:])
+    content_from_page2 = re.sub(r'AE \d+/\d+', '', content_from_page2)
+    content_from_page2 = re.sub(r'S/\d+ Food/\d+-AE-\w+', '', content_from_page2)
+    
+    return content_from_page2
+
+def manual_fallback_parser(text_content):
+    """
+    Manual parser as fallback - preserves backslashes by using raw string processing
+    """
+    questions = []
+    
+    # Split by question markers
+    question_blocks = re.split(r'(Q\.\s*\d+)', text_content)
+    
+    for i in range(1, len(question_blocks), 2):
+        if i + 1 >= len(question_blocks):
+            break
+            
+        q_header = question_blocks[i]
+        q_content = question_blocks[i + 1]
+        
+        # Extract question number
+        q_num_match = re.search(r'(\d+)', q_header)
+        if not q_num_match:
+            continue
+            
+        q_num = int(q_num_match.group(1))
+        if q_num > 85:
+            continue
+        
+        # Use very simple string operations to avoid regex eating backslashes
+        question_data = parse_question_simple(q_content, q_num)
+        if question_data:
+            questions.append(question_data)
+    
+    questions.sort(key=lambda x: x['Question_Number'])
+    return questions
+
+def parse_question_simple(content, question_number):
+    """
+    Simple parsing using basic string operations to preserve backslashes
+    """
+    # Convert to string and clean minimally
+    content_str = str(content)
+    
+    # Find option markers using simple string search
+    option_positions = {}
+    for option in ['(A)', '(B)', '(C)', '(D)']:
+        pos = content_str.find(option)
+        if pos != -1:
+            option_positions[pos] = option
+    
+    if not option_positions:
+        return None
+    
+    # Sort positions
+    sorted_positions = sorted(option_positions.keys())
+    
+    # Question text is everything before first option
+    question_text = content_str[:sorted_positions[0]].strip()
+    
+    # Extract options
+    options = {}
+    for i, pos in enumerate(sorted_positions):
+        option_marker = option_positions[pos]
+        option_letter = option_marker[1]  # Get A, B, C, or D
+        
+        # Find where this option ends (next option or end of content)
+        if i + 1 < len(sorted_positions):
+            next_pos = sorted_positions[i + 1]
+            option_text = content_str[pos + 3:next_pos].strip()  # +3 to skip "(X)"
+        else:
+            option_text = content_str[pos + 3:].strip()
+        
+        options[f'Option_{option_letter}'] = option_text
+    
+    # Clean question text minimally
+    question_text = re.sub(r'^\s*[\.\-\*]\s*', '', question_text)
+    question_text = re.sub(r'\s+', ' ', question_text).strip()
+    
+    if len(question_text) < 5:
+        return None
+        
+    return {
+        'Question_Number': question_number,
+        'Question_Text': question_text,
+        'Option_A': options.get('Option_A', ''),
+        'Option_B': options.get('Option_B', ''),
+        'Option_C': options.get('Option_C', ''),
+        'Option_D': options.get('Option_D', '')
+    }
+
+def create_excel_with_backslash_check(questions, output_path):
+    """Create Excel file and verify backslashes are preserved"""
+    # Create DataFrame
+    df = pd.DataFrame(questions)
+    
+    # Ensure correct column order
+    column_order = ['Question_Number', 'Question_Text', 'Option_A', 'Option_B', 'Option_C', 'Option_D']
+    for col in column_order:
+        if col not in df.columns:
+            df[col] = ''
+    
+    df = df[column_order]
+    
+    # Create Excel with multiple sheets
+    with pd.ExcelWriter(output_path, engine='openpyxl') as writer:
+        # Main questions sheet
+        df.to_excel(writer, index=False, sheet_name='Questions')
+        
+        # Create backslash analysis sheet
+        backslash_analysis = []
+        for _, row in df.iterrows():
+            analysis_row = {'Question_Number': row['Question_Number']}
+            
+            for col in ['Question_Text', 'Option_A', 'Option_B', 'Option_C', 'Option_D']:
+                text = str(row[col])
+                has_backslash = '\\' in text
+                analysis_row[f'{col}_Has_Backslash'] = 'YES' if has_backslash else 'NO'
+                if has_backslash:
+                    # Extract the part with backslash for verification
+                    backslash_parts = [part for part in text.split('\\') if part]
+                    analysis_row[f'{col}_Backslash_Content'] = ' | '.join(backslash_parts[:3])[:50] + '...' if backslash_parts else ''
+                else:
+                    analysis_row[f'{col}_Backslash_Content'] = ''
+            
+            backslash_analysis.append(analysis_row)
+        
+        analysis_df = pd.DataFrame(backslash_analysis)
+        analysis_df.to_excel(writer, index=False, sheet_name='Backslash_Analysis')
+    
+    return df
+
+def main():
+    # Configuration
+    INPUT_DIR = r"C:\Users\menha\Downloads\test11"
+    OUTPUT_DIR = r"C:\Users\menha\Downloads\test11"
+    DEEPSEEK_API_KEY = "sk-a2a0c73a89fc41cfbc71aaf1d142b972"  # Replace with your actual API key
+    
+    # Find text files
+    input_path = Path(INPUT_DIR)
+    text_files = list(input_path.glob("rewritten_*.txt"))
+    
+    if not text_files:
+        text_files = list(input_path.glob("*.txt"))
+    
+    if not text_files:
+        print("No text files found!")
+        return
+    
+    # Initialize DeepSeek parser if API key is provided
+    ai_parser = None
+    if DEEPSEEK_API_KEY != "your_deepseek_api_key_here":
+        ai_parser = DeepSeekParser(DEEPSEEK_API_KEY)
+        print("✓ DeepSeek API parser initialized")
+    else:
+        print("⚠ No DeepSeek API key provided, using manual parsing only")
+    
+    for text_file in text_files:
+        print(f"\n{'='*50}")
+        print(f"Processing: {text_file.name}")
+        print(f"{'='*50}")
+        
+        try:
+            with open(text_file, 'r', encoding='utf-8') as f:
+                content = f.read()
+            
+            # Extract from page 2 onward
+            content = extract_questions_from_page2_onward(content)
+            
+            questions = []
+            
+            # Try AI parsing first if available
+            if ai_parser:
+                print("Using DeepSeek AI to parse questions...")
+                ai_questions = ai_parser.parse_questions_with_ai(content)
+                
+                if ai_questions and len(ai_questions) > 10:
+                    questions = ai_questions
+                    print(f"✓ AI parsing successful: {len(questions)} questions found")
+                else:
+                    print("⚠ AI parsing returned few questions, using manual fallback")
+                    questions = manual_fallback_parser(content)
+            else:
+                print("Using manual parsing...")
+                questions = manual_fallback_parser(content)
+            
+            if questions:
+                # Create Excel file
+                excel_filename = text_file.stem + '_parsed.xlsx'
+                excel_path = Path(OUTPUT_DIR) / excel_filename
+                
+                df = create_excel_with_backslash_check(questions, excel_path)
+                
+                print(f"✓ Created Excel file: {excel_path.name}")
+                print(f"✓ Total questions: {len(questions)}")
+                
+                # Show backslash analysis
+                backslash_count = 0
+                for q in questions:
+                    if any('\\' in str(q[col]) for col in ['Question_Text', 'Option_A', 'Option_B', 'Option_C', 'Option_D']):
+                        backslash_count += 1
+                
+                print(f"✓ Questions with backslashes: {backslash_count}")
+                
+                # Show samples with backslashes
+                print(f"\nSample questions with backslashes:")
+                print("-" * 80)
+                samples_shown = 0
+                for q in questions:
+                    if samples_shown >= 3:
+                        break
+                    for col in ['Question_Text', 'Option_A', 'Option_B', 'Option_C', 'Option_D']:
+                        text = str(q[col])
+                        if '\\' in text:
+                            print(f"Q{q['Question_Number']} - {col}: {text[:80]}...")
+                            samples_shown += 1
+                            break
+                
+            else:
+                print("✗ No questions found")
+                
+        except Exception as e:
+            print(f"✗ Error: {e}")
+            import traceback
+            traceback.print_exc()
+
+if __name__ == "__main__":
+    # Check dependencies
+    try:
+        import openpyxl
+    except ImportError:
+        print("Installing openpyxl...")
+        import subprocess
+        subprocess.check_call(["pip", "install", "openpyxl"])
+        import openpyxl
+    
+    main()
