@@ -1,0 +1,479 @@
+import os, re, fitz, subprocess, asyncio, pandas as pd, random, time, shutil
+from tqdm import tqdm
+from openai import AsyncOpenAI
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill, Font
+
+# ---------------- CONFIG ----------------
+PDF_FOLDER = r"C:\Users\menha\Downloads\test"
+OUTPUT_FOLDER = r"C:\Users\menha\Downloads\test"
+DONE_FOLDER = os.path.join(OUTPUT_FOLDER, "done")
+
+# API Configuration
+USE_BOTH_APIS = True  # Set to False to use only one API
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "sk-proj-XXXX")
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "your-deepseek-key-here")
+
+# Model priorities for each provider
+OPENAI_MODELS = ["gpt-4o", "gpt-4o-mini", "gpt-3.5-turbo"]
+DEEPSEEK_MODELS = ["deepseek-chat"]  # Add other Deepseek models if available
+
+CHUNK_PAGES = 8
+MAX_RETRIES = 3
+# ----------------------------------------
+
+# Initialize clients
+openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+deepseek_client = AsyncOpenAI(
+    api_key=DEEPSEEK_API_KEY,
+    base_url="https://api.deepseek.com/v1"  # Deepseek API endpoint
+)
+
+# ---------------- GPT PROMPT (optimized) ----------------
+REWRITE_PROMPT = """
+You are an expert at restoring exam question text from imperfect OCR sources.
+
+Your goal is to produce clean, *structurally consistent blocks* that can be parsed deterministically
+into a table later. Follow these rules exactly.
+
+---
+
+### STRUCTURE RULES
+1. Each question must start with a line like Q29 or Q.29.
+   - If the number and text are split, merge them.
+2. Each question must include exactly four options:
+   (A) ...
+   (B) ...
+   (C) ...
+   (D) ...
+   - If missing, use placeholders like “(C) —”.
+3. Optionally add:
+   Correct Option: A
+   Explanation: short text
+   Has Image: Yes/No
+4. Shared instructions should appear as:
+   Instruction: text
+
+---
+
+### FORMAT RULES
+- Replace commas with semicolons.
+- Escape LaTeX with $...$ and double all backslashes.
+- Preserve order exactly.
+- Separate question blocks with one blank line.
+- Output plain text only.
+
+---
+
+=== OCR TEXT START ===
+{chunk_text}
+=== OCR TEXT END ===
+"""
+
+# ---------------- Helper functions ----------------
+def repair_pdf(pdf_path):
+    repaired_path = pdf_path.replace(".pdf", "_fixed.pdf")
+    try:
+        subprocess.run([
+            "gswin64c", "-o", repaired_path,
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.4",
+            "-dPDFSETTINGS=/prepress",
+            "-dNOPAUSE", "-dBATCH", pdf_path
+        ], check=False)
+        if os.path.exists(repaired_path):
+            return repaired_path
+    except Exception:
+        pass
+    return pdf_path
+
+def ocr_pdf(pdf_path):
+    ocr_path = pdf_path.replace(".pdf", "_ocr.pdf")
+    repaired = repair_pdf(pdf_path)
+    try:
+        subprocess.run([
+            "ocrmypdf", "--force-ocr", "--skip-big", "50", "--optimize", "0",
+            "--jpeg-quality", "80", "--continue-on-failure", "--output-type", "pdfa",
+            repaired, ocr_path
+        ], check=False)
+        if os.path.exists(ocr_path):
+            return ocr_path
+    except Exception:
+        pass
+    return repaired
+
+def extract_pages_text(pdf_path):
+    doc = fitz.open(pdf_path)
+    pages = []
+    for i, page in enumerate(doc):
+        text = page.get_text("text").strip()
+        has_img = len(page.get_images()) > 0
+        pages.append((i + 1, text, has_img))
+    doc.close()
+    return pages
+
+def preprocess_text(text):
+    text = text.replace("\r", "\n")
+    text = re.sub(r"(Q\.?\s*\d+)\s*\n(?!\()", r"\1 ", text)
+    text = re.sub(r"\s*\(?A\)?[\)\.\-:]\s*", r"\n(A) ", text)
+    text = re.sub(r"\s*\(?B\)?[\)\.\-:]\s*", r"\n(B) ", text)
+    text = re.sub(r"\s*\(?C\)?[\)\.\-:]\s*", r"\n(C) ", text)
+    text = re.sub(r"\s*\(?D\)?[\)\.\-:]\s*", r"\n(D) ", text)
+    text = re.sub(r"[Oo]rrect\s*[Oo]ption", "Correct Option", text)
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    return text.strip()
+
+async def call_openai_with_fallback(prompt):
+    for model in OPENAI_MODELS:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = await openai_client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                if resp and resp.choices:
+                    return resp.choices[0].message.content, f"OpenAI-{model}"
+            except Exception as e:
+                wait = (2 ** attempt) + random.random()
+                print(f"⚠️ OpenAI error ({model}, attempt {attempt}): {e} — retrying in {wait:.1f}s")
+                await asyncio.sleep(wait)
+    return "", "OpenAI-failed"
+
+async def call_deepseek_with_fallback(prompt):
+    for model in DEEPSEEK_MODELS:
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = await deepseek_client.chat.completions.create(
+                    model=model,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                if resp and resp.choices:
+                    return resp.choices[0].message.content, f"Deepseek-{model}"
+            except Exception as e:
+                wait = (2 ** attempt) + random.random()
+                print(f"⚠️ Deepseek error ({model}, attempt {attempt}): {e} — retrying in {wait:.1f}s")
+                await asyncio.sleep(wait)
+    return "", "Deepseek-failed"
+
+async def call_apis_comparison(prompt):
+    """Call both APIs and return results for comparison"""
+    results = {}
+    
+    if USE_BOTH_APIS:
+        # Call both APIs concurrently
+        openai_task = asyncio.create_task(call_openai_with_fallback(prompt))
+        deepseek_task = asyncio.create_task(call_deepseek_with_fallback(prompt))
+        
+        openai_result, openai_source = await openai_task
+        deepseek_result, deepseek_source = await deepseek_task
+        
+        results["openai"] = {
+            "content": openai_result,
+            "source": openai_source
+        }
+        results["deepseek"] = {
+            "content": deepseek_result,
+            "source": deepseek_source
+        }
+    else:
+        # Use only OpenAI (default behavior)
+        openai_result, openai_source = await call_openai_with_fallback(prompt)
+        results["openai"] = {
+            "content": openai_result,
+            "source": openai_source
+        }
+        results["deepseek"] = {
+            "content": "",
+            "source": "not_used"
+        }
+    
+    return results
+
+# ---------------- Parser ----------------
+def parse_rewritten_blocks(all_text):
+    rows = []
+    current_instruction = ""
+    blocks = re.split(r'\n\s*\n', all_text.strip())
+
+    for block in blocks:
+        b = block.strip()
+        if not b:
+            continue
+
+        if re.match(r'^(Instruction:|Statement)', b, re.I):
+            instr = re.sub(r'^(Instruction:|Statement[: ]*)', '', b, flags=re.I).strip()
+            current_instruction = instr.replace('\n', ' ').strip()
+            continue
+
+        row = {
+            "Instruction": current_instruction,
+            "Question Number": "",
+            "Question": "",
+            "Option A": "",
+            "Option B": "",
+            "Option C": "",
+            "Option D": "",
+            "Correct Option": "",
+            "Explanation": "",
+            "Has Image": "No"
+        }
+
+        lines = [ln.strip() for ln in b.splitlines() if ln.strip()]
+        text_joined = " ".join(lines)
+
+        qnum = re.search(r"(Q\.?\s*\d+|\b\d+\b)", text_joined)
+        if qnum:
+            row["Question Number"] = qnum.group(0).replace(" ", "")
+            question_part = text_joined[qnum.end():].strip()
+        else:
+            question_part = text_joined
+
+        # Escape LaTeX and commas
+        question_part = question_part.replace("\\", "\\\\").replace(",", ";")
+
+        parts = re.split(r"\(A\)|\(B\)|\(C\)|\(D\)", question_part)
+        if len(parts) > 1:
+            row["Question"] = parts[0].strip()
+            opts = re.findall(r"\((A|B|C|D)\)([^()]+)", question_part)
+            for label, text in opts:
+                text = text.replace("\\", "\\\\").replace(",", ";").strip()
+                row[f"Option {label}"] = text
+        else:
+            row["Question"] = question_part
+
+        m_correct = re.search(r"Correct Option\s*[:\-]?\s*([A-D])", text_joined, re.I)
+        if m_correct:
+            row["Correct Option"] = m_correct.group(1).upper()
+
+        m_exp = re.search(r"Explanation\s*[:\-]?\s*(.+)", text_joined, re.I)
+        if m_exp:
+            row["Explanation"] = m_exp.group(1).replace("\\", "\\\\").replace(",", ";").strip()
+
+        m_img = re.search(r"Has Image\s*[:\-]?\s*(Yes|No)", text_joined, re.I)
+        if m_img:
+            row["Has Image"] = m_img.group(1).capitalize()
+
+        rows.append(row)
+        current_instruction = ""
+
+    return rows
+
+# ---------------- Fix fragmented questions ----------------
+def fix_fragmented_questions(df):
+    merged = []
+    prev = None
+    for _, r in df.iterrows():
+        if re.match(r'^\d+$', str(r["Question Number"])) and not r["Question"]:
+            if prev is not None:
+                for col in ["Option A", "Option B", "Option C", "Option D"]:
+                    if r[col] and not prev[col]:
+                        prev[col] = r[col]
+                continue
+        merged.append(r.to_dict())
+        prev = merged[-1]
+    return pd.DataFrame(merged)
+
+# ---------------- Comparison Analysis ----------------
+def compare_results(openai_df, deepseek_df):
+    """Compare results from both APIs and generate comparison metrics"""
+    comparison = {
+        "total_questions_openai": len(openai_df),
+        "total_questions_deepseek": len(deepseek_df),
+        "questions_with_correct_option_openai": len(openai_df[openai_df["Correct Option"].notna() & (openai_df["Correct Option"] != "")]),
+        "questions_with_correct_option_deepseek": len(deepseek_df[deepseek_df["Correct Option"].notna() & (deepseek_df["Correct Option"] != "")]),
+        "questions_with_explanation_openai": len(openai_df[openai_df["Explanation"].notna() & (openai_df["Explanation"] != "")]),
+        "questions_with_explanation_deepseek": len(deepseek_df[deepseek_df["Explanation"].notna() & (deepseek_df["Explanation"] != "")]),
+    }
+    
+    # Calculate match rate for question numbers (if both have same structure)
+    common_questions = min(len(openai_df), len(deepseek_df))
+    if common_questions > 0:
+        number_matches = sum(
+            1 for i in range(common_questions) 
+            if str(openai_df.iloc[i]["Question Number"]) == str(deepseek_df.iloc[i]["Question Number"])
+        )
+        comparison["question_number_match_rate"] = number_matches / common_questions
+    else:
+        comparison["question_number_match_rate"] = 0
+    
+    return comparison
+
+# ---------------- Main Processing ----------------
+async def process_pdf_file(pdf_path):
+    print(f"\n📘 Processing: {os.path.basename(pdf_path)}")
+    pages = extract_pages_text(pdf_path)
+    if sum(len(t) for (_, t, _) in pages[:3]) < 50:
+        print("🔍 Running OCR...")
+        ocr_path = ocr_pdf(pdf_path)
+        pages = extract_pages_text(ocr_path)
+
+    chunks, cur = [], []
+    for pno, text, has_img in pages:
+        cur.append((pno, text, has_img))
+        if len(cur) >= CHUNK_PAGES:
+            chunks.append(cur)
+            cur = []
+    if cur:
+        chunks.append(cur)
+
+    all_openai_results = []
+    all_deepseek_results = []
+    api_sources = {"openai": [], "deepseek": []}
+    
+    for chunk in tqdm(chunks, desc="Processing chunks"):
+        chunk_text = "\n\n".join([t for (_, t, _) in chunk])
+        prompt = REWRITE_PROMPT.format(chunk_text=preprocess_text(chunk_text))
+        
+        api_results = await call_apis_comparison(prompt)
+        
+        # Process OpenAI results
+        openai_content = api_results["openai"]["content"]
+        if not openai_content:
+            openai_content = preprocess_text(chunk_text)
+        all_openai_results.append(openai_content)
+        api_sources["openai"].append(api_results["openai"]["source"])
+        
+        # Process Deepseek results
+        deepseek_content = api_results["deepseek"]["content"]
+        if not deepseek_content and USE_BOTH_APIS:
+            deepseek_content = preprocess_text(chunk_text)
+        all_deepseek_results.append(deepseek_content)
+        api_sources["deepseek"].append(api_results["deepseek"]["source"])
+
+    # Process OpenAI results
+    openai_combined = "\n\n".join(all_openai_results)
+    openai_rows = parse_rewritten_blocks(openai_combined)
+    openai_df = pd.DataFrame(openai_rows, columns=[
+        "Instruction", "Question Number", "Question",
+        "Option A", "Option B", "Option C", "Option D",
+        "Correct Option", "Explanation", "Has Image"
+    ])
+    openai_df = fix_fragmented_questions(openai_df)
+    
+    # Add API source information
+    openai_df["API_Source"] = "OpenAI"
+    
+    base = os.path.splitext(os.path.basename(pdf_path))[0]
+    
+    # Save OpenAI results
+    openai_csv_path = os.path.join(OUTPUT_FOLDER, base + "_openai_extracted.csv")
+    openai_df.to_csv(openai_csv_path, index=False, encoding="utf-8-sig")
+    print(f"✅ OpenAI results saved: {openai_csv_path}")
+    
+    # Process and save Deepseek results if used
+    if USE_BOTH_APIS:
+        deepseek_combined = "\n\n".join(all_deepseek_results)
+        deepseek_rows = parse_rewritten_blocks(deepseek_combined)
+        deepseek_df = pd.DataFrame(deepseek_rows, columns=[
+            "Instruction", "Question Number", "Question",
+            "Option A", "Option B", "Option C", "Option D",
+            "Correct Option", "Explanation", "Has Image"
+        ])
+        deepseek_df = fix_fragmented_questions(deepseek_df)
+        deepseek_df["API_Source"] = "Deepseek"
+        
+        deepseek_csv_path = os.path.join(OUTPUT_FOLDER, base + "_deepseek_extracted.csv")
+        deepseek_df.to_csv(deepseek_csv_path, index=False, encoding="utf-8-sig")
+        print(f"✅ Deepseek results saved: {deepseek_csv_path}")
+        
+        # Generate comparison
+        comparison = compare_results(openai_df, deepseek_df)
+        comparison_df = pd.DataFrame([comparison])
+        comparison_path = os.path.join(OUTPUT_FOLDER, base + "_comparison.csv")
+        comparison_df.to_csv(comparison_path, index=False)
+        print(f"📊 Comparison saved: {comparison_path}")
+        
+        # Create combined file for easy comparison
+        combined_df = pd.concat([openai_df, deepseek_df], ignore_index=True)
+        combined_path = os.path.join(OUTPUT_FOLDER, base + "_combined_extracted.csv")
+        combined_df.to_csv(combined_path, index=False, encoding="utf-8-sig")
+        print(f"🔗 Combined results saved: {combined_path}")
+        
+        result_files = [openai_csv_path, deepseek_csv_path, comparison_path, combined_path]
+    else:
+        result_files = [openai_csv_path]
+
+    # Move processed PDF
+    os.makedirs(DONE_FOLDER, exist_ok=True)
+    try:
+        shutil.move(pdf_path, os.path.join(DONE_FOLDER, os.path.basename(pdf_path)))
+    except Exception:
+        pass
+    
+    return result_files
+
+async def merge_all_csvs():
+    """Merge all CSV files from both APIs"""
+    csv_files = [f for f in os.listdir(OUTPUT_FOLDER) if f.endswith("_extracted.csv")]
+    openai_frames = []
+    deepseek_frames = []
+    combined_frames = []
+    
+    for f in csv_files:
+        try:
+            df = pd.read_csv(os.path.join(OUTPUT_FOLDER, f))
+            if "openai" in f.lower():
+                openai_frames.append(df)
+            elif "deepseek" in f.lower():
+                deepseek_frames.append(df)
+            elif "combined" in f.lower():
+                combined_frames.append(df)
+        except Exception as e:
+            print(f"⚠️ Skipping {f}: {e}")
+    
+    # Save merged results
+    if openai_frames:
+        merged_openai = pd.concat(openai_frames, ignore_index=True)
+        openai_out = os.path.join(OUTPUT_FOLDER, "all_openai_extracted.xlsx")
+        merged_openai.to_excel(openai_out, index=False)
+        format_excel_file(openai_out)
+        print(f"📊 Merged OpenAI Excel saved: {openai_out}")
+    
+    if deepseek_frames and USE_BOTH_APIS:
+        merged_deepseek = pd.concat(deepseek_frames, ignore_index=True)
+        deepseek_out = os.path.join(OUTPUT_FOLDER, "all_deepseek_extracted.xlsx")
+        merged_deepseek.to_excel(deepseek_out, index=False)
+        format_excel_file(deepseek_out)
+        print(f"📊 Merged Deepseek Excel saved: {deepseek_out}")
+    
+    if combined_frames and USE_BOTH_APIS:
+        merged_combined = pd.concat(combined_frames, ignore_index=True)
+        combined_out = os.path.join(OUTPUT_FOLDER, "all_combined_extracted.xlsx")
+        merged_combined.to_excel(combined_out, index=False)
+        format_excel_file(combined_out)
+        print(f"📊 Merged Combined Excel saved: {combined_out}")
+
+def format_excel_file(file_path):
+    """Format Excel file with styles"""
+    try:
+        wb = load_workbook(file_path)
+        ws = wb.active
+        header_fill = PatternFill(start_color="CCE5FF", end_color="CCE5FF", fill_type="solid")
+        bold_font = Font(bold=True)
+        for cell in ws[1]:
+            cell.fill = header_fill
+            cell.font = bold_font
+        wb.save(file_path)
+    except Exception as e:
+        print(f"⚠️ Could not format Excel file {file_path}: {e}")
+
+async def main():
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    pdfs = [os.path.join(PDF_FOLDER, f) for f in os.listdir(PDF_FOLDER) if f.lower().endswith(".pdf")]
+    if not pdfs:
+        print("⚠️ No PDF files found.")
+        return
+
+    print(f"🔧 Configuration: Using {'both OpenAI and Deepseek APIs' if USE_BOTH_APIS else 'OpenAI API only'}")
+    
+    for pdf in pdfs:
+        try:
+            await process_pdf_file(pdf)
+        except Exception as e:
+            print(f"❌ Error processing {pdf}: {e}")
+
+    await merge_all_csvs()
+    print("\n🎉 All done!")
+
+if __name__ == "__main__":
+    asyncio.run(main())
