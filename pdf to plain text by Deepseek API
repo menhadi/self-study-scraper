@@ -1,0 +1,280 @@
+import os
+import requests
+import json
+from pathlib import Path
+import time
+
+class DeepSeekRewriter:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api.deepseek.com/v1/chat/completions"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+    
+    def rewrite_content(self, content):
+        """Rewrite content using DeepSeek API"""
+        prompt = """
+        Please rewrite the following content to improve clarity, grammar, and readability while preserving:
+        1. All technical accuracy and terminology
+        2. The original meaning and context
+        3. Mathematical notation and formulas
+        4. Question structure and options
+        5. Professional tone
+        
+        Content to rewrite:
+        """
+        
+        # Split content if too long (DeepSeek has token limits)
+        max_chunk_size = 12000  # Conservative chunk size
+        if len(content) > max_chunk_size:
+            chunks = self.split_content(content, max_chunk_size)
+            rewritten_chunks = []
+            for i, chunk in enumerate(chunks):
+                print(f"  Processing chunk {i+1}/{len(chunks)}...")
+                rewritten_chunk = self.process_chunk(chunk)
+                rewritten_chunks.append(rewritten_chunk)
+                time.sleep(1)  # Rate limiting
+            return "\n\n".join(rewritten_chunks)
+        else:
+            return self.process_chunk(content)
+    
+    def process_chunk(self, chunk):
+        """Process a single chunk of content"""
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Please rewrite the following content to improve clarity while preserving all technical accuracy, mathematical notation, and question structure:\n\n" + chunk
+                }
+            ],
+            "temperature": 0.3,
+            "max_tokens": 4000
+        }
+        
+        try:
+            response = requests.post(self.base_url, headers=self.headers, json=payload)
+            response.raise_for_status()
+            result = response.json()
+            return result['choices'][0]['message']['content']
+        except Exception as e:
+            print(f"Error calling API: {e}")
+            return chunk
+    
+    def split_content(self, content, chunk_size):
+        """Split content into manageable chunks"""
+        chunks = []
+        paragraphs = content.split('\n\n')
+        
+        current_chunk = ""
+        for paragraph in paragraphs:
+            if len(current_chunk) + len(paragraph) < chunk_size:
+                current_chunk += paragraph + "\n\n"
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = paragraph + "\n\n"
+        
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return chunks
+
+def extract_text_from_scanned_pdf(pdf_path):
+    """Extract text from scanned PDF using OCR"""
+    try:
+        # Option 1: Using pdf2image + pytesseract
+        try:
+            from pdf2image import convert_from_path
+            import pytesseract
+            
+            print("  Converting PDF to images...")
+            images = convert_from_path(pdf_path, dpi=300)
+            
+            text = ""
+            print(f"  Performing OCR on {len(images)} pages...")
+            for i, image in enumerate(images):
+                print(f"    Page {i+1}/{len(images)}")
+                page_text = pytesseract.image_to_string(image, lang='eng')
+                text += f"--- Page {i+1} ---\n{page_text}\n\n"
+            
+            return text.strip()
+            
+        except ImportError as e:
+            print(f"OCR libraries not available: {e}")
+            return None
+            
+    except Exception as e:
+        print(f"Error in OCR processing: {e}")
+        return None
+
+def try_regular_extraction(pdf_path):
+    """Try regular text extraction first"""
+    try:
+        # Try PyMuPDF (fitz) first - often best for regular PDFs
+        try:
+            import fitz
+            doc = fitz.open(pdf_path)
+            text = ""
+            for page in doc:
+                text += page.get_text()
+            doc.close()
+            if len(text.strip()) > 100:  # If we got substantial text
+                return text
+        except ImportError:
+            pass
+        
+        # Try pdfplumber
+        try:
+            import pdfplumber
+            text = ""
+            with pdfplumber.open(pdf_path) as pdf:
+                for page in pdf.pages:
+                    text += page.extract_text() or ""
+            if len(text.strip()) > 100:
+                return text
+        except ImportError:
+            pass
+        
+        # Try PyPDF2
+        try:
+            import PyPDF2
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                text = ""
+                for page in reader.pages:
+                    text += page.extract_text()
+            if len(text.strip()) > 100:
+                return text
+        except ImportError:
+            pass
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error in regular extraction: {e}")
+        return None
+
+def extract_text_from_pdf(pdf_path):
+    """Extract text from PDF - try regular methods first, then OCR"""
+    print("  Attempting regular text extraction...")
+    text = try_regular_extraction(pdf_path)
+    
+    if text and len(text.strip()) > 100:
+        print("  ✓ Success with regular extraction")
+        return text
+    else:
+        print("  ✗ Regular extraction failed, trying OCR...")
+        ocr_text = extract_text_from_scanned_pdf(pdf_path)
+        if ocr_text and len(ocr_text.strip()) > 100:
+            print("  ✓ Success with OCR extraction")
+            return ocr_text
+        else:
+            print("  ✗ All extraction methods failed")
+            return None
+
+def process_pdf_files(directory_path, api_key):
+    """Process all PDF files in the given directory"""
+    rewriter = DeepSeekRewriter(api_key)
+    
+    # Find all PDF files in directory
+    directory = Path(directory_path)
+    pdf_files = list(directory.glob("*.pdf"))
+    
+    if not pdf_files:
+        print(f"No PDF files found in {directory_path}")
+        return
+    
+    print(f"Found {len(pdf_files)} PDF files to process:")
+    
+    for pdf_file in pdf_files:
+        print(f"\nProcessing: {pdf_file.name}")
+        
+        # Extract text from PDF
+        content = extract_text_from_pdf(pdf_file)
+        
+        if content:
+            print(f"  Extracted {len(content)} characters")
+            
+            # Check if content is substantial
+            if len(content.strip()) < 50:
+                print("  ✗ Extracted text too short, skipping...")
+                continue
+                
+            # Rewrite the content
+            print("  Rewriting content with AI...")
+            rewritten_content = rewriter.rewrite_content(content)
+            
+            # Save rewritten content
+            output_file = pdf_file.parent / f"rewritten_{pdf_file.stem}.txt"
+            save_rewritten_content(rewritten_content, output_file)
+            
+            print(f"✓ Rewritten: {output_file.name}")
+        else:
+            print(f"✗ Failed to extract text from {pdf_file.name}")
+
+def save_rewritten_content(content, output_path):
+    """Save rewritten content to file"""
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+    except Exception as e:
+        print(f"Error saving file: {e}")
+
+def check_dependencies():
+    """Check and install required dependencies"""
+    required_packages = {
+        'requests': 'requests',
+        'PyPDF2': 'PyPDF2',
+        'pdfplumber': 'pdfplumber',
+        'pymupdf': 'fitz',
+        'pdf2image': 'pdf2image',
+        'pytesseract': 'pytesseract',
+        'Pillow': 'PIL'
+    }
+    
+    missing = []
+    for package, import_name in required_packages.items():
+        try:
+            if import_name == 'fitz':
+                import fitz
+            elif import_name == 'PIL':
+                from PIL import Image
+            else:
+                __import__(import_name)
+        except ImportError:
+            missing.append(package)
+    
+    if missing:
+        print("Missing dependencies. Please install:")
+        print(f"pip install {' '.join(missing)}")
+        return False
+    return True
+
+def main():
+    # Configuration
+    API_KEY = "sk-a2a0c73a89fc41cfbc71aaf1d142b972"  # Replace with your actual API key
+    DIRECTORY_PATH = r"C:\Users\menha\Downloads\test11"
+    
+    # Check if API key is provided
+    if API_KEY == "your_deepseek_api_key_here":
+        print("Please replace 'your_deepseek_api_key_here' with your actual DeepSeek API key")
+        return
+    
+    # Check if directory exists
+    if not os.path.exists(DIRECTORY_PATH):
+        print(f"Directory {DIRECTORY_PATH} does not exist!")
+        return
+    
+    # Check dependencies
+    if not check_dependencies():
+        print("Please install the missing dependencies first.")
+        return
+    
+    # Process files
+    process_pdf_files(DIRECTORY_PATH, API_KEY)
+
+if __name__ == "__main__":
+    main()
