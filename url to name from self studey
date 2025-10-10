@@ -1,0 +1,235 @@
+import csv
+from urllib.parse import urljoin
+
+class HierarchyExtractor:
+    def __init__(self):
+        self.all_data = []
+        
+    def parse_breadcrumb(self, breadcrumb):
+        """Extract level names from breadcrumb text"""
+        parts = breadcrumb.split(' > ')
+        # Format: Home > Madhya Pradesh > State Books > Class 10th > Mathematics > 15 Probability
+        if len(parts) >= 5:
+            return {
+                'state': parts[1] if len(parts) > 1 else 'Unknown',
+                'class': parts[3] if len(parts) > 3 else 'Unknown', 
+                'subject': parts[4] if len(parts) > 4 else 'Unknown',
+                'chapter': parts[5] if len(parts) > 5 else 'Unknown'
+            }
+        else:
+            return {
+                'state': parts[1] if len(parts) > 1 else 'Unknown',
+                'class': parts[2] if len(parts) > 2 else 'Unknown',
+                'subject': parts[3] if len(parts) > 3 else 'Unknown',
+                'chapter': parts[4] if len(parts) > 4 else 'No chapter'
+            }
+    
+    def extract_parent_urls(self, url):
+        """Extract parent URLs from the chapter URL"""
+        # Clean the URL
+        clean_url = url.strip()
+        
+        # Split URL by slashes to understand the structure
+        parts = clean_url.split('/')
+        
+        # Build parent URLs based on the URL structure
+        # Example: https://www.selfstudys.com/advance-pdf-viewer/Madhya Pradesh/state-books/class-10th/mathematics/15-probability/401817
+        parent_urls = {}
+        
+        # Level 1: State URL (remove last 4 parts)
+        if len(parts) >= 7:
+            state_url = '/'.join(parts[:4])  # https://www.selfstudys.com/advance-pdf-viewer/Madhya Pradesh
+            parent_urls['state_url'] = state_url
+        else:
+            parent_urls['state_url'] = clean_url
+        
+        # Level 2: Class URL (remove last 3 parts)
+        if len(parts) >= 6:
+            class_url = '/'.join(parts[:5])  # https://www.selfstudys.com/advance-pdf-viewer/Madhya Pradesh/state-books/class-10th
+            parent_urls['class_url'] = class_url
+        else:
+            parent_urls['class_url'] = clean_url
+        
+        # Level 3: Subject URL (remove last 2 parts)
+        if len(parts) >= 5:
+            subject_url = '/'.join(parts[:6])  # https://www.selfstudys.com/advance-pdf-viewer/Madhya Pradesh/state-books/class-10th/mathematics
+            parent_urls['subject_url'] = subject_url
+        else:
+            parent_urls['subject_url'] = clean_url
+        
+        return parent_urls
+    
+    def process_urls_file(self, filename='urls.txt'):
+        """Process the urls.txt file with tab-separated URLs and breadcrumbs"""
+        print("📖 Reading urls.txt file...")
+        
+        try:
+            with open(filename, 'r', encoding='utf-8') as file:
+                lines = file.readlines()
+            
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                
+                # Split by tab character
+                if '\t' in line:
+                    url, breadcrumb = line.split('\t', 1)
+                    url = url.strip()
+                    breadcrumb = breadcrumb.strip()
+                    
+                    if url and breadcrumb:
+                        self.process_single_entry(url, breadcrumb)
+                else:
+                    print(f"⚠️  Skipping line (no tab separator): {line[:50]}...")
+            
+            print(f"✅ Processed {len(self.all_data)} entries")
+            return self.all_data
+            
+        except FileNotFoundError:
+            print(f"❌ File {filename} not found.")
+            return []
+        except Exception as e:
+            print(f"❌ Error reading file: {e}")
+            return []
+    
+    def process_single_entry(self, url, breadcrumb):
+        """Process a single URL-breadcrumb pair"""
+        # Extract names from breadcrumb
+        names = self.parse_breadcrumb(breadcrumb)
+        
+        # Extract parent URLs from URL structure
+        parent_urls = self.extract_parent_urls(url)
+        
+        # Create hierarchy entry
+        entry = {
+            'state': names['state'],
+            'state_url': parent_urls['state_url'],
+            'class': names['class'],
+            'class_url': parent_urls['class_url'],
+            'subject': names['subject'],
+            'subject_url': parent_urls['subject_url'],
+            'chapter': names['chapter'],
+            'chapter_url': url,
+            'hierarchy_path': f"{names['state']} > {names['class']} > {names['subject']} > {names['chapter']}",
+            'breadcrumb': breadcrumb
+        }
+        
+        self.all_data.append(entry)
+        print(f"✅ Processed: {names['chapter']}")
+
+    def save_to_csv(self, filename='hierarchy_output.csv'):
+        """Save extracted hierarchy to CSV"""
+        if not self.all_data:
+            print("No data to save!")
+            return
+        
+        with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
+            fieldnames = ['state', 'state_url', 'class', 'class_url', 'subject', 'subject_url', 
+                         'chapter', 'chapter_url', 'hierarchy_path', 'breadcrumb']
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            writer.writeheader()
+            for row in self.all_data:
+                writer.writerow(row)
+        
+        print(f"💾 Hierarchy saved to {filename}")
+
+    def save_hierarchical_text(self, filename='hierarchy_structure.txt'):
+        """Save as readable hierarchical text"""
+        if not self.all_data:
+            print("No data to save!")
+            return
+        
+        with open(filename, 'w', encoding='utf-8') as f:
+            f.write("COMPLETE HIERARCHICAL STRUCTURE\n")
+            f.write("=" * 60 + "\n\n")
+            
+            current_state = ""
+            current_class = ""
+            current_subject = ""
+            
+            for row in self.all_data:
+                # State level
+                if row['state'] != current_state:
+                    current_state = row['state']
+                    current_class = ""
+                    current_subject = ""
+                    f.write(f"\n🏛️ STATE: {current_state}\n")
+                    f.write(f"🔗 {row['state_url']}\n")
+                    f.write("-" * 50 + "\n")
+                
+                # Class level
+                if row['class'] != current_class:
+                    current_class = row['class']
+                    current_subject = ""
+                    f.write(f"\n  📚 CLASS: {current_class}\n")
+                    f.write(f"  🔗 {row['class_url']}\n")
+                    f.write("  " + "-" * 48 + "\n")
+                
+                # Subject level
+                if row['subject'] != current_subject:
+                    current_subject = row['subject']
+                    f.write(f"\n    📖 SUBJECT: {current_subject}\n")
+                    f.write(f"    🔗 {row['subject_url']}\n")
+                    f.write("    📋 CHAPTERS:\n")
+                
+                # Chapter level
+                f.write(f"      • {row['chapter']}\n")
+                f.write(f"        🔗 {row['chapter_url']}\n")
+        
+        print(f"💾 Hierarchical structure saved to {filename}")
+
+    def display_summary(self):
+        """Display summary of extracted data"""
+        if not self.all_data:
+            print("No data to display!")
+            return
+        
+        print(f"\n📊 EXTRACTION SUMMARY:")
+        print("=" * 40)
+        print(f"Total entries processed: {len(self.all_data)}")
+        
+        states = set(row['state'] for row in self.all_data)
+        classes = set(row['class'] for row in self.all_data)
+        subjects = set(row['subject'] for row in self.all_data)
+        chapters = set(row['chapter'] for row in self.all_data)
+        
+        print(f"States: {len(states)}")
+        print(f"Classes: {len(classes)}")
+        print(f"Subjects: {len(subjects)}")
+        print(f"Chapters: {len(chapters)}")
+        
+        print(f"\n🏛️ States found: {', '.join(states)}")
+        print(f"📚 Classes found: {', '.join(sorted(classes))}")
+        
+        print(f"\n📝 SAMPLE HIERARCHY:")
+        for i, row in enumerate(self.all_data[:5]):
+            print(f"{i+1}. {row['hierarchy_path']}")
+
+def main():
+    extractor = HierarchyExtractor()
+    
+    print("🌐 HIERARCHY EXTRACTOR FROM URLs.TXT")
+    print("=" * 50)
+    print("This script will:")
+    print("1. Read urls.txt file with tab-separated URLs and breadcrumbs")
+    print("2. Extract complete hierarchy: State → Class → Subject → Chapter")
+    print("3. Save results in CSV and readable format")
+    print()
+    
+    # Process the urls.txt file
+    data = extractor.process_urls_file('urls.txt')
+    
+    if data:
+        # Save results
+        extractor.save_to_csv()
+        extractor.save_hierarchical_text()
+        
+        # Display summary
+        extractor.display_summary()
+    else:
+        print("❌ No data processed. Please check your urls.txt file format.")
+
+if __name__ == "__main__":
+    main()
