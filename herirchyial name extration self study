@@ -1,0 +1,182 @@
+import csv
+import os
+import time
+import requests
+import pandas as pd
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+# --------------------------------------------
+# CONFIGURATION
+# --------------------------------------------
+INPUT_FILE = "urls (2).csv"  # input file
+URL_COLUMN = "URL"
+LEVEL1_CLASS = "sample-links mb-3 ul1"
+LEVEL2_CLASS = "colored-links mb-3"
+OUTPUT_CSV = "hierarchy_output.csv"
+OUTPUT_TXT = "hierarchy_output.txt"
+SAVE_INTERVAL = 10  # Save every 10 records
+# --------------------------------------------
+
+
+def get_html(url):
+    """Fetch HTML via requests, fallback to Selenium for JS-heavy pages."""
+    try:
+        res = requests.get(url, timeout=10)
+        if res.status_code == 200 and "<ul" in res.text:
+            return res.text
+    except Exception:
+        pass
+
+    print(f"⚙️ Using Selenium for {url}")
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    driver = webdriver.Chrome(options=options)
+    driver.get(url)
+    time.sleep(4)
+    html = driver.page_source
+    driver.quit()
+    return html
+
+
+def extract_level1_links(html, base_url):
+    """Extract Parent → Book links from Level 1"""
+    soup = BeautifulSoup(html, "html.parser")
+    uls = soup.find_all("ul", class_=LEVEL1_CLASS)
+    data = []
+    for ul in uls:
+        current_parent = None
+        for li in ul.find_all("li"):
+            a = li.find("a")
+            if not a:
+                continue
+            text = a.get_text(strip=True)
+            href = a.get("href", "").strip()
+            full_link = urljoin(base_url, href)
+            if "javascript:void(0)" in href:
+                current_parent = text
+            else:
+                data.append((current_parent, text, full_link))
+    return data
+
+
+def extract_level2_links(html, base_url):
+    """Extract Chapter/Subtopic links from Level 2"""
+    soup = BeautifulSoup(html, "html.parser")
+    ul = soup.find("ul", class_=LEVEL2_CLASS)
+    results = []
+    if not ul:
+        return results
+    for li in ul.find_all("li", class_="chapterLi"):
+        a = li.find("a")
+        if not a:
+            continue
+        text = a.get_text(strip=True)
+        href = a.get("href", "").strip()
+        full_link = urljoin(base_url, href)
+        results.append((text, full_link))
+    return results
+
+
+def load_input_urls():
+    """Load URLs and other columns from CSV"""
+    df = pd.read_csv(INPUT_FILE, encoding="utf-8-sig")
+    if URL_COLUMN not in df.columns:
+        raise ValueError(f"❌ Missing column '{URL_COLUMN}' in {INPUT_FILE}")
+    return df
+
+
+def append_to_files(rows, csv_headers):
+    """Append extracted rows to output CSV and TXT"""
+    csv_exists = os.path.exists(OUTPUT_CSV)
+    with open(OUTPUT_CSV, "a", encoding="utf-8-sig", newline="") as f:
+        writer = csv.writer(f)
+        if not csv_exists:
+            writer.writerow(csv_headers)
+        writer.writerows(rows)
+
+    with open(OUTPUT_TXT, "a", encoding="utf-8-sig") as f:
+        for row in rows:
+            breadcrumb = row[-1]
+            subchild_url = row[5]
+            child_url = row[4]
+            f.write(f"{breadcrumb} -> {subchild_url or child_url}\n")
+
+
+def crawl_all():
+    """Main crawler for all URLs in input"""
+    df = load_input_urls()
+    processed = 0
+    results_batch = []
+
+    for idx, row in df.iterrows():
+        main_url = str(row[URL_COLUMN]).strip()
+        if not main_url or not main_url.startswith("http"):
+            continue
+
+        # Preserve existing columns like Parent, Grandparent, etc.
+        meta_cols = [str(x) for x in row if str(x) != "nan"]
+
+        print(f"\n🔍 Processing ({idx+1}/{len(df)}): {main_url}")
+
+        try:
+            main_html = get_html(main_url)
+            level1_links = extract_level1_links(main_html, main_url)
+
+            for parent, child, child_url in level1_links:
+                breadcrumb = f"{parent} > {child}" if parent else child
+                results_batch.append([
+                    *meta_cols, parent, child, "",  # hierarchy
+                    main_url, child_url, "",        # URLs
+                    breadcrumb
+                ])
+
+                # Extract level 2 links
+                if not child_url or "javascript:void(0)" in child_url:
+                    continue
+
+                sub_html = get_html(child_url)
+                level2_links = extract_level2_links(sub_html, child_url)
+
+                for sub_text, sub_link in level2_links:
+                    breadcrumb2 = f"{parent} > {child} > {sub_text}" if parent else f"{child} > {sub_text}"
+                    results_batch.append([
+                        *meta_cols, parent, child, sub_text,
+                        main_url, child_url, sub_link,
+                        breadcrumb2
+                    ])
+
+                processed += 1
+                # Save progress every few URLs
+                if len(results_batch) >= SAVE_INTERVAL:
+                    append_to_files(results_batch, list(df.columns) + [
+                        "Parent", "Child", "SubChild",
+                        "Parent URL", "Child URL", "SubChild URL",
+                        "Breadcrumb"
+                    ])
+                    print(f"💾 Saved progress at {processed} URLs")
+                    results_batch = []
+
+        except Exception as e:
+            print(f"⚠️ Skipped {main_url}: {e}")
+            continue
+
+    # Final save
+    if results_batch:
+        append_to_files(results_batch, list(df.columns) + [
+            "Parent", "Child", "SubChild",
+            "Parent URL", "Child URL", "SubChild URL",
+            "Breadcrumb"
+        ])
+
+    print(f"\n✅ Done! Crawled {len(df)} URLs")
+    print(f"📁 Outputs continuously saved to:\n   - {OUTPUT_CSV}\n   - {OUTPUT_TXT}")
+
+
+if __name__ == "__main__":
+    crawl_all()
