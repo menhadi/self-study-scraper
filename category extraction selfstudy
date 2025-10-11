@@ -1,0 +1,96 @@
+import csv
+import time
+import requests
+from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+# -----------------------------------------
+# CONFIG
+# -----------------------------------------
+URLS = [
+    "https://www.selfstudys.com/state-wise/madhya-pradesh/class-12th",
+    "https://www.selfstudys.com/state-wise/madhya-pradesh/class-11th",
+]
+UL_CLASS = "sample-links mb-3 ul1"
+OUTPUT_CSV = "selfstudys_hierarchy.csv"
+OUTPUT_TXT = "selfstudys_hierarchy.txt"
+# -----------------------------------------
+
+
+def get_html(url):
+    """Try fetching via requests, fallback to Selenium if needed"""
+    try:
+        res = requests.get(url, timeout=10)
+        if "<ul" in res.text:
+            return res.text
+    except:
+        pass
+
+    print(f"⚙️ Using Selenium for {url}")
+    chrome_options = Options()
+    chrome_options.add_argument("--headless")
+    chrome_options.add_argument("--disable-gpu")
+    driver = webdriver.Chrome(options=chrome_options)
+    driver.get(url)
+    time.sleep(5)
+    html = driver.page_source
+    driver.quit()
+    return html
+
+
+def extract_hierarchy_from_html(html):
+    """Extract (parent, child, link) structure"""
+    soup = BeautifulSoup(html, "html.parser")
+    uls = soup.find_all("ul", class_=UL_CLASS)
+
+    data = []
+    for ul in uls:
+        current_parent = None
+        for li in ul.find_all("li"):
+            a = li.find("a")
+            if not a:
+                continue
+            text = a.get_text(strip=True)
+            href = a.get("href", "")
+            if "javascript:void(0)" in href:
+                current_parent = text
+            else:
+                if current_parent:
+                    data.append((current_parent, text, href))
+                else:
+                    data.append((None, text, href))
+    return data
+
+
+def save_to_files(all_data):
+    """Save all combined results"""
+    # CSV
+    with open(OUTPUT_CSV, "w", encoding="utf-8", newline="") as f:
+        writer = csv.writer(f)
+        writer.writerow(["Parent", "Child", "Link"])
+        for row in all_data:
+            writer.writerow(row)
+
+    # Text
+    with open(OUTPUT_TXT, "w", encoding="utf-8") as f:
+        for parent, child, link in all_data:
+            if parent:
+                f.write(f"{parent}\n    ├── {child} -> {link}\n")
+            else:
+                f.write(f"{child} -> {link}\n")
+    print(f"\n✅ Saved results to:\n  {OUTPUT_CSV}\n  {OUTPUT_TXT}")
+
+
+def main():
+    all_data = []
+    for url in URLS:
+        print(f"🔍 Processing: {url}")
+        html = get_html(url)
+        data = extract_hierarchy_from_html(html)
+        all_data.extend(data)
+    save_to_files(all_data)
+
+
+if __name__ == "__main__":
+    main()
