@@ -2,24 +2,26 @@ import csv
 import time
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import urljoin
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
 
-# -----------------------------------------
-# CONFIG
-# -----------------------------------------
-URLS = [
+# --------------------------------------------
+# CONFIGURATION
+# --------------------------------------------
+BASE_URLS = [
     "https://www.selfstudys.com/state-wise/madhya-pradesh/class-12th",
     "https://www.selfstudys.com/state-wise/madhya-pradesh/class-11th",
 ]
-UL_CLASS = "sample-links mb-3 ul1"
-OUTPUT_CSV = "selfstudys_hierarchy.csv"
-OUTPUT_TXT = "selfstudys_hierarchy.txt"
-# -----------------------------------------
+LEVEL1_CLASS = "sample-links mb-3 ul1"
+LEVEL2_CLASS = "colored-links mb-3"
+OUTPUT_CSV = "selfstudys_hierarchy_final.csv"
+OUTPUT_TXT = "selfstudys_hierarchy_final.txt"
+# --------------------------------------------
 
 
 def get_html(url):
-    """Try fetching via requests, fallback to Selenium if needed"""
+    """Fetch HTML using requests; fallback to Selenium for JS-heavy pages"""
     try:
         res = requests.get(url, timeout=10)
         if "<ul" in res.text:
@@ -28,22 +30,21 @@ def get_html(url):
         pass
 
     print(f"⚙️ Using Selenium for {url}")
-    chrome_options = Options()
-    chrome_options.add_argument("--headless")
-    chrome_options.add_argument("--disable-gpu")
-    driver = webdriver.Chrome(options=chrome_options)
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--disable-gpu")
+    driver = webdriver.Chrome(options=options)
     driver.get(url)
-    time.sleep(5)
+    time.sleep(4)
     html = driver.page_source
     driver.quit()
     return html
 
 
-def extract_hierarchy_from_html(html):
-    """Extract (parent, child, link) structure"""
+def extract_level1_links(html, base_url):
+    """Extract Parent → Book links from Level 1"""
     soup = BeautifulSoup(html, "html.parser")
-    uls = soup.find_all("ul", class_=UL_CLASS)
-
+    uls = soup.find_all("ul", class_=LEVEL1_CLASS)
     data = []
     for ul in uls:
         current_parent = None
@@ -52,45 +53,89 @@ def extract_hierarchy_from_html(html):
             if not a:
                 continue
             text = a.get_text(strip=True)
-            href = a.get("href", "")
+            href = a.get("href", "").strip()
+            full_link = urljoin(base_url, href)
             if "javascript:void(0)" in href:
                 current_parent = text
             else:
-                if current_parent:
-                    data.append((current_parent, text, href))
-                else:
-                    data.append((None, text, href))
+                data.append((current_parent, text, full_link))
     return data
 
 
-def save_to_files(all_data):
-    """Save all combined results"""
-    # CSV
+def extract_level2_links(html, base_url):
+    """Extract Chapter/Subtopic links from Level 2"""
+    soup = BeautifulSoup(html, "html.parser")
+    ul = soup.find("ul", class_=LEVEL2_CLASS)
+    results = []
+    if not ul:
+        return results
+    for li in ul.find_all("li", class_="chapterLi"):
+        a = li.find("a")
+        if not a:
+            continue
+        text = a.get_text(strip=True)
+        href = a.get("href", "").strip()
+        full_link = urljoin(base_url, href)
+        results.append((text, full_link))
+    return results
+
+
+def crawl_hierarchy():
+    """Crawl up to Level 2 and build full hierarchy"""
+    results = []
+    for main_url in BASE_URLS:
+        print(f"\n🔍 Processing: {main_url}")
+        main_html = get_html(main_url)
+        level1_links = extract_level1_links(main_html, main_url)
+
+        for parent, child, child_url in level1_links:
+            # Add Level 1 (no subchild)
+            results.append([
+                parent, child, "",           # hierarchy text
+                main_url, child_url, "",     # URLs
+                f"{parent} > {child}"        # breadcrumb
+            ])
+
+            # Now extract Level 2 (subchild)
+            if not child_url or "javascript:void(0)" in child_url:
+                continue
+
+            try:
+                sub_html = get_html(child_url)
+                level2_links = extract_level2_links(sub_html, child_url)
+                for sub_text, sub_link in level2_links:
+                    results.append([
+                        parent, child, sub_text,  # hierarchy text
+                        main_url, child_url, sub_link,  # URLs
+                        f"{parent} > {child} > {sub_text}"  # breadcrumb
+                    ])
+            except Exception as e:
+                print(f"⚠️ Skipped {child_url}: {e}")
+    return results
+
+
+def save_results(data):
+    """Save both CSV and readable TXT outputs"""
     with open(OUTPUT_CSV, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["Parent", "Child", "Link"])
-        for row in all_data:
-            writer.writerow(row)
+        writer.writerow([
+            "Parent", "Child", "SubChild",
+            "Parent URL", "Child URL", "SubChild URL",
+            "Breadcrumb"
+        ])
+        writer.writerows(data)
 
-    # Text
     with open(OUTPUT_TXT, "w", encoding="utf-8") as f:
-        for parent, child, link in all_data:
-            if parent:
-                f.write(f"{parent}\n    ├── {child} -> {link}\n")
+        for parent, child, sub, purl, curl, surl, bc in data:
+            if sub:
+                f.write(f"{bc} -> {surl}\n")
             else:
-                f.write(f"{child} -> {link}\n")
-    print(f"\n✅ Saved results to:\n  {OUTPUT_CSV}\n  {OUTPUT_TXT}")
+                f.write(f"{bc} -> {curl}\n")
 
-
-def main():
-    all_data = []
-    for url in URLS:
-        print(f"🔍 Processing: {url}")
-        html = get_html(url)
-        data = extract_hierarchy_from_html(html)
-        all_data.extend(data)
-    save_to_files(all_data)
+    print(f"\n✅ Extracted {len(data)} rows")
+    print(f"📁 Saved:\n  - {OUTPUT_CSV}\n  - {OUTPUT_TXT}")
 
 
 if __name__ == "__main__":
-    main()
+    all_data = crawl_hierarchy()
+    save_results(all_data)
