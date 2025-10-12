@@ -1,0 +1,262 @@
+import requests
+from bs4 import BeautifulSoup
+import re
+import csv
+import time
+import os
+import concurrent.futures
+
+def get_pdf_download_url(page_url):
+    """
+    Extract PDF download link from SelfStudys book page - Optimized version
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        # Fetch the page content with timeout
+        response = requests.get(page_url, headers=headers, timeout=10)
+        response.raise_for_status()
+        
+        # Parse HTML content
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Look for PDF download links - optimized search
+        pdf_links = []
+        
+        # Pattern 1: Direct PDF links in script tags (most common)
+        script_tags = soup.find_all('script')
+        for script in script_tags:
+            if script.string:
+                # Look for URLs containing 'sitepdfs'
+                matches = re.findall(r'https://www\.selfstudys\.com/sitepdfs/[^\s"\']+', script.string)
+                if matches:
+                    pdf_links.extend(matches)
+                    break  # Found in scripts, no need to check further
+        
+        # If not found in scripts, check anchor tags
+        if not pdf_links:
+            anchor_tags = soup.find_all('a', href=True)
+            for anchor in anchor_tags:
+                href = anchor['href']
+                if 'sitepdfs' in href:
+                    if href.startswith('//'):
+                        href = 'https:' + href
+                    elif href.startswith('/'):
+                        href = 'https://www.selfstudys.com' + href
+                    pdf_links.append(href)
+                    break  # Found one, no need to check further
+        
+        # Return first found PDF URL
+        return pdf_links[0] if pdf_links else None
+        
+    except requests.RequestException as e:
+        print(f"  ✗ Request failed: {e}")
+        return None
+    except Exception as e:
+        print(f"  ✗ Error: {e}")
+        return None
+
+def process_single_url(url):
+    """Process a single URL and return result"""
+    pdf_url = get_pdf_download_url(url)
+    
+    if pdf_url:
+        return url, pdf_url, "Success"
+    else:
+        return url, "", "Failed"
+
+def process_urls_sequential(urls, delay=0.5):
+    """Process URLs sequentially but faster"""
+    results = []
+    
+    for i, url in enumerate(urls, 1):
+        print(f"[{i}/{len(urls)}] Processing: {url[:80]}...")
+        
+        start_time = time.time()
+        result = process_single_url(url)
+        end_time = time.time()
+        
+        if result[2] == "Success":
+            print(f"  ✓ Success ({end_time - start_time:.2f}s): {result[1]}")
+        else:
+            print(f"  ✗ Failed ({end_time - start_time:.2f}s)")
+        
+        results.append(result)
+        
+        # Smaller delay between requests
+        if i < len(urls):
+            time.sleep(delay)
+    
+    return results
+
+def process_urls_parallel(urls, max_workers=3):
+    """Process URLs in parallel for maximum speed"""
+    results = []
+    
+    print(f"Processing {len(urls)} URLs in parallel with {max_workers} workers...")
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        # Submit all tasks
+        future_to_url = {executor.submit(process_single_url, url): url for url in urls}
+        
+        # Process completed tasks
+        for i, future in enumerate(concurrent.futures.as_completed(future_to_url), 1):
+            url = future_to_url[future]
+            try:
+                result = future.result(timeout=15)
+                if result[2] == "Success":
+                    print(f"[{i}/{len(urls)}] ✓ {url[:60]}...")
+                    print(f"     PDF: {result[1]}")
+                else:
+                    print(f"[{i}/{len(urls)}] ✗ {url[:60]}...")
+                results.append(result)
+            except concurrent.futures.TimeoutError:
+                print(f"[{i}/{len(urls)}] ✗ Timeout: {url[:60]}...")
+                results.append((url, "", "Failed - Timeout"))
+            except Exception as e:
+                print(f"[{i}/{len(urls)}] ✗ Error: {url[:60]}... - {e}")
+                results.append((url, "", "Failed - Error"))
+    
+    return results
+
+def process_urls_from_file(input_file, output_txt, output_csv, use_parallel=True, delay=0.3):
+    """
+    Fast function to process URLs from file
+    """
+    # Check if input file exists
+    if not os.path.exists(input_file):
+        print(f"Error: Input file '{input_file}' not found.")
+        return
+    
+    # Read URLs from input file - simple approach
+    try:
+        with open(input_file, 'r', encoding='utf-8') as file:
+            content = file.read()
+        
+        # Extract all URLs using regex
+        urls = re.findall(r'https?://[^\s<>"]+|www\.[^\s<>"]+', content)
+        
+        # Filter only selfstudys URLs
+        selfstudys_urls = [url for url in urls if 'selfstudys.com' in url]
+        
+        if not selfstudys_urls:
+            print("No SelfStudys URLs found with regex. Trying line-by-line reading...")
+            with open(input_file, 'r', encoding='utf-8') as file:
+                lines = file.readlines()
+            
+            selfstudys_urls = []
+            for line in lines:
+                line = line.strip()
+                if line and ('http' in line and 'selfstudys.com' in line):
+                    # Extract URL from line
+                    url_match = re.search(r'(https?://[^\s<>"]+)', line)
+                    if url_match:
+                        selfstudys_urls.append(url_match.group(1))
+        
+        print(f"Found {len(selfstudys_urls)} SelfStudys URLs to process")
+        
+        if not selfstudys_urls:
+            print("Please make sure your file contains SelfStudys URLs")
+            return
+        
+    except Exception as e:
+        print(f"Error reading input file: {e}")
+        return
+    
+    start_time = time.time()
+    
+    # Process URLs
+    if use_parallel and len(selfstudys_urls) > 1:
+        results = process_urls_parallel(selfstudys_urls, max_workers=3)
+    else:
+        results = process_urls_sequential(selfstudys_urls, delay=delay)
+    
+    total_time = time.time() - start_time
+    
+    # Save results to text file
+    try:
+        with open(output_txt, 'w', encoding='utf-8') as txt_file:
+            txt_file.write("Input URL | PDF Download URL | Status\n")
+            txt_file.write("=" * 100 + "\n")
+            for input_url, pdf_url, status in results:
+                txt_file.write(f"{input_url} | {pdf_url} | {status}\n")
+        print(f"✓ Results saved to text file: {output_txt}")
+    except Exception as e:
+        print(f"✗ Error writing to text file: {e}")
+    
+    # Save results to CSV file
+    try:
+        with open(output_csv, 'w', newline='', encoding='utf-8') as csv_file:
+            writer = csv.writer(csv_file)
+            writer.writerow(['Input_URL', 'PDF_Download_URL', 'Status'])
+            for input_url, pdf_url, status in results:
+                writer.writerow([input_url, pdf_url, status])
+        print(f"✓ Results saved to CSV file: {output_csv}")
+    except Exception as e:
+        print(f"✗ Error writing to CSV file: {e}")
+    
+    # Print summary
+    successful = sum(1 for _, _, status in results if status == "Success")
+    failed = len(selfstudys_urls) - successful
+    
+    print(f"\n" + "="*60)
+    print("PROCESSING SUMMARY")
+    print("="*60)
+    print(f"Total URLs processed: {len(selfstudys_urls)}")
+    print(f"Successful extractions: {successful}")
+    print(f"Failed extractions: {failed}")
+    print(f"Success rate: {(successful/len(selfstudys_urls))*100:.1f}%")
+    print(f"Total time: {total_time:.2f} seconds")
+    print(f"Average time per URL: {total_time/len(selfstudys_urls):.2f} seconds")
+    
+    # Show some successful PDF URLs
+    if successful > 0:
+        print(f"\nFirst few successful PDF URLs:")
+        success_count = 0
+        for input_url, pdf_url, status in results:
+            if status == "Success" and success_count < 3:
+                print(f"  {pdf_url}")
+                success_count += 1
+
+# Test function
+def test_extraction():
+    """Test the extraction with known working URL"""
+    test_url = "https://www.selfstudys.com/books/bihar/state-books/class-12th/2024/english-105-set-e-2024/1103030"
+    
+    print("Testing PDF extraction...")
+    start_time = time.time()
+    pdf_url = get_pdf_download_url(test_url)
+    end_time = time.time()
+    
+    if pdf_url:
+        print(f"✓ SUCCESS ({end_time - start_time:.2f}s): {pdf_url}")
+    else:
+        print(f"✗ FAILED ({end_time - start_time:.2f}s)")
+    return pdf_url is not None
+
+# Main execution
+if __name__ == "__main__":
+    input_filename = "urls-4.txt"
+    output_text = "pdf_urls_output.txt"
+    output_csv = "pdf_urls_output.csv"
+    
+    print("🚀 FAST SelfStudys PDF URL Extractor")
+    print("="*50)
+    
+    # First test if extraction works
+    if test_extraction():
+        print("\n" + "="*50)
+        print("Starting bulk processing...")
+        
+        # Process all URLs - using parallel processing for speed
+        process_urls_from_file(
+            input_filename, 
+            output_text, 
+            output_csv, 
+            use_parallel=True,  # Set to False for sequential processing
+            delay=0.2  # Smaller delay between requests
+        )
+    else:
+        print("Basic test failed. Please check the website availability.")
