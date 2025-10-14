@@ -1,0 +1,372 @@
+import requests
+from bs4 import BeautifulSoup
+import pandas as pd
+import re
+
+def extract_questions_properly(url):
+    """
+    Extract questions with proper structure - complete questions in one cell
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        print("🚀 EXTRACTING QUESTIONS WITH PROPER STRUCTURE...")
+        print("=" * 80)
+        
+        # Extract subject
+        subject_element = soup.find('h1', id='dynamic-title')
+        subject = subject_element.get_text(strip=True) if subject_element else "Science & Technology"
+        print(f"📚 Subject: {subject}")
+        
+        # Get the main content area
+        main_content = soup.find('div', class_=lambda x: x and any(cls in str(x).lower() for cls in ['content', 'main', 'article', 'entry']))
+        if not main_content:
+            main_content = soup.find('body')
+        
+        # Find all year sections and questions
+        questions_data = []
+        
+        # Find all elements that could contain questions
+        all_elements = main_content.find_all(['p', 'div', 'li', 'span'])
+        
+        current_year = "2025"
+        current_question = None
+        collecting_question = False
+        question_lines = []
+        
+        for element in all_elements:
+            text = element.get_text(strip=True)
+            if not text:
+                continue
+            
+            # Check for year
+            if re.match(r'^\d{4}$', text):
+                current_year = text
+                continue
+            
+            # Check for question start (number followed by dot)
+            if re.match(r'^\d+\.', text):
+                # Save previous question if exists
+                if current_question and question_lines:
+                    complete_question = parse_question_block(question_lines, subject, current_year)
+                    if complete_question:
+                        questions_data.append(complete_question)
+                
+                # Start new question
+                question_lines = [text]
+                collecting_question = True
+                
+            elif collecting_question:
+                # Check if this is still part of the question or options
+                if re.match(r'^\([a-d]\)', text.lower()) or re.match(r'^[IV]+\.', text):
+                    # This is part of question (options or roman numerals)
+                    question_lines.append(text)
+                elif any(keyword in text.lower() for keyword in ['how many', 'which of', 'consider the']):
+                    # This is part of question
+                    question_lines.append(text)
+                else:
+                    # Might be options or answer
+                    question_lines.append(text)
+            
+            # Check if we should stop collecting (answer found or next question)
+            if text.lower().startswith('answer') or text.lower().startswith('correct option'):
+                collecting_question = False
+        
+        # Don't forget the last question
+        if question_lines:
+            complete_question = parse_question_block(question_lines, subject, current_year)
+            if complete_question:
+                questions_data.append(complete_question)
+        
+        return questions_data
+        
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return []
+
+def parse_question_block(question_lines, subject, year):
+    """
+    Parse a complete question block with all lines
+    """
+    try:
+        # Combine all question lines
+        full_text = ' '.join(question_lines)
+        
+        # Extract question number
+        question_match = re.match(r'^(\d+)\.\s*(.*)', full_text)
+        if not question_match:
+            return None
+            
+        question_number = question_match.group(1)
+        remaining_text = question_match.group(2)
+        
+        # Split question text from options
+        # Look for the first option pattern
+        option_split = re.split(r'\(([a-d])\)', remaining_text, maxsplit=1)
+        
+        if len(option_split) < 3:
+            return None
+        
+        question_text = option_split[0].strip()
+        first_option_letter = option_split[1]
+        options_text = first_option_letter + option_split[2]
+        
+        # Extract all options
+        options = extract_all_options(options_text)
+        
+        # Extract answer from the full text
+        answer = extract_answer_from_text(full_text)
+        
+        # Ensure all options exist
+        for letter in ['A', 'B', 'C', 'D']:
+            if letter not in options:
+                options[letter] = ''
+        
+        question_data = {
+            'Subject': subject,
+            'Year': year,
+            'Question': question_text,
+            'Option_A': options.get('A', ''),
+            'Option_B': options.get('B', ''),
+            'Option_C': options.get('C', ''),
+            'Option_D': options.get('D', ''),
+            'Answer': answer
+        }
+        
+        return question_data
+        
+    except Exception as e:
+        print(f"Error parsing question block: {e}")
+        return None
+
+def extract_all_options(options_text):
+    """
+    Extract all options from options text
+    """
+    options = {}
+    
+    # Pattern to find all options
+    option_pattern = r'\(([a-d])\)\s*([^\(]*)'
+    matches = re.findall(option_pattern, options_text)
+    
+    for option_letter, option_text in matches:
+        # Clean the option text (remove any answer indicators)
+        clean_text = re.sub(r'answer.*$', '', option_text, flags=re.IGNORECASE).strip()
+        clean_text = re.sub(r'correct.*$', '', clean_text, flags=re.IGNORECASE).strip()
+        options[option_letter.upper()] = clean_text
+    
+    return options
+
+def extract_answer_from_text(text):
+    """
+    Extract answer from text
+    """
+    answer_patterns = [
+        r'answer\s*[:\-]?\s*\(?([a-d])\)?',
+        r'correct\s*[:\-]?\s*\(?([a-d])\)?',
+        r'solution\s*[:\-]?\s*\(?([a-d])\)?',
+        r'\(([a-d])\)\s*is\s*correct',
+        r'correct\s*option\s*is\s*\(?([a-d])\)?',
+    ]
+    
+    for pattern in answer_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return f"({match.group(1).upper()})"
+    
+    return ""
+
+def debug_website_structure(url):
+    """
+    Debug function to see the actual website structure
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(url, headers=headers)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        print("🔍 DEBUGGING WEBSITE STRUCTURE...")
+        print("=" * 80)
+        
+        # Find all elements with questions
+        all_elements = soup.find_all(['p', 'div', 'li', 'span'])
+        
+        question_count = 0
+        for i, element in enumerate(all_elements):
+            text = element.get_text(strip=True)
+            if not text:
+                continue
+                
+            # Check if this looks like a question
+            if re.match(r'^\d+\.', text) or any(keyword in text.lower() for keyword in ['consider', 'how many', 'which of']):
+                print(f"\n--- Element {i} ---")
+                print(f"Tag: {element.name}")
+                print(f"Classes: {element.get('class', [])}")
+                print(f"Text: {text[:200]}...")
+                question_count += 1
+                
+                if question_count >= 10:  # Show first 10
+                    break
+        
+        return True
+    except Exception as e:
+        print(f"Debug error: {e}")
+        return False
+
+def main():
+    """
+    Main execution function
+    """
+    url = "https://www.drishtiias.com/prelims/prelims-subject-wise-compilation-gs-paper-1/prelims-gspaperi-subject-wise-science-technology"
+    
+    print("🎯 DRISHTI IAS - PROPER QUESTION EXTRACTION")
+    print("=" * 80)
+    
+    # First, debug to understand structure
+    print("🔄 Analyzing website structure...")
+    debug_website_structure(url)
+    
+    print("\n🔄 Extracting questions...")
+    questions_data = extract_questions_properly(url)
+    
+    # Create dataframe
+    df = pd.DataFrame(questions_data) if questions_data else pd.DataFrame()
+    
+    if not df.empty:
+        print(f"\n✅ SUCCESS! Extracted {len(df)} questions")
+        
+        # Display the data properly
+        print("\n" + "=" * 120)
+        print("FINAL EXTRACTED DATA")
+        print("=" * 120)
+        
+        # Show complete data
+        for idx, row in df.iterrows():
+            print(f"\n--- Question {idx + 1} ---")
+            print(f"Subject: {row['Subject']}")
+            print(f"Year: {row['Year']}")
+            print(f"Question: {row['Question']}")
+            print(f"Option A: {row['Option_A']}")
+            print(f"Option B: {row['Option_B']}")
+            print(f"Option C: {row['Option_C']}")
+            print(f"Option D: {row['Option_D']}")
+            print(f"Answer: {row['Answer']}")
+            print("-" * 80)
+        
+        # Save to files
+        df.to_csv('drishti_proper_questions.csv', index=False, encoding='utf-8')
+        df.to_excel('drishti_proper_questions.xlsx', index=False)
+        
+        print(f"\n💾 Data saved to:")
+        print("   - drishti_proper_questions.csv")
+        print("   - drishti_proper_questions.xlsx")
+        
+    else:
+        print("\n❌ No questions extracted")
+        print("Let me try a different approach...")
+        
+        # Try simple text-based extraction
+        simple_extraction(url)
+
+def simple_extraction(url):
+    """
+    Simple text-based extraction as fallback
+    """
+    try:
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+        }
+        
+        response = requests.get(url, headers=headers)
+        soup = BeautifulSoup(response.content, 'html.parser')
+        
+        # Get all text
+        all_text = soup.get_text()
+        
+        # Split by questions
+        questions = re.split(r'(\d+\.)\s*', all_text)
+        
+        questions_data = []
+        subject = "Science & Technology"
+        year = "2025"
+        
+        for i in range(1, len(questions), 2):
+            if i + 1 < len(questions):
+                question_number = questions[i]
+                question_content = questions[i + 1]
+                
+                # Extract until next question or end
+                next_question_match = re.search(r'^\d+\.', question_content)
+                if next_question_match:
+                    question_content = question_content[:next_question_match.start()]
+                
+                # Parse this question
+                question_data = parse_complete_question_simple(question_content, subject, year, question_number)
+                if question_data:
+                    questions_data.append(question_data)
+                    print(f"✅ Extracted Q{question_number.strip('.')}")
+        
+        # Save the simple extraction
+        if questions_data:
+            df = pd.DataFrame(questions_data)
+            df.to_csv('drishti_simple_extraction.csv', index=False)
+            print(f"💾 Simple extraction saved: {len(questions_data)} questions")
+        
+    except Exception as e:
+        print(f"Simple extraction error: {e}")
+
+def parse_complete_question_simple(full_text, subject, year, question_number):
+    """
+    Simple question parser
+    """
+    try:
+        # Extract question text (everything before first option)
+        question_match = re.match(r'(.*?)(?=\(a\)|\(b\)|\(c\)|\(d\))', full_text, re.DOTALL)
+        if not question_match:
+            return None
+            
+        question_text = question_match.group(1).strip()
+        
+        # Extract options
+        options = {}
+        option_pattern = r'\(([a-d])\)\s*([^\(]*)'
+        matches = re.findall(option_pattern, full_text)
+        
+        for letter, text in matches:
+            options[letter.upper()] = text.strip()
+        
+        # Extract answer
+        answer = extract_answer_from_text(full_text)
+        
+        # Ensure all options
+        for letter in ['A', 'B', 'C', 'D']:
+            if letter not in options:
+                options[letter] = ''
+        
+        return {
+            'Subject': subject,
+            'Year': year,
+            'Question': question_text,
+            'Option_A': options['A'],
+            'Option_B': options['B'],
+            'Option_C': options['C'],
+            'Option_D': options['D'],
+            'Answer': answer
+        }
+        
+    except Exception as e:
+        print(f"Simple parser error: {e}")
+        return None
+
+if __name__ == "__main__":
+    main() 
