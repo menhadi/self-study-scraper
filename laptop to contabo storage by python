@@ -1,0 +1,139 @@
+import os
+import csv
+import time
+import boto3
+import concurrent.futures
+from botocore.exceptions import ClientError
+
+# =====================================================
+# CONFIGURATION
+# =====================================================
+ACCESS_KEY = "YOUR_ACCESS_KEY_HERE"
+SECRET_KEY = "YOUR_SECRET_KEY_HERE"
+ENDPOINT_URL = "https://sin1.contabostorage.com"
+REGION_NAME = "SIN"
+BUCKET_NAME = "tech4learn"
+LOCAL_FOLDER = r"D:\Self Study\Pdf"
+REMOTE_PATH = "pdfs"
+OUTPUT_CSV = r"C:\Users\menha\Downloads\uploaded_links_parallel.csv"
+
+# Tune these safely
+THREADS = 8            # number of parallel uploads (8–12 is usually optimal)
+BATCH_SIZE = 2000      # how many files per batch (too high = API throttle)
+RETRY_LIMIT = 3
+SLEEP_BETWEEN_BATCHES = 5
+
+# =====================================================
+# INITIALIZE S3 CLIENT
+# =====================================================
+session = boto3.session.Session()
+s3 = session.client(
+    "s3",
+    aws_access_key_id=ACCESS_KEY,
+    aws_secret_access_key=SECRET_KEY,
+    region_name=REGION_NAME,
+    endpoint_url=ENDPOINT_URL
+)
+
+# =====================================================
+# FUNCTIONS
+# =====================================================
+
+def file_exists(bucket, key):
+    """Check if file already exists on Contabo."""
+    try:
+        s3.head_object(Bucket=bucket, Key=key)
+        return True
+    except ClientError as e:
+        if e.response["Error"]["Code"] == "404":
+            return False
+        else:
+            raise
+
+def upload_one(file_info):
+    """Upload a single file with retry and return result tuple (filename, url, success)."""
+    filename, full_path, remote_key = file_info
+    for attempt in range(RETRY_LIMIT):
+        try:
+            s3.upload_file(
+                full_path,
+                BUCKET_NAME,
+                remote_key,
+                ExtraArgs={"ACL": "public-read", "ContentType": "application/pdf"},
+            )
+            file_url = f"{ENDPOINT_URL}/{BUCKET_NAME}/{remote_key}"
+            print(f"✅ Uploaded: {filename}")
+            return (filename, file_url, True)
+        except Exception as e:
+            print(f"⚠️ Retry {attempt+1}/{RETRY_LIMIT} for {filename}: {e}")
+            time.sleep(3)
+    print(f"❌ Failed: {filename}")
+    return (filename, "", False)
+
+# =====================================================
+# MAIN
+# =====================================================
+def main():
+    print(f"🚀 Starting parallel upload from: {LOCAL_FOLDER}")
+    all_files = []
+    for root, _, files in os.walk(LOCAL_FOLDER):
+        for filename in files:
+            if filename.lower().endswith(".pdf"):
+                full_path = os.path.join(root, filename)
+                rel_path = os.path.relpath(full_path, LOCAL_FOLDER)
+                remote_key = f"{REMOTE_PATH}/{rel_path.replace(os.sep, '/')}"
+                all_files.append((filename, full_path, remote_key))
+
+    total_files = len(all_files)
+    print(f"📦 Total files to process: {total_files:,}")
+
+    uploaded_records = []
+    processed = 0
+
+    # Load existing progress
+    if os.path.exists(OUTPUT_CSV):
+        with open(OUTPUT_CSV, newline='', encoding='utf-8') as csvfile:
+            reader = csv.DictReader(csvfile)
+            uploaded_records = [[row["Filename"], row["URL"]] for row in reader]
+        processed = len(uploaded_records)
+        uploaded_names = set(r[0] for r in uploaded_records)
+        print(f"🔁 Resuming upload — already recorded: {processed:,}")
+    else:
+        uploaded_names = set()
+
+    for i in range(0, total_files, BATCH_SIZE):
+        batch = all_files[i:i+BATCH_SIZE]
+        print(f"\n📤 Uploading batch {i//BATCH_SIZE + 1} ({len(batch)} files)...")
+
+        # Skip already uploaded files
+        filtered_batch = [f for f in batch if f[0] not in uploaded_names and not file_exists(BUCKET_NAME, f[2])]
+        if not filtered_batch:
+            print("✅ All files in this batch already uploaded.")
+            continue
+
+        # Parallel upload using ThreadPoolExecutor
+        with concurrent.futures.ThreadPoolExecutor(max_workers=THREADS) as executor:
+            for result in executor.map(upload_one, filtered_batch):
+                filename, url, success = result
+                if success:
+                    uploaded_records.append([filename, url])
+                    uploaded_names.add(filename)
+                processed += 1
+
+        # Save progress after each batch
+        with open(OUTPUT_CSV, "w", newline='', encoding="utf-8") as csvfile:
+            writer = csv.writer(csvfile)
+            writer.writerow(["Filename", "URL"])
+            writer.writerows(uploaded_records)
+        print(f"💾 Progress saved ({len(uploaded_records):,}/{total_files:,} files).")
+
+        if i + BATCH_SIZE < total_files:
+            print(f"⏸️  Cooling down {SLEEP_BETWEEN_BATCHES}s before next batch...")
+            time.sleep(SLEEP_BETWEEN_BATCHES)
+
+    print("\n✅ All uploads completed successfully!")
+    print(f"📊 Total uploaded: {len(uploaded_records):,}")
+    print(f"🧾 CSV file: {OUTPUT_CSV}")
+
+if __name__ == "__main__":
+    main()
