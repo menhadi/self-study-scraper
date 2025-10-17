@@ -7,84 +7,161 @@ from bs4 import BeautifulSoup
 from urllib.parse import urljoin
 from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 # --------------------------------------------
 # CONFIGURATION
 # --------------------------------------------
-INPUT_FILE = "urls (2).csv"  # input file
-URL_COLUMN = "URL"
+INPUT_FILE = "urls (2).csv"     # Input file with URLs
+URL_COLUMN = "URL"              # Column name for URLs
 LEVEL1_CLASS = "sample-links mb-3 ul1"
 LEVEL2_CLASS = "colored-links mb-3"
-OUTPUT_CSV = "hierarchy_output.csv"
-OUTPUT_TXT = "hierarchy_output.txt"
-SAVE_INTERVAL = 10  # Save every 10 records
+OUTPUT_CSV = "hierarchy_output_fast.csv"
+OUTPUT_TXT = "hierarchy_output_fast.txt"
+SAVE_INTERVAL = 25              # Save every 25 URLs (less I/O = faster)
 # --------------------------------------------
 
 
-def get_html(url):
-    """Fetch HTML via requests, fallback to Selenium for JS-heavy pages."""
+# =====================================================
+# SETUP & UTILITY
+# =====================================================
+
+def start_selenium():
+    """Start a single persistent Selenium instance."""
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    driver = webdriver.Chrome(options=options)
+    driver.set_page_load_timeout(25)
+    return driver
+
+
+def stop_selenium(driver):
+    """Safely stop Selenium."""
     try:
-        res = requests.get(url, timeout=10)
+        driver.quit()
+    except:
+        pass
+
+
+# Persistent HTTP session (faster than re-opening each time)
+session = requests.Session()
+session.headers.update({"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+
+
+# =====================================================
+# FETCHING
+# =====================================================
+
+def get_html(url, driver=None):
+    """Fetch HTML: Try requests first, fallback to Selenium for JS-heavy accordions."""
+    try:
+        res = session.get(url, timeout=8)
         if res.status_code == 200 and "<ul" in res.text:
             return res.text
     except Exception:
         pass
 
-    print(f"⚙️ Using Selenium for {url}")
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    driver = webdriver.Chrome(options=options)
-    driver.get(url)
-    time.sleep(4)
-    html = driver.page_source
-    driver.quit()
-    return html
+    if not driver:
+        return None
 
+    print(f"⚙️ Using Selenium for {url}")
+    try:
+        driver.get(url)
+        # Smart wait instead of fixed sleep
+        WebDriverWait(driver, 6).until(
+            EC.presence_of_element_located((By.TAG_NAME, "ul"))
+        )
+        return driver.page_source
+    except Exception as e:
+        print(f"⚠️ Selenium load failed: {e}")
+        return None
+
+
+# =====================================================
+# PARSING (3-Level Accordion)
+# =====================================================
 
 def extract_level1_links(html, base_url):
-    """Extract Parent → Book links from Level 1"""
+    """Extract Parent → Child → SubChild (supports 'ul3 collapse-level-3 m-2')."""
     soup = BeautifulSoup(html, "html.parser")
     uls = soup.find_all("ul", class_=LEVEL1_CLASS)
     data = []
+
     for ul in uls:
-        current_parent = None
-        for li in ul.find_all("li"):
-            a = li.find("a")
+        for li in ul.find_all("li", recursive=False):
+            a = li.find("a", recursive=False)
             if not a:
                 continue
+
             text = a.get_text(strip=True)
             href = a.get("href", "").strip()
             full_link = urljoin(base_url, href)
-            if "javascript:void(0)" in href:
-                current_parent = text
+
+            # Check for nested ULs
+            nested_ul = li.find("ul", recursive=False)
+            if nested_ul:
+                parent_name = text
+                for sub_li in nested_ul.find_all("li", recursive=False):
+                    a2 = sub_li.find("a")
+                    if not a2:
+                        continue
+                    child_text = a2.get_text(strip=True)
+                    href2 = a2.get("href", "").strip()
+                    full_link2 = urljoin(base_url, href2)
+
+                    # Handle 3rd-level accordion (ul3 collapse-level-3)
+                    ul3 = sub_li.find("ul", class_="ul3")
+                    if not ul3:
+                        for possible_ul in sub_li.find_all("ul", recursive=False):
+                            if any("collapse-level-3" in c for c in possible_ul.get("class", [])):
+                                ul3 = possible_ul
+                                break
+
+                    if ul3:
+                        for li3 in ul3.find_all("li", recursive=False):
+                            a3 = li3.find("a")
+                            if not a3:
+                                continue
+                            subchild_text = a3.get_text(strip=True)
+                            href3 = a3.get("href", "").strip()
+                            full_link3 = urljoin(base_url, href3)
+                            data.append((parent_name, child_text, subchild_text, full_link3))
+                    else:
+                        data.append((parent_name, child_text, "", full_link2))
             else:
-                data.append((current_parent, text, full_link))
+                data.append((text, "", "", full_link))
+
     return data
 
 
 def extract_level2_links(html, base_url):
-    """Extract Chapter/Subtopic links from Level 2"""
+    """Extract SubChild/Chapter links (handles multiple layouts)."""
     soup = BeautifulSoup(html, "html.parser")
-    ul = soup.find("ul", class_=LEVEL2_CLASS)
     results = []
-    if not ul:
-        return results
-    for li in ul.find_all("li", class_="chapterLi"):
-        a = li.find("a")
-        if not a:
-            continue
-        text = a.get_text(strip=True)
-        href = a.get("href", "").strip()
-        full_link = urljoin(base_url, href)
-        results.append((text, full_link))
+    for cls in [LEVEL2_CLASS, "box-links mb-3"]:
+        uls = soup.find_all("ul", class_=cls)
+        for ul in uls:
+            for li in ul.find_all("li", recursive=False):
+                a = li.find("a")
+                if not a:
+                    continue
+                text = a.get_text(strip=True)
+                href = a.get("href", "").strip()
+                full_link = urljoin(base_url, href)
+                results.append((text, full_link))
     return results
 
 
+# =====================================================
+# FILE MANAGEMENT
+# =====================================================
+
 def load_input_urls():
-    """Load URLs and other columns from CSV"""
+    """Load URLs from input CSV."""
     df = pd.read_csv(INPUT_FILE, encoding="utf-8-sig")
     if URL_COLUMN not in df.columns:
         raise ValueError(f"❌ Missing column '{URL_COLUMN}' in {INPUT_FILE}")
@@ -92,7 +169,7 @@ def load_input_urls():
 
 
 def append_to_files(rows, csv_headers):
-    """Append extracted rows to output CSV and TXT"""
+    """Append extracted rows to CSV and TXT (batch mode)."""
     csv_exists = os.path.exists(OUTPUT_CSV)
     with open(OUTPUT_CSV, "a", encoding="utf-8-sig", newline="") as f:
         writer = csv.writer(f)
@@ -103,80 +180,105 @@ def append_to_files(rows, csv_headers):
     with open(OUTPUT_TXT, "a", encoding="utf-8-sig") as f:
         for row in rows:
             breadcrumb = row[-1]
-            subchild_url = row[5]
-            child_url = row[4]
-            f.write(f"{breadcrumb} -> {subchild_url or child_url}\n")
+            subchild_url = row[6]
+            child_url = row[5]
+            parent_url = row[4]
+            f.write(f"{breadcrumb} -> {subchild_url or child_url or parent_url}\n")
 
+
+# =====================================================
+# MAIN CRAWLER (FAST MODE)
+# =====================================================
 
 def crawl_all():
-    """Main crawler for all URLs in input"""
+    """Main crawler logic (optimized version)."""
     df = load_input_urls()
-    processed = 0
     results_batch = []
+    processed = 0
+
+    driver = start_selenium()
 
     for idx, row in df.iterrows():
         main_url = str(row[URL_COLUMN]).strip()
         if not main_url or not main_url.startswith("http"):
             continue
 
-        # Preserve existing columns like Parent, Grandparent, etc.
-        meta_cols = [str(x) for x in row if str(x) != "nan"]
+        meta_cols = [str(x) if str(x) != "nan" else "" for x in row]
 
         print(f"\n🔍 Processing ({idx+1}/{len(df)}): {main_url}")
 
         try:
-            main_html = get_html(main_url)
+            main_html = get_html(main_url, driver)
+            if not main_html:
+                print(f"⚠️ Empty page at {main_url}")
+                continue
+
             level1_links = extract_level1_links(main_html, main_url)
 
-            for parent, child, child_url in level1_links:
-                breadcrumb = f"{parent} > {child}" if parent else child
+            if not level1_links:
                 results_batch.append([
-                    *meta_cols, parent, child, "",  # hierarchy
-                    main_url, child_url, "",        # URLs
-                    breadcrumb
+                    *meta_cols, "", "", "",
+                    main_url, "", "", f"{main_url}"
                 ])
 
-                # Extract level 2 links
-                if not child_url or "javascript:void(0)" in child_url:
+            for parent, child, subchild, link in level1_links:
+                breadcrumb = " > ".join([x for x in [parent, child, subchild] if x])
+                results_batch.append([
+                    *meta_cols,
+                    parent, child, subchild,
+                    main_url, link if link != "javascript:void(0)" else "",
+                    "", breadcrumb
+                ])
+
+                if not link or "javascript:void(0)" in link:
                     continue
 
-                sub_html = get_html(child_url)
-                level2_links = extract_level2_links(sub_html, child_url)
+                sub_html = get_html(link, driver)
+                level2_links = extract_level2_links(sub_html, link)
 
                 for sub_text, sub_link in level2_links:
-                    breadcrumb2 = f"{parent} > {child} > {sub_text}" if parent else f"{child} > {sub_text}"
+                    breadcrumb2 = f"{breadcrumb} > {sub_text}"
                     results_batch.append([
-                        *meta_cols, parent, child, sub_text,
-                        main_url, child_url, sub_link,
+                        *meta_cols,
+                        parent, child, sub_text,
+                        main_url, link, sub_link,
                         breadcrumb2
                     ])
 
                 processed += 1
-                # Save progress every few URLs
                 if len(results_batch) >= SAVE_INTERVAL:
-                    append_to_files(results_batch, list(df.columns) + [
-                        "Parent", "Child", "SubChild",
-                        "Parent URL", "Child URL", "SubChild URL",
-                        "Breadcrumb"
-                    ])
-                    print(f"💾 Saved progress at {processed} URLs")
+                    append_to_files(
+                        results_batch,
+                        list(df.columns) + [
+                            "Parent", "Child", "SubChild",
+                            "Parent URL", "Child URL", "SubChild URL",
+                            "Breadcrumb"
+                        ]
+                    )
+                    print(f"💾 Progress saved ({processed} URLs).")
                     results_batch = []
 
         except Exception as e:
-            print(f"⚠️ Skipped {main_url}: {e}")
+            print(f"⚠️ Error on {main_url}: {e}")
             continue
 
-    # Final save
     if results_batch:
-        append_to_files(results_batch, list(df.columns) + [
-            "Parent", "Child", "SubChild",
-            "Parent URL", "Child URL", "SubChild URL",
-            "Breadcrumb"
-        ])
+        append_to_files(
+            results_batch,
+            list(df.columns) + [
+                "Parent", "Child", "SubChild",
+                "Parent URL", "Child URL", "SubChild URL",
+                "Breadcrumb"
+            ]
+        )
 
-    print(f"\n✅ Done! Crawled {len(df)} URLs")
-    print(f"📁 Outputs continuously saved to:\n   - {OUTPUT_CSV}\n   - {OUTPUT_TXT}")
+    stop_selenium(driver)
+    print(f"\n✅ Done! Crawled {len(df)} URLs.")
+    print(f"📁 Output saved to:\n   - {OUTPUT_CSV}\n   - {OUTPUT_TXT}")
 
 
+# =====================================================
+# RUN
+# =====================================================
 if __name__ == "__main__":
     crawl_all()
