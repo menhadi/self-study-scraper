@@ -1,0 +1,2 @@
+cd "C:\Program Files\rclone"
+rclone copy "D:\Self Study\Pdf" contabo:tech4learn/pdfs --dry-run --verbose
