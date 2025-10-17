@@ -82,64 +82,66 @@ def get_html(url, driver=None):
 
 
 # =====================================================
-# PARSING (3-Level Accordion)
+# PARSING (4-Level Accordion)
 # =====================================================
 
 def extract_level1_links(html, base_url):
-    """Extract Parent → Child → SubChild (supports 'ul3 collapse-level-3 m-2')."""
+    """
+    Recursively extract up to 4 hierarchical levels:
+      Parent, Child, SubChild, SubSubChild
+    Returns list of tuples: (L1, L2, L3, L4, link_for_this_node)
+    Emits an entry for a node even if it has children (so you can see the node's own link)
+    """
     soup = BeautifulSoup(html, "html.parser")
-    uls = soup.find_all("ul", class_=LEVEL1_CLASS)
+    top_uls = soup.find_all("ul", class_=LEVEL1_CLASS)
     data = []
 
-    for ul in uls:
+    def is_nested_ul_of_interest(u):
+        # Accept any UL that looks like an accordion or nested list.
+        cls = u.get("class", [])
+        # if no class, still OK (some pages may not include class)
+        return True
+
+    def recurse_list(ul, parents):
         for li in ul.find_all("li", recursive=False):
             a = li.find("a", recursive=False)
             if not a:
-                continue
-
-            text = a.get_text(strip=True)
-            href = a.get("href", "").strip()
+                # If there's no anchor, try to find text directly
+                text = li.get_text(strip=True)
+                href = ""
+            else:
+                text = a.get_text(strip=True)
+                href = a.get("href", "").strip()
             full_link = urljoin(base_url, href)
 
-            # Check for nested ULs
-            nested_ul = li.find("ul", recursive=False)
+            # Find nested ULs (direct children only)
+            nested_ul = None
+            for possible_ul in li.find_all("ul", recursive=False):
+                if is_nested_ul_of_interest(possible_ul):
+                    nested_ul = possible_ul
+                    break
+
+            # Always emit current node as an entry (so parent nodes with children still appear)
+            levels = parents + [text]
+            # Pad to 4 levels
+            while len(levels) < 4:
+                levels.append("")
+            data.append((levels[0], levels[1], levels[2], levels[3], full_link))
+
+            # If nested UL exists, recurse to produce deeper entries
             if nested_ul:
-                parent_name = text
-                for sub_li in nested_ul.find_all("li", recursive=False):
-                    a2 = sub_li.find("a")
-                    if not a2:
-                        continue
-                    child_text = a2.get_text(strip=True)
-                    href2 = a2.get("href", "").strip()
-                    full_link2 = urljoin(base_url, href2)
+                recurse_list(nested_ul, parents + [text])
 
-                    # Handle 3rd-level accordion (ul3 collapse-level-3)
-                    ul3 = sub_li.find("ul", class_="ul3")
-                    if not ul3:
-                        for possible_ul in sub_li.find_all("ul", recursive=False):
-                            if any("collapse-level-3" in c for c in possible_ul.get("class", [])):
-                                ul3 = possible_ul
-                                break
-
-                    if ul3:
-                        for li3 in ul3.find_all("li", recursive=False):
-                            a3 = li3.find("a")
-                            if not a3:
-                                continue
-                            subchild_text = a3.get_text(strip=True)
-                            href3 = a3.get("href", "").strip()
-                            full_link3 = urljoin(base_url, href3)
-                            data.append((parent_name, child_text, subchild_text, full_link3))
-                    else:
-                        data.append((parent_name, child_text, "", full_link2))
-            else:
-                data.append((text, "", "", full_link))
+    for ul in top_uls:
+        recurse_list(ul, [])
 
     return data
 
 
 def extract_level2_links(html, base_url):
     """Extract SubChild/Chapter links (handles multiple layouts)."""
+    if not html:
+        return []
     soup = BeautifulSoup(html, "html.parser")
     results = []
     for cls in [LEVEL2_CLASS, "box-links mb-3"]:
@@ -180,10 +182,14 @@ def append_to_files(rows, csv_headers):
     with open(OUTPUT_TXT, "a", encoding="utf-8-sig") as f:
         for row in rows:
             breadcrumb = row[-1]
-            subchild_url = row[6]
-            child_url = row[5]
-            parent_url = row[4]
-            f.write(f"{breadcrumb} -> {subchild_url or child_url or parent_url}\n")
+            # last 4 URL columns are at positions: -5 .. -2 depending on header layout
+            # We will pick the deepest non-empty URL among SubSubChild, SubChild, Child, Parent
+            parent_url = row[-7] if len(row) >= 7 else ""
+            child_url = row[-6] if len(row) >= 6 else ""
+            subchild_url = row[-5] if len(row) >= 5 else ""
+            subsub_url = row[-4] if len(row) >= 4 else ""
+            chosen = subsub_url or subchild_url or child_url or parent_url or ""
+            f.write(f"{breadcrumb} -> {chosen}\n")
 
 
 # =====================================================
@@ -213,35 +219,86 @@ def crawl_all():
                 print(f"⚠️ Empty page at {main_url}")
                 continue
 
-            level1_links = extract_level1_links(main_html, main_url)
+            level1_entries = extract_level1_links(main_html, main_url)
 
-            if not level1_links:
+            if not level1_entries:
                 results_batch.append([
-                    *meta_cols, "", "", "",
-                    main_url, "", "", f"{main_url}"
+                    *meta_cols, "", "", "", "",
+                    main_url, "", "", "", "",
+                    f"{main_url}"
                 ])
 
-            for parent, child, subchild, link in level1_links:
-                breadcrumb = " > ".join([x for x in [parent, child, subchild] if x])
+            for L1, L2, L3, L4, node_link in level1_entries:
+                # Breadcrumb only includes non-empty levels
+                breadcrumb = " > ".join([x for x in [L1, L2, L3, L4] if x])
+
+                # Prepare output row:
+                # Meta cols + L1,L2,L3,L4 + Parent URL, Child URL, SubChild URL, SubSubChild URL + Breadcrumb
+                # We follow the convention:
+                #  - Parent URL = main_url
+                #  - Child/ deeper URL = node_link (the page where that node points)
+                #    (for nodes that are deeper, node_link belongs to that deeper column)
+                parent_url = main_url
+                child_url = ""
+                subchild_url = ""
+                subsub_url = ""
+
+                # Map node_link to the deepest non-empty level in L1..L4
+                if L4:
+                    subsub_url = node_link if node_link and "javascript:void(0)" not in node_link else ""
+                elif L3:
+                    subchild_url = node_link if node_link and "javascript:void(0)" not in node_link else ""
+                elif L2:
+                    child_url = node_link if node_link and "javascript:void(0)" not in node_link else ""
+                else:
+                    # top-level link
+                    child_url = node_link if node_link and "javascript:void(0)" not in node_link else ""
+
                 results_batch.append([
                     *meta_cols,
-                    parent, child, subchild,
-                    main_url, link if link != "javascript:void(0)" else "",
-                    "", breadcrumb
+                    L1, L2, L3, L4,
+                    parent_url, child_url, subchild_url, subsub_url,
+                    breadcrumb
                 ])
 
-                if not link or "javascript:void(0)" in link:
+                # If node_link is visitable, fetch level-2 style links (chapters) from that page
+                visit_link = node_link
+                if not visit_link or "javascript:void(0)" in visit_link:
                     continue
 
-                sub_html = get_html(link, driver)
-                level2_links = extract_level2_links(sub_html, link)
+                sub_html = get_html(visit_link, driver)
+                level2_links = extract_level2_links(sub_html, visit_link)
+
+                # Determine current deepest level index (0-based): 0..3
+                current_levels = [L1, L2, L3, L4]
+                deepest_idx = 0
+                for i in range(4):
+                    if current_levels[i]:
+                        deepest_idx = i
 
                 for sub_text, sub_link in level2_links:
-                    breadcrumb2 = f"{breadcrumb} > {sub_text}"
+                    # Create a new levels copy and put this sub_text into next depth (cap at index 3)
+                    new_levels = current_levels.copy()
+                    next_idx = deepest_idx + 1
+                    if next_idx > 3:
+                        next_idx = 3
+                    new_levels[next_idx] = sub_text
+
+                    # Map URLs for the new row:
+                    # Parent URL remains main_url
+                    # Child URL = visit_link (the page we visited)
+                    # SubChild URL = sub_link (the chapter link)
+                    new_parent_url = main_url
+                    new_child_url = visit_link if deepest_idx >= 0 else ""
+                    new_subchild_url = sub_link if next_idx >= 2 else ""
+                    new_subsub_url = sub_link if next_idx == 3 else ""
+
+                    breadcrumb2 = " > ".join([x for x in new_levels if x])
+
                     results_batch.append([
                         *meta_cols,
-                        parent, child, sub_text,
-                        main_url, link, sub_link,
+                        new_levels[0], new_levels[1], new_levels[2], new_levels[3],
+                        new_parent_url, new_child_url, new_subchild_url, new_subsub_url,
                         breadcrumb2
                     ])
 
@@ -250,8 +307,8 @@ def crawl_all():
                     append_to_files(
                         results_batch,
                         list(df.columns) + [
-                            "Parent", "Child", "SubChild",
-                            "Parent URL", "Child URL", "SubChild URL",
+                            "Parent", "Child", "SubChild", "SubSubChild",
+                            "Parent URL", "Child URL", "SubChild URL", "SubSubChild URL",
                             "Breadcrumb"
                         ]
                     )
@@ -266,8 +323,8 @@ def crawl_all():
         append_to_files(
             results_batch,
             list(df.columns) + [
-                "Parent", "Child", "SubChild",
-                "Parent URL", "Child URL", "SubChild URL",
+                "Parent", "Child", "SubChild", "SubSubChild",
+                "Parent URL", "Child URL", "SubChild URL", "SubSubChild URL",
                 "Breadcrumb"
             ]
         )
