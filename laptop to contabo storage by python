@@ -8,12 +8,12 @@ from botocore.exceptions import ClientError
 # =====================================================
 # CONFIGURATION
 # =====================================================
-ACCESS_KEY = "YOUR_ACCESS_KEY_HERE"
-SECRET_KEY = "YOUR_SECRET_KEY_HERE"
+ACCESS_KEY = "2df2ad91e601a61f08528727ed921c11"
+SECRET_KEY = "942ed0a2947b91aa3e583ffee2e21bde"
 ENDPOINT_URL = "https://sin1.contabostorage.com"
 REGION_NAME = "SIN"
 BUCKET_NAME = "tech4learn"
-LOCAL_FOLDER = r"D:\Self Study\Pdf"
+LOCAL_FOLDER = r"D:\Self Study\test"
 REMOTE_PATH = "pdfs"
 OUTPUT_CSV = r"C:\Users\menha\Downloads\uploaded_links_parallel.csv"
 
