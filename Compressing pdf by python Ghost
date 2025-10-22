@@ -1,0 +1,59 @@
+import os
+import subprocess
+from tqdm import tqdm
+import sys
+import tempfile
+import shutil
+
+sys.stdout.reconfigure(encoding='utf-8')
+
+INPUT_DIR = r"D:\Self Study\test"
+OUTPUT_DIR = r"D:\Self Study\test\test"
+GHOSTSCRIPT_PATH = r"C:\Program Files\gs\gs10.06.0\bin\gswin64c.exe"
+PDF_QUALITY = "/ebook"
+
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+pdf_files = [f for f in os.listdir(INPUT_DIR) if f.lower().endswith(".pdf")]
+
+if not pdf_files:
+    print("⚠️ No PDF files found in", INPUT_DIR)
+    sys.exit()
+
+print(f"Found {len(pdf_files)} PDFs. Starting compression...\n")
+
+for file in tqdm(pdf_files, desc="Compressing PDFs", ncols=100):
+    input_path = os.path.join(INPUT_DIR, file)
+    output_path = os.path.join(OUTPUT_DIR, file)
+
+    # Create temp copy with ASCII name
+    temp_dir = tempfile.mkdtemp()
+    temp_input = os.path.join(temp_dir, "input.pdf")
+    shutil.copy(input_path, temp_input)
+    temp_output = os.path.join(temp_dir, "output.pdf")
+
+    cmd = [
+        GHOSTSCRIPT_PATH,
+        "-sDEVICE=pdfwrite",
+        "-dCompatibilityLevel=1.4",
+        f"-dPDFSETTINGS={PDF_QUALITY}",
+        "-dNOPAUSE",
+        "-dQUIET",
+        "-dBATCH",
+        f"-sOutputFile={temp_output}",
+        temp_input
+    ]
+
+    try:
+        subprocess.run(cmd, check=True)
+        shutil.move(temp_output, output_path)
+        orig_size = os.path.getsize(input_path) / 1024 / 1024
+        new_size = os.path.getsize(output_path) / 1024 / 1024
+        reduction = ((orig_size - new_size) / orig_size) * 100 if orig_size else 0
+        print(f"✅ {file} — {orig_size:.2f}MB → {new_size:.2f}MB ({reduction:.1f}% smaller)")
+    except Exception as e:
+        print(f"❌ Error compressing {file}: {e}")
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+print("\n🎉 Compression complete!")
