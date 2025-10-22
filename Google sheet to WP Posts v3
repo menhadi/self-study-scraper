@@ -1,0 +1,321 @@
+/**
+ * FULL AUTOMATION v10.4 (Stable)
+ * ✅ Clickable Title links to single posts
+ * ✅ [real3dflipbook] embeds instead of <embed>
+ * ✅ Custom breadcrumb navigation inside table posts
+ * ✅ Keeps Sync Status + Table Headings logic from v10.3
+ */
+
+const WP_SITE = "https://tech4learn.com";
+const WP_POSTS_ENDPOINT = WP_SITE + "/wp-json/wp/v2/posts";
+const WP_CATS_ENDPOINT  = WP_SITE + "/wp-json/wp/v2/categories";
+const BATCH_SIZE = 80;
+const PUBLISH_MODE = "publish";
+
+// ---------------- AUTH ----------------
+function getCredentials() {
+  return { user: "tech4learn.com", pass: "qqcteWtjJ34JJ0K4T80imE2T" };
+}
+function getAuthHeaders() {
+  var c = getCredentials();
+  return {
+    "Authorization": "Basic " + Utilities.base64Encode(c.user + ":" + c.pass),
+    "Content-Type": "application/json"
+  };
+}
+
+// ---------------- CONTROLS ----------------
+function startSync() {
+  var has = ScriptApp.getProjectTriggers().some(t => t.getHandlerFunction() === "syncGroupedTables");
+  if (!has) {
+    ScriptApp.newTrigger("syncGroupedTables").timeBased().everyMinutes(5).create();
+    Logger.log("▶️ Trigger created for syncGroupedTables");
+  }
+  syncGroupedTables();
+}
+function stopSync() {
+  ScriptApp.getProjectTriggers().forEach(t => {
+    if (t.getHandlerFunction() === "syncGroupedTables") ScriptApp.deleteTrigger(t);
+  });
+  Logger.log("⏸️ Sync stopped");
+}
+function resetProgress() {
+  PropertiesService.getScriptProperties().setProperty("lastRow", "1");
+  Logger.log("🔄 Progress reset");
+}
+function recreateAll() { resetProgress(); stopSync(); startSync(); }
+
+// ---------------- CORE ----------------
+function syncGroupedTables() {
+  try {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (!ss) return Logger.log("❌ No active spreadsheet");
+    let sheet = null;
+    for (let s of ss.getSheets()) {
+      const vals = s.getDataRange().getValues();
+      if (!vals.length) continue;
+      const hdrs = vals[0].map(x => (x || "").toString().trim().toLowerCase());
+      if (hdrs.includes("main category") && hdrs.includes("pdf url")) { sheet = s; break; }
+    }
+    if (!sheet) sheet = ss.getActiveSheet();
+    const data = sheet.getDataRange().getValues();
+    if (data.length < 2) return Logger.log("❌ No data rows");
+
+    const headersLower = data[0].map(h => (h || "").toString().trim().toLowerCase());
+    function findCol(names) {
+      for (let n of names) {
+        const idx = headersLower.findIndex(h => h.indexOf(n.toLowerCase()) !== -1);
+        if (idx !== -1) return idx;
+      }
+      return -1;
+    }
+
+    let levelIdx = [];
+    const mainIdx = headersLower.findIndex(h => h === "main category" || h === "menu");
+    if (mainIdx !== -1) levelIdx.push(mainIdx);
+    headersLower.forEach((h, i) => {
+      if (i !== mainIdx && (h.startsWith("sub") || h.includes("subcategory"))) levelIdx.push(i);
+    });
+
+    const idx = {
+      levels: levelIdx.slice(0, 6),
+      post: findCol(["post title", "post name"]),
+      pdfTitle: findCol(["pdf title", "pdf file name"]),
+      pdfURL: findCol(["pdf url", "pdf link"]),
+      singleFlag: findCol(["create single post", "single post", "create post"]),
+      metaTitle: findCol(["meta title"]),
+      metaDesc: findCol(["meta description"]),
+      focusKey: findCol(["focus keyword"]),
+      canonical: findCol(["canonical url"]),
+      tableHead: findCol(["table headings", "headers", "columns"]),
+      syncStatus: findCol(["sync status", "status"])
+    };
+
+    const props = PropertiesService.getScriptProperties();
+    let lastRow = parseInt(props.getProperty("lastRow") || "1", 10);
+    if (isNaN(lastRow) || lastRow < 1) lastRow = 1;
+
+    const nodesMap = {};
+    function nodeKey(p) { return p.join(" || "); }
+    function ensureNode(path) {
+      const k = nodeKey(path);
+      if (!nodesMap[k]) nodesMap[k] = { path: [...path], childNodes: new Set(), childLeaves: [] };
+      return nodesMap[k];
+    }
+
+    const maxRow = Math.min(data.length - 1, lastRow + BATCH_SIZE);
+    for (let r = lastRow + 1; r <= maxRow; r++) {
+      const row = data[r];
+      const status = safe(row, idx.syncStatus).toLowerCase();
+      if (["✅ synced", "synced", "done"].includes(status)) continue;
+
+      const path = [];
+      for (let li of idx.levels) {
+        const v = safe(row, li);
+        if (v) path.push(v);
+      }
+
+      const postName = safe(row, idx.post);
+      const pdfURL = safe(row, idx.pdfURL);
+      if (!pdfURL) continue;
+
+      const pdfTitle = safe(row, idx.pdfTitle) || postName || (path.length ? path[path.length - 1] : "PDF");
+      const meta = {
+        title: safe(row, idx.metaTitle),
+        desc: safe(row, idx.metaDesc),
+        key: safe(row, idx.focusKey),
+        canonical: safe(row, idx.canonical)
+      };
+      const singleFlag = ["yes", "y", "true", "1"].includes(safe(row, idx.singleFlag).toLowerCase());
+      const tableHeadRaw = safe(row, idx.tableHead);
+      const tableHeaders = tableHeadRaw ? tableHeadRaw.split(",").map(h => h.trim()) : [];
+
+      for (let i = 1; i <= path.length; i++) {
+        const pref = path.slice(0, i);
+        ensureNode(pref);
+        if (i > 1) ensureNode(path.slice(0, i - 1)).childNodes.add(nodeKey(pref));
+      }
+
+      const node = ensureNode(path.length ? path : [pdfTitle]);
+      node.childLeaves.push({ title: pdfTitle, pdfURL, meta, createSingle: singleFlag, tableHeaders, rowIndex: r });
+      props.setProperty("lastRow", String(r));
+    }
+
+    const headersAuth = getAuthHeaders();
+    const createdNodes = {};
+    const leafMap = {};
+    const nodeKeys = Object.keys(nodesMap).sort((a, b) => a.split(" || ").length - b.split(" || ").length);
+
+    // Pass 1: Category table posts
+    for (let nk1 of nodeKeys) {
+      const node1 = nodesMap[nk1];
+      const title = node1.path.join(" | ");
+      const slug = slugify(title);
+      const catIDs = ensureCategoryPath(node1.path, headersAuth);
+      const payload = {
+        title,
+        content: "<h2>" + escapeHtml(title) + "</h2>Generating...",
+        status: PUBLISH_MODE,
+        slug,
+        categories: catIDs
+      };
+      createdNodes[nk1] = createOrUpdatePost(slug, payload, headersAuth);
+    }
+
+    // Pass 2: Single posts (with flipbook)
+    for (let nk2 of nodeKeys) {
+      const node2 = nodesMap[nk2];
+      if (!node2.childLeaves?.length) continue;
+      for (let j = 0; j < node2.childLeaves.length; j++) {
+        const leaf = node2.childLeaves[j];
+        if (!leaf.createSingle) continue;
+
+        const postTitle = node2.path.length ? node2.path.join(" | ") + " | " + leaf.title : leaf.title;
+        const slug2 = slugify(postTitle);
+        const catIDs2 = ensureCategoryPath(node2.path, headersAuth);
+        const html2 =
+          `<h2>${escapeHtml(postTitle)}</h2>` +
+          `[real3dflipbook pdf="${leaf.pdfURL}"]<br>` +
+          `<div style="margin:10px 0"><a href="${leaf.pdfURL}" target="_blank">Read</a> | ` +
+          `<a href="${leaf.pdfURL}" download>Download</a></div>`;
+
+        const singlePost = createOrUpdatePost(slug2, {
+          title: postTitle,
+          content: html2,
+          status: PUBLISH_MODE,
+          categories: catIDs2
+        }, headersAuth);
+        leafMap[nk2 + "||" + j] = singlePost;
+        if (idx.syncStatus !== -1) sheet.getRange(leaf.rowIndex + 1, idx.syncStatus + 1).setValue("✅ Synced");
+      }
+    }
+
+    // Pass 3: Category/subcategory tables with breadcrumbs + links
+    for (let nk3 of nodeKeys) {
+      const node3 = nodesMap[nk3];
+      const nodePost = createdNodes[nk3];
+      if (!nodePost) continue;
+
+      let html = buildBreadcrumbHtml(node3.path, createdNodes) +
+                 "<h2>" + escapeHtml(node3.path.join(" | ")) + "</h2>";
+
+      // Child categories table
+      if (node3.childNodes.size > 0) {
+        const css = tableCSS();
+        html += css + '<h3>Subcategories</h3><table class="auto-table"><thead><tr>' +
+          '<th>#</th>' + Array(node3.path.length + 1).fill(0).map((_,i)=>`<th>Level ${i+1}</th>`).join('') +
+          '<th>Open</th></tr></thead><tbody>';
+        let c = 1;
+        node3.childNodes.forEach(ck => {
+          const child = nodesMap[ck], cp = createdNodes[ck];
+          html += `<tr><td>${c++}</td>${child.path.map(p=>`<td>${escapeHtml(p)}</td>`).join("")}` +
+            `<td><a href="${cp ? cp.link : '#'}" target="_blank">Open</a></td></tr>`;
+        });
+        html += '</tbody></table>';
+      }
+
+      // Leaf items (PDFs)
+      if (node3.childLeaves.length > 0) {
+        const leaf = node3.childLeaves[0];
+        const headers = leaf.tableHeaders.length ? leaf.tableHeaders : node3.path.map((_,i)=>"Level "+(i+1));
+        html += "<h3>Items</h3>" + buildLeafTableHtml(node3.childLeaves, node3.path, headers, leafMap, nk3);
+      }
+
+      updatePostContent(nodePost.id, html, headersAuth);
+    }
+
+  } catch (e) { Logger.log("❌ syncGroupedTables error: " + e); }
+}
+
+// ---------------- UTILITIES ----------------
+function buildBreadcrumbHtml(path, createdNodes) {
+  if (!path.length) return "";
+  let crumb = `<nav class="breadcrumb" style="margin-bottom:10px;font-size:14px;">` +
+              `<a href="${WP_SITE}">Home</a>`;
+  for (let i = 0; i < path.length; i++) {
+    const subPath = path.slice(0, i + 1);
+    const key = subPath.join(" || ");
+    const node = createdNodes[key];
+    if (node) {
+      if (i < path.length - 1) crumb += ` › <a href="${node.link}">${escapeHtml(path[i])}</a>`;
+      else crumb += ` › <span>${escapeHtml(path[i])}</span>`;
+    } else crumb += ` › <span>${escapeHtml(path[i])}</span>`;
+  }
+  return crumb + `</nav>`;
+}
+
+function tableCSS() {
+  return '<style>table.auto-table{width:100%;border-collapse:collapse;margin:10px 0;font-family:Arial;}' +
+         '.auto-table th,.auto-table td{padding:8px;border:1px solid #ccc;}.auto-table th{background:#f0f0f0;}</style>';
+}
+
+function ensureCategoryPath(path, headers) {
+  let ids = [], parent = 0;
+  for (let name of path) {
+    name = name.trim(); if (!name) continue;
+    try {
+      const s = UrlFetchApp.fetch(WP_CATS_ENDPOINT + "?search=" + encodeURIComponent(name), { headers });
+      const found = JSON.parse(s.getContentText());
+      const match = found.find(f => f.name.toLowerCase() === name.toLowerCase() && f.parent === parent);
+      if (match) { parent = match.id; ids.push(parent); continue; }
+      const res = UrlFetchApp.fetch(WP_CATS_ENDPOINT, {
+        method: "POST", headers, payload: JSON.stringify({ name, parent }), muteHttpExceptions: true
+      });
+      if (res.getResponseCode() === 400 && res.getContentText().includes("term_exists")) {
+        const tid = JSON.parse(res.getContentText()).data.term_id;
+        if (tid) { parent = tid; ids.push(parent); continue; }
+      }
+      const c = JSON.parse(res.getContentText());
+      if (c.id) { parent = c.id; ids.push(parent); }
+    } catch (e) { Logger.log("⚠️ ensureCategoryPath skip: " + e); }
+  }
+  return ids;
+}
+
+function createOrUpdatePost(slug, payload, headers) {
+  try {
+    const ex = UrlFetchApp.fetch(WP_POSTS_ENDPOINT + "?slug=" + encodeURIComponent(slug), { headers, muteHttpExceptions: true });
+    const list = JSON.parse(ex.getContentText() || "[]");
+    if (list.length) {
+      const id = list[0].id;
+      const res = UrlFetchApp.fetch(WP_POSTS_ENDPOINT + "/" + id, { method: "PUT", headers, payload: JSON.stringify(payload) });
+      const o = JSON.parse(res.getContentText());
+      return { id: o.id, link: o.link };
+    } else {
+      const res2 = UrlFetchApp.fetch(WP_POSTS_ENDPOINT, { method: "POST", headers, payload: JSON.stringify(payload) });
+      const o2 = JSON.parse(res2.getContentText());
+      return { id: o2.id, link: o2.link };
+    }
+  } catch (e) { Logger.log("❌ createOrUpdatePost: " + e); return null; }
+}
+
+function updatePostContent(id, html, headers) {
+  try {
+    UrlFetchApp.fetch(WP_POSTS_ENDPOINT + "/" + id, { method: "PUT", headers, payload: JSON.stringify({ content: html }) });
+  } catch (e) { Logger.log("❌ updatePostContent: " + e); }
+}
+
+function buildLeafTableHtml(items, path, headers, leafMap, nkKey) {
+  const css = tableCSS();
+  let head = '<tr><th>#</th>';
+  for (let h of headers) head += `<th>${escapeHtml(h)}</th>`;
+  head += '<th>Title</th><th>View</th><th>Read</th><th>Download</th></tr>';
+  let rows = "";
+  for (let j = 0; j < items.length; j++) {
+    const it = items[j];
+    const singlePost = leafMap[nkKey + "||" + j];
+    const link = singlePost ? singlePost.link : "#";
+    rows += `<tr><td>${j + 1}</td>`;
+    for (let p of path) rows += `<td>${escapeHtml(p)}</td>`;
+    rows += `<td><a href="${link}" target="_blank">${escapeHtml(it.title)}</a></td>` +
+            `<td>[real3dflipbook pdf="${it.pdfURL}"]</td>` +
+            `<td><a href="${it.pdfURL}" target="_blank">Read</a></td>` +
+            `<td><a href="${it.pdfURL}" download>Download</a></td></tr>`;
+  }
+  return css + `<table class="auto-table"><thead>${head}</thead><tbody>${rows}</tbody></table>`;
+}
+
+// ---------------- HELPERS ----------------
+function safe(r, i) { if (i === -1 || !r) return ""; const v = r[i]; return v ? v.toString().trim() : ""; }
+function slugify(t) { return t.toLowerCase().replace(/\s+/g,"-").replace(/[^\w\-]+/g,"").replace(/\-\-+/g,"-").replace(/^-+|-+$/g,""); }
+function escapeHtml(t) { return t.replace(/[&<>"']/g, m => ({ "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;" }[m])); }
