@@ -1,0 +1,327 @@
+/**
+ * FULL AUTOMATION v10.3 (Stable)
+ * - Added: "Table Headings" column → custom dynamic headers per table
+ * - Added: "Sync Status" column → only process pending/updated rows
+ * - Preserves: All logic, style, and layout from v10.2
+ */
+
+const WP_SITE = "https://tech4learn.com";
+const WP_POSTS_ENDPOINT = WP_SITE + "/wp-json/wp/v2/posts";
+const WP_CATS_ENDPOINT  = WP_SITE + "/wp-json/wp/v2/categories";
+const BATCH_SIZE = 80;
+const PUBLISH_MODE = "publish";
+
+// ---------------- AUTH ----------------
+function getCredentials() {
+  return { user: "tech4learn.com", pass: "qqcteWtjJ34JJ0K4T80imE2T" };
+}
+function getAuthHeaders() {
+  var c = getCredentials();
+  return {
+    "Authorization": "Basic " + Utilities.base64Encode(c.user + ":" + c.pass),
+    "Content-Type": "application/json"
+  };
+}
+
+// ---------------- CONTROLS ----------------
+function startSync() {
+  var has = ScriptApp.getProjectTriggers().some(function (t) {
+    return t.getHandlerFunction() === "syncGroupedTables";
+  });
+  if (!has) {
+    ScriptApp.newTrigger("syncGroupedTables").timeBased().everyMinutes(5).create();
+    Logger.log("▶️ Trigger created for syncGroupedTables");
+  }
+  syncGroupedTables();
+}
+function stopSync() {
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === "syncGroupedTables") ScriptApp.deleteTrigger(t);
+  });
+  Logger.log("⏸️ Sync stopped");
+}
+function resetProgress() {
+  PropertiesService.getScriptProperties().setProperty("lastRow", "1");
+  Logger.log("🔄 Progress reset");
+}
+function recreateAll() {
+  resetProgress();
+  stopSync();
+  startSync();
+}
+
+// ---------------- CORE ----------------
+function syncGroupedTables() {
+  try {
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    if (!ss) return Logger.log("❌ No active spreadsheet");
+
+    var sheet = null;
+    var sheets = ss.getSheets();
+    for (var si = 0; si < sheets.length; si++) {
+      var vals = sheets[si].getDataRange().getValues();
+      if (!vals || vals.length === 0) continue;
+      var hdrs = vals[0].map(function (x) { return (x || "").toString().trim().toLowerCase(); });
+      if (hdrs.indexOf("main category") !== -1 && hdrs.indexOf("pdf url") !== -1) {
+        sheet = sheets[si];
+        break;
+      }
+    }
+    if (!sheet) sheet = ss.getActiveSheet();
+
+    var data = sheet.getDataRange().getValues();
+    if (data.length < 2) return Logger.log("❌ No data rows");
+
+    var headersLower = data[0].map(function (h) { return (h || "").toString().trim().toLowerCase(); });
+    function findCol(names) {
+      for (var n = 0; n < names.length; n++) {
+        var idx = headersLower.findIndex(function (h) {
+          return h.indexOf(names[n].toLowerCase()) !== -1;
+        });
+        if (idx !== -1) return idx;
+      }
+      return -1;
+    }
+
+    var levelIdx = [];
+    var mainIdx = headersLower.findIndex(function (h) { return h === "main category" || h === "menu"; });
+    if (mainIdx !== -1) levelIdx.push(mainIdx);
+    headersLower.forEach(function (h, i) {
+      if (i !== mainIdx && (h.indexOf("sub") === 0 || h.indexOf("subcategory") !== -1)) levelIdx.push(i);
+    });
+
+    var idx = {
+      levels: levelIdx.slice(0, 6),
+      post: findCol(["post title", "post name"]),
+      pdfTitle: findCol(["pdf title", "pdf file name"]),
+      pdfURL: findCol(["pdf url", "pdf link"]),
+      singleFlag: findCol(["create single post", "single post", "create post"]),
+      metaTitle: findCol(["meta title"]),
+      metaDesc: findCol(["meta description"]),
+      focusKey: findCol(["focus keyword"]),
+      canonical: findCol(["canonical url"]),
+      tableHead: findCol(["table headings", "headers", "columns"]),
+      syncStatus: findCol(["sync status", "status"])
+    };
+
+    var props = PropertiesService.getScriptProperties();
+    var lastRow = parseInt(props.getProperty("lastRow") || "1", 10);
+    if (isNaN(lastRow) || lastRow < 1) lastRow = 1;
+
+    var nodesMap = {};
+    function nodeKey(p) { return p.join(" || "); }
+    function ensureNode(path) {
+      var k = nodeKey(path);
+      if (!nodesMap[k]) nodesMap[k] = { path: path.slice(), childNodes: new Set(), childLeaves: [] };
+      return nodesMap[k];
+    }
+
+    var maxRow = Math.min(data.length - 1, lastRow + BATCH_SIZE);
+    for (var r = lastRow + 1; r <= maxRow; r++) {
+      var row = data[r];
+
+      // Skip rows already synced
+      var status = safe(row, idx.syncStatus).toLowerCase();
+      if (status === "✅ synced" || status === "synced" || status === "done") continue;
+
+      var path = [];
+      for (var li = 0; li < idx.levels.length; li++) {
+        var v = safe(row, idx.levels[li]);
+        if (v) path.push(v);
+      }
+
+      var postName = safe(row, idx.post);
+      var pdfURL = safe(row, idx.pdfURL);
+      if (!pdfURL) continue;
+
+      var pdfTitle = safe(row, idx.pdfTitle) || postName || (path.length ? path[path.length - 1] : "PDF");
+      var meta = {
+        title: safe(row, idx.metaTitle),
+        desc: safe(row, idx.metaDesc),
+        key: safe(row, idx.focusKey),
+        canonical: safe(row, idx.canonical)
+      };
+      var singleFlag = ["yes", "y", "true", "1"].indexOf(safe(row, idx.singleFlag).toLowerCase()) !== -1;
+
+      var tableHeadRaw = safe(row, idx.tableHead);
+      var tableHeaders = tableHeadRaw ? tableHeadRaw.split(",").map(h => h.trim()) : [];
+
+      for (var i = 1; i <= path.length; i++) {
+        var pref = path.slice(0, i);
+        ensureNode(pref);
+        if (i > 1) ensureNode(path.slice(0, i - 1)).childNodes.add(nodeKey(pref));
+      }
+
+      var node = ensureNode(path.length ? path : [pdfTitle]);
+      node.childLeaves.push({ title: pdfTitle, pdfURL: pdfURL, meta: meta, createSingle: singleFlag, tableHeaders: tableHeaders, rowIndex: r });
+
+      props.setProperty("lastRow", String(r));
+    }
+
+    var headersAuth = getAuthHeaders();
+    var createdNodes = {};
+    var leafMap = {};
+    var nodeKeys = Object.keys(nodesMap).sort(function (a, b) {
+      return a.split(" || ").length - b.split(" || ").length;
+    });
+
+    // Pass 1: Category posts
+    for (var nk1 = 0; nk1 < nodeKeys.length; nk1++) {
+      var node1 = nodesMap[nodeKeys[nk1]];
+      var title = node1.path.join(" | ");
+      var slug = slugify(title);
+      var catIDs = ensureCategoryPath(node1.path, headersAuth);
+      var payload = {
+        title: title,
+        content: "<h2>" + escapeHtml(title) + "</h2>Generating...",
+        status: PUBLISH_MODE,
+        slug: slug,
+        categories: catIDs
+      };
+      createdNodes[nodeKeys[nk1]] = createOrUpdatePost(slug, payload, headersAuth);
+    }
+
+    // Pass 2: Single posts
+    for (var nk2 = 0; nk2 < nodeKeys.length; nk2++) {
+      var node2 = nodesMap[nodeKeys[nk2]];
+      if (!node2.childLeaves || node2.childLeaves.length === 0) continue;
+      for (var j = 0; j < node2.childLeaves.length; j++) {
+        var leaf = node2.childLeaves[j];
+        if (!leaf.createSingle) continue;
+        var postTitle = node2.path.length ? (node2.path.join(" | ") + " | " + leaf.title) : leaf.title;
+        var slug2 = slugify(postTitle);
+        var html2 = '<h2>' + escapeHtml(postTitle) + '</h2>' +
+          '<div style="margin:10px 0"><embed src="' + leaf.pdfURL + '" type="application/pdf" width="100%" height="800"></div>' +
+          '<div><a href="' + leaf.pdfURL + '" target="_blank">Read</a> | <a href="' + leaf.pdfURL + '" download>Download</a></div>';
+        var catIDs2 = ensureCategoryPath(node2.path, headersAuth);
+        leafMap[nodeKeys[nk2] + "||" + j] = createOrUpdatePost(slug2, {
+          title: postTitle,
+          content: html2,
+          status: PUBLISH_MODE,
+          categories: catIDs2
+        }, headersAuth);
+
+        // ✅ Mark as synced
+        if (idx.syncStatus !== -1) sheet.getRange(leaf.rowIndex + 1, idx.syncStatus + 1).setValue("✅ Synced");
+      }
+    }
+
+    // Pass 3: Category/subcategory tables (Fixed)
+    for (var nk3 = 0; nk3 < nodeKeys.length; nk3++) {
+      var node3 = nodesMap[nodeKeys[nk3]];
+      var nodePost = createdNodes[nodeKeys[nk3]];
+      if (!nodePost) continue;
+
+      var html = "<h2>" + escapeHtml(node3.path.join(" | ")) + "</h2>";
+
+      // Child categories
+      if (node3.childNodes.size > 0) {
+        var css = '<style>table.auto-table{width:100%;border-collapse:collapse;margin:10px 0;font-family:Arial;}' +
+          '.auto-table th,.auto-table td{padding:8px;border:1px solid #ccc;}.auto-table th{background:#f0f0f0;}</style>';
+        html += css + '<h3>Subcategories</h3><table class="auto-table"><thead><tr>';
+        html += '<th>#</th>';
+        var levels = node3.path.length + 1;
+        for (var l = 0; l < levels; l++) html += '<th>Level ' + (l + 1) + '</th>';
+        html += '<th>Open</th></tr></thead><tbody>';
+        var counter = 1;
+        node3.childNodes.forEach(function (ck) {
+          var child = nodesMap[ck];
+          var cp = createdNodes[ck];
+          var childPath = child.path;
+          var childLink = cp ? cp.link : "#";
+          html += '<tr><td>' + (counter++) + '</td>';
+          for (var l2 = 0; l2 < childPath.length; l2++) {
+            html += '<td>' + escapeHtml(childPath[l2]) + '</td>';
+          }
+          html += '<td><a href="' + childLink + '" target="_blank">Open</a></td></tr>';
+        });
+        html += '</tbody></table>';
+      }
+
+      // Items table (custom headers)
+      if (node3.childLeaves.length > 0) {
+        var leaf = node3.childLeaves[0];
+        var headers = leaf.tableHeaders && leaf.tableHeaders.length > 0 ? leaf.tableHeaders : node3.path.map((_, i) => "Level " + (i + 1));
+        html += "<h3>Items</h3>" + buildLeafTableHtml(node3.childLeaves, node3.path, headers);
+      }
+
+      updatePostContent(nodePost.id, html, headersAuth);
+    }
+
+  } catch (e) {
+    Logger.log("❌ syncGroupedTables error: " + e);
+  }
+}
+
+// ---------------- UTILITIES ----------------
+function ensureCategoryPath(path, headers) {
+  var ids = [];
+  var parent = 0;
+  for (var i = 0; i < path.length; i++) {
+    var name = path[i].trim();
+    if (!name) continue;
+    try {
+      var s = UrlFetchApp.fetch(WP_CATS_ENDPOINT + "?search=" + encodeURIComponent(name), { headers: headers });
+      var found = JSON.parse(s.getContentText());
+      var match = found.find(function (f) { return f.name.toLowerCase() === name.toLowerCase() && f.parent === parent; });
+      if (match) { parent = match.id; ids.push(parent); continue; }
+      var res = UrlFetchApp.fetch(WP_CATS_ENDPOINT, {
+        method: "POST", headers: headers, payload: JSON.stringify({ name: name, parent: parent }), muteHttpExceptions: true
+      });
+      if (res.getResponseCode() === 400 && res.getContentText().indexOf("term_exists") !== -1) {
+        var tid = JSON.parse(res.getContentText()).data.term_id;
+        if (tid) { parent = tid; ids.push(parent); continue; }
+      }
+      var c = JSON.parse(res.getContentText());
+      if (c.id) { parent = c.id; ids.push(parent); }
+    } catch (e) { Logger.log("⚠️ ensureCategoryPath skip: " + e); }
+  }
+  return ids;
+}
+
+function createOrUpdatePost(slug, payload, headers) {
+  try {
+    var ex = UrlFetchApp.fetch(WP_POSTS_ENDPOINT + "?slug=" + encodeURIComponent(slug), { headers: headers, muteHttpExceptions: true });
+    var list = JSON.parse(ex.getContentText() || "[]");
+    if (list.length > 0) {
+      var id = list[0].id;
+      var res = UrlFetchApp.fetch(WP_POSTS_ENDPOINT + "/" + id, { method: "PUT", headers: headers, payload: JSON.stringify(payload) });
+      var o = JSON.parse(res.getContentText());
+      return { id: o.id, link: o.link };
+    } else {
+      var res2 = UrlFetchApp.fetch(WP_POSTS_ENDPOINT, { method: "POST", headers: headers, payload: JSON.stringify(payload) });
+      var o2 = JSON.parse(res2.getContentText());
+      return { id: o2.id, link: o2.link };
+    }
+  } catch (e) { Logger.log("❌ createOrUpdatePost: " + e); return null; }
+}
+
+function updatePostContent(id, html, headers) {
+  try {
+    UrlFetchApp.fetch(WP_POSTS_ENDPOINT + "/" + id, { method: "PUT", headers: headers, payload: JSON.stringify({ content: html }) });
+  } catch (e) { Logger.log("❌ updatePostContent: " + e); }
+}
+
+function buildLeafTableHtml(items, path, headers) {
+  var css = '<style>table.auto-table{width:100%;border-collapse:collapse;margin:10px 0;font-family:Arial;}' +
+    '.auto-table th,.auto-table td{padding:8px;border:1px solid #ccc;}.auto-table th{background:#f0f0f0;}</style>';
+  var head = '<tr><th>#</th>';
+  for (var i = 0; i < headers.length; i++) head += '<th>' + escapeHtml(headers[i]) + '</th>';
+  head += '<th>Title</th><th>View</th><th>Read</th><th>Download</th></tr>';
+  var rows = "";
+  for (var j = 0; j < items.length; j++) {
+    var it = items[j];
+    rows += '<tr><td>' + (j + 1) + '</td>';
+    for (var k = 0; k < path.length; k++) rows += '<td>' + escapeHtml(path[k]) + '</td>';
+    rows += '<td>' + escapeHtml(it.title) + '</td>';
+    rows += '<td>[real3dflipbook pdf="' + it.pdfURL + '"]</td>';
+    rows += '<td><a href="' + it.pdfURL + '" target="_blank">Read</a></td>';
+    rows += '<td><a href="' + it.pdfURL + '" download>Download</a></td></tr>';
+  }
+  return css + '<table class="auto-table"><thead>' + head + '</thead><tbody>' + rows + '</tbody></table>';
+}
+
+// ---------------- HELPERS ----------------
+function safe(r, i) { if (i === -1 || !r) return ""; var v = r[i]; return v ? v.toString().trim() : ""; }
+function slugify(t) { return t.toLowerCase().replace(/\s+/g, "-").replace(/[^\w\-]+/g, "").replace(/\-\-+/g, "-").replace(/^-+|-+$/g, ""); }
+function escapeHtml(t) { return t.replace(/[&<>"']/g, function (m) { return { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[m]; }); }
