@@ -1,0 +1,105 @@
+import os
+import boto3
+from tqdm import tqdm
+from botocore.client import Config
+from datetime import datetime
+
+# === CONFIGURATION ===
+R2_ACCOUNT_ID   = "9c3a111cd1c8101060111b18f9dda444"
+R2_ACCESS_KEY   = "cd09fc348dc0e5ac72d04d7b301ae141"
+R2_SECRET_KEY   = "15c67f92b18a5b0dc5a4ce9f6b675e76367544a316aa21118ce0d737ab080d7a"
+R2_BUCKET_NAME  = "tech4learn"
+R2_CDN_BASE     = "https://cdn.tech4learn.com"
+
+# === LOCAL PATHS ===
+LOCAL_BASE_DIR = r"D:\Self Study\test"
+INPUT_FILE_LIST = r"D:\Self Study\files.txt"
+TIMESTAMP = datetime.now().strftime('%Y%m%d_%H%M%S')
+
+LOG_FILE = os.path.join(LOCAL_BASE_DIR, f"upload_log_{TIMESTAMP}.csv")
+OUTPUT_URLS_FILE = os.path.join(LOCAL_BASE_DIR, f"uploaded_urls_{TIMESTAMP}.txt")
+MAPPING_FILE = os.path.join(LOCAL_BASE_DIR, f"uploaded_mapping_{TIMESTAMP}.txt")
+
+# === CONNECT TO R2 ===
+endpoint_url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=endpoint_url,
+    aws_access_key_id=R2_ACCESS_KEY,
+    aws_secret_access_key=R2_SECRET_KEY,
+    config=Config(signature_version="s3v4"),
+    region_name="auto"
+)
+
+# === READ INPUT FILE LIST (keep order) ===
+with open(INPUT_FILE_LIST, encoding='utf-8') as f:
+    filenames = [line.strip() for line in f if line.strip()]
+
+uploaded_urls = []
+mapping_lines = ["Old_File_Name,Public_URL"]
+log_lines = ["File,Status,Message,URL"]
+
+print(f"🚀 Starting upload of {len(filenames)} files from {LOCAL_BASE_DIR} (including subfolders)...")
+
+# === Build list of all local PDFs ===
+print("🔍 Indexing all local PDF files...")
+all_pdfs = []
+for root, _, files in os.walk(LOCAL_BASE_DIR):
+    for f in files:
+        if f.lower().endswith(".pdf"):
+            all_pdfs.append(os.path.join(root, f))
+print(f"📁 Found {len(all_pdfs)} PDF files locally.")
+
+# === MAIN UPLOAD LOOP (keeps same order as input) ===
+for file_name in tqdm(filenames, desc="Uploading PDFs"):
+    target_name = file_name.strip()
+    if not target_name.lower().endswith(".pdf"):
+        target_name += ".pdf"
+
+    file_found = None
+
+    # Strict filename match (case-insensitive, exact match)
+    for pdf_path in all_pdfs:
+        if os.path.basename(pdf_path).lower() == target_name.lower():
+            file_found = pdf_path
+            break
+
+    if not file_found:
+        uploaded_urls.append(f"{file_name} - NOT FOUND")
+        log_lines.append(f"{file_name},NOT_FOUND,Exact file not found,")
+        mapping_lines.append(f"{file_name},NOT FOUND")
+        continue
+
+    rel_path = os.path.relpath(file_found, LOCAL_BASE_DIR).replace("\\", "/")
+
+    try:
+        s3.upload_file(file_found, R2_BUCKET_NAME, rel_path)
+        public_url = f"{R2_CDN_BASE}/{rel_path}"
+        uploaded_urls.append(public_url)
+        log_lines.append(f"{file_name},OK,Uploaded,{public_url}")
+        mapping_lines.append(f"{file_name},{public_url}")
+        print(f"✅ Uploaded: {file_name} → {rel_path}")
+    except Exception as e:
+        msg = f"ERROR: {str(e)}"
+        uploaded_urls.append(f"{file_name} - {msg}")
+        log_lines.append(f"{file_name},FAIL,{msg},")
+        mapping_lines.append(f"{file_name},ERROR")
+
+# === SAVE ALL OUTPUT FILES ===
+with open(OUTPUT_URLS_FILE, "w", encoding="utf-8") as out:
+    for url in uploaded_urls:
+        out.write(url + "\n")
+
+with open(LOG_FILE, "w", encoding="utf-8") as log:
+    for line in log_lines:
+        log.write(line + "\n")
+
+with open(MAPPING_FILE, "w", encoding="utf-8") as mapf:
+    for line in mapping_lines:
+        mapf.write(line + "\n")
+
+print("\n✅ Upload complete!")
+print(f"🌐 URLs only: {OUTPUT_URLS_FILE}")
+print(f"📋 Full log: {LOG_FILE}")
+print(f"🔗 Mapping file (ordered): {MAPPING_FILE}")
