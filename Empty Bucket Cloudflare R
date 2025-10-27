@@ -1,0 +1,40 @@
+import boto3
+from botocore.client import Config
+
+# === CONFIGURATION ===
+R2_ACCOUNT_ID   = "9c3a111cd1c8101060111b18f9dda444"
+R2_ACCESS_KEY   = "cd09fc348dc0e5ac72d04d7b301ae141"
+R2_SECRET_KEY   = "15c67f92b18a5b0dc5a4ce9f6b675e76367544a316aa21118ce0d737ab080d7a"
+R2_BUCKET_NAME  = "tech4learn"
+
+# === CONNECT TO R2 ===
+endpoint_url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+s3 = boto3.client(
+    "s3",
+    endpoint_url=endpoint_url,
+    aws_access_key_id=R2_ACCESS_KEY,
+    aws_secret_access_key=R2_SECRET_KEY,
+    config=Config(signature_version="s3v4"),
+    region_name="auto"
+)
+
+# === SAFETY PROMPT ===
+confirm = input(f"⚠️ WARNING: This will permanently delete ALL files in bucket '{R2_BUCKET_NAME}'.\nType 'DELETE' to confirm: ")
+if confirm.strip().upper() != "DELETE":
+    print("❌ Deletion cancelled.")
+    exit()
+
+# === DELETE EVERYTHING ===
+paginator = s3.get_paginator("list_objects_v2")
+total_deleted = 0
+
+print(f"🧹 Deleting all objects from bucket: {R2_BUCKET_NAME}")
+
+for page in paginator.paginate(Bucket=R2_BUCKET_NAME):
+    if "Contents" in page:
+        objects = [{"Key": obj["Key"]} for obj in page["Contents"]]
+        s3.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": objects})
+        total_deleted += len(objects)
+        print(f"🗑️ Deleted {len(objects)} objects... (Total: {total_deleted})")
+
+print(f"\n✅ Completed! Total {total_deleted} objects deleted from '{R2_BUCKET_NAME}'.")
