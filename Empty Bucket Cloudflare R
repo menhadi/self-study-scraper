@@ -19,16 +19,33 @@ s3 = boto3.client(
 )
 
 # === SAFETY PROMPT ===
-confirm = input(f"⚠️ WARNING: This will permanently delete ALL files in bucket '{R2_BUCKET_NAME}'.\nType 'DELETE' to confirm: ")
+confirm = input(f"⚠️ WARNING: This will permanently delete ALL files and incomplete uploads from bucket '{R2_BUCKET_NAME}'.\nType 'DELETE' to confirm: ")
 if confirm.strip().upper() != "DELETE":
-    print("❌ Deletion cancelled.")
+    print("❌ Operation cancelled.")
     exit()
 
-# === DELETE EVERYTHING ===
+# === 1️⃣ DELETE INCOMPLETE MULTIPART UPLOADS ===
+print("\n🔍 Checking for incomplete multipart uploads...")
+try:
+    uploads = s3.list_multipart_uploads(Bucket=R2_BUCKET_NAME)
+    if "Uploads" in uploads:
+        total = len(uploads["Uploads"])
+        print(f"⚠️ Found {total} incomplete multipart uploads.")
+        for upload in uploads["Uploads"]:
+            key = upload["Key"]
+            upload_id = upload["UploadId"]
+            print(f"🧹 Aborting: {key}")
+            s3.abort_multipart_upload(Bucket=R2_BUCKET_NAME, Key=key, UploadId=upload_id)
+        print(f"✅ Cleaned up {total} incomplete uploads.")
+    else:
+        print("✅ No incomplete multipart uploads found.")
+except Exception as e:
+    print(f"⚠️ Error cleaning multipart uploads: {e}")
+
+# === 2️⃣ DELETE ALL NORMAL OBJECTS ===
+print("\n🧹 Deleting all objects from bucket...")
 paginator = s3.get_paginator("list_objects_v2")
 total_deleted = 0
-
-print(f"🧹 Deleting all objects from bucket: {R2_BUCKET_NAME}")
 
 for page in paginator.paginate(Bucket=R2_BUCKET_NAME):
     if "Contents" in page:
@@ -37,4 +54,9 @@ for page in paginator.paginate(Bucket=R2_BUCKET_NAME):
         total_deleted += len(objects)
         print(f"🗑️ Deleted {len(objects)} objects... (Total: {total_deleted})")
 
-print(f"\n✅ Completed! Total {total_deleted} objects deleted from '{R2_BUCKET_NAME}'.")
+if total_deleted == 0:
+    print("✅ No regular objects found to delete.")
+else:
+    print(f"\n✅ Completed! Total {total_deleted} objects deleted from '{R2_BUCKET_NAME}'.")
+
+print("\n🎯 Bucket cleanup complete. (Both normal files and incomplete uploads removed.)")
