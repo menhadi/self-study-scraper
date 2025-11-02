@@ -255,7 +255,7 @@ def check_dependencies():
 
 def main():
     # Configuration
-    API_KEY = "sk-a2a0c73a89fc41cfbc71aaf1d142b972"  # Replace with your actual API key
+    API_KEY = "sk-467f5288c9ef40a4ae6ccec5978019ea"  # Replace with your actual API key
     DIRECTORY_PATH = r"C:\Users\menha\Downloads\test11"
     
     # Check if API key is provided
