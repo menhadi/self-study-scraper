@@ -14,68 +14,105 @@ class DeepSeekRewriter:
         }
     
     def rewrite_content(self, content):
-        """Rewrite content using DeepSeek API - process in one go for better quality"""
-        print(f"  Preparing to rewrite {len(content)} characters...")
+        """Rewrite content using DeepSeek API"""
+        prompt = """
+        Please rewrite the following content to improve clarity, grammar, and readability while preserving:
+        1. All technical accuracy and terminology
+        2. The original meaning and context
+        3. Mathematical notation and formulas
+        4. Question structure and options
+        5. Professional tone
         
+        Content to rewrite:
+        """
+        
+        # Split content if too long (DeepSeek has token limits)
+        max_chunk_size = 12000  # Conservative chunk size
+        if len(content) > max_chunk_size:
+            chunks = self.split_content(content, max_chunk_size)
+            rewritten_chunks = []
+            for i, chunk in enumerate(chunks):
+                print(f"  Processing chunk {i+1}/{len(chunks)}...")
+                rewritten_chunk = self.process_chunk(chunk)
+                rewritten_chunks.append(rewritten_chunk)
+                time.sleep(1)  # Rate limiting
+            return "\n\n".join(rewritten_chunks)
+        else:
+            return self.process_chunk(content)
+    
+    def process_chunk(self, chunk):
+        """Process a single chunk of content"""
         payload = {
             "model": "deepseek-chat",
             "messages": [
                 {
-                    "role": "user", 
-                    "content": f"""Please carefully rewrite the following content to improve clarity, grammar, and readability while PRESERVING ALL ORIGINAL CONTENT. 
-
-IMPORTANT: Do not omit any text, questions, options, or technical details. Keep all mathematical notation, question numbers, and options exactly as they appear.
-
-Content to rewrite:
-
-{content}"""
+                    "role": "user",
+                    "content": "Please rewrite the following content to improve clarity while preserving all technical accuracy, mathematical notation, and question structure:\n\n" + chunk
                 }
             ],
-            "temperature": 0.3,
+            "temperature": 0.2,
             "max_tokens": 4000
         }
         
         try:
-            print("  Sending to DeepSeek API...")
-            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=60)
+            response = requests.post(self.base_url, headers=self.headers, json=payload)
             response.raise_for_status()
             result = response.json()
-            rewritten = result['choices'][0]['message']['content']
-            print(f"  ✓ Successfully rewritten {len(rewritten)} characters")
-            return rewritten
+            return result['choices'][0]['message']['content']
         except Exception as e:
-            print(f"  Error calling API: {e}")
-            return content
+            print(f"Error calling API: {e}")
+            return chunk
+    
+    def split_content(self, content, chunk_size):
+        """Split content into manageable chunks"""
+        chunks = []
+        paragraphs = content.split('\n\n')
+        
+        current_chunk = ""
+        for paragraph in paragraphs:
+            if len(current_chunk) + len(paragraph) < chunk_size:
+                current_chunk += paragraph + "\n\n"
+            else:
+                if current_chunk:
+                    chunks.append(current_chunk.strip())
+                current_chunk = paragraph + "\n\n"
+        
+        if current_chunk:
+            chunks.append(current_chunk.strip())
+        
+        return chunks
 
 def extract_text_from_scanned_pdf(pdf_path, start_page=1, end_page=None):
     """Extract text from scanned PDF using OCR - specific page range"""
     try:
-        from pdf2image import convert_from_path
-        import pytesseract
-        
-        print(f"  Converting PDF pages {start_page} to {end_page if end_page else 'end'} to images...")
-        
-        # Convert specific page range
-        if end_page:
-            images = convert_from_path(pdf_path, dpi=300, first_page=start_page, last_page=end_page)
-        else:
-            images = convert_from_path(pdf_path, dpi=300, first_page=start_page)
-        
-        text = ""
-        actual_start_page = start_page
-        print(f"  Performing OCR on {len(images)} pages...")
-        
-        for i, image in enumerate(images):
-            current_page = actual_start_page + i
-            print(f"    Page {current_page}")
-            page_text = pytesseract.image_to_string(image, lang='eng')
-            text += f"--- Page {current_page} ---\n{page_text}\n\n"
-        
-        return text.strip()
+        # Option 1: Using pdf2image + pytesseract
+        try:
+            from pdf2image import convert_from_path
+            import pytesseract
             
-    except ImportError as e:
-        print(f"OCR libraries not available: {e}")
-        return None
+            print(f"  Converting PDF pages {start_page} to {end_page if end_page else 'end'} to images...")
+            
+            # Convert specific page range
+            if end_page:
+                images = convert_from_path(pdf_path, dpi=300, first_page=start_page, last_page=end_page)
+            else:
+                images = convert_from_path(pdf_path, dpi=300, first_page=start_page)
+            
+            text = ""
+            actual_start_page = start_page
+            print(f"  Performing OCR on {len(images)} pages...")
+            for i, image in enumerate(images):
+                current_page = actual_start_page + i
+                print(f"    Page {current_page}")
+                page_text = pytesseract.image_to_string(image, lang='eng')
+                text += f"--- Page {current_page} ---\n{page_text}\n\n"
+            
+            return text.strip()
+            
+        except ImportError as e:
+            print(f"OCR libraries not available: {e}")
+            return None
+            
     except Exception as e:
         print(f"Error in OCR processing: {e}")
         return None
@@ -186,8 +223,8 @@ def get_pdf_page_count(pdf_path):
         except:
             return None
 
-def process_pdf_in_batches(pdf_file, api_key, batch_size=5):
-    """Process PDF in batches of pages to avoid timeouts"""
+def process_pdf_in_batches(pdf_file, api_key, batch_size=20):
+    """Process PDF in batches of pages"""
     rewriter = DeepSeekRewriter(api_key)
     
     # Get total page count
@@ -199,41 +236,35 @@ def process_pdf_in_batches(pdf_file, api_key, batch_size=5):
     print(f"  Total pages: {total_pages}, processing in batches of {batch_size}")
     
     all_rewritten_content = []
-    processed_successfully = True
     
     # Process in batches
     for batch_start in range(1, total_pages + 1, batch_size):
         batch_end = min(batch_start + batch_size - 1, total_pages)
         
-        print(f"\n  Processing batch: Pages {batch_start}-{batch_end}")
+        print(f"  Processing batch: Pages {batch_start}-{batch_end}")
         
         # Extract text for this batch
         content = extract_text_from_pdf(pdf_file, batch_start, batch_end)
         
         if content:
-            print(f"    Extracted {len(content)} characters")
+            print(f"  Extracted {len(content)} characters")
             
+            # Check if content is substantial
             if len(content.strip()) < 50:
-                print("    ✗ Extracted text too short, skipping batch...")
+                print("  ✗ Extracted text too short, skipping batch...")
                 all_rewritten_content.append(f"\n--- Pages {batch_start}-{batch_end} (Skipped - Too Short) ---\n")
                 continue
                 
             # Rewrite the content for this batch
-            print("    Rewriting content with AI...")
+            print("  Rewriting content with AI...")
             rewritten_content = rewriter.rewrite_content(content)
             
             all_rewritten_content.append(f"\n--- Pages {batch_start}-{batch_end} ---\n{rewritten_content}")
             
-            print(f"    ✓ Batch {batch_start}-{batch_end} completed")
-            
-            # Add delay between batches to avoid rate limiting
-            if batch_end < total_pages:
-                print("    Waiting 2 seconds before next batch...")
-                time.sleep(2)
+            print(f"  ✓ Batch {batch_start}-{batch_end} completed")
         else:
-            print(f"    ✗ Failed to extract text for pages {batch_start}-{batch_end}")
+            print(f"  ✗ Failed to extract text for pages {batch_start}-{batch_end}")
             all_rewritten_content.append(f"\n--- Pages {batch_start}-{batch_end} (Extraction Failed) ---\n")
-            processed_successfully = False
     
     # Combine all batches
     if all_rewritten_content:
@@ -243,15 +274,14 @@ def process_pdf_in_batches(pdf_file, api_key, batch_size=5):
         output_file = pdf_file.parent / f"rewritten_{pdf_file.stem}.txt"
         save_rewritten_content(final_content, output_file)
         
-        print(f"✓ Completed: {output_file.name}")
+        print(f"✓ Rewritten: {output_file.name}")
         return True
     else:
         print("✗ No content was processed successfully")
         return False
 
-def process_pdf_files(directory_path, api_key, batch_size=5):
-    """Process all PDF files in the given directory in batches"""
-    
+def process_pdf_files(directory_path, api_key):
+    """Process all PDF files in the given directory"""
     # Find all PDF files in directory
     directory = Path(directory_path)
     pdf_files = list(directory.glob("*.pdf"))
@@ -260,26 +290,13 @@ def process_pdf_files(directory_path, api_key, batch_size=5):
         print(f"No PDF files found in {directory_path}")
         return
     
-    print(f"Found {len(pdf_files)} PDF files to process (batch size: {batch_size} pages):")
-    
-    successful_files = 0
+    print(f"Found {len(pdf_files)} PDF files to process:")
     
     for pdf_file in pdf_files:
-        print(f"\n" + "="*60)
-        print(f"Processing: {pdf_file.name}")
-        print("="*60)
+        print(f"\nProcessing: {pdf_file.name}")
         
-        # Process PDF in batches
-        success = process_pdf_in_batches(pdf_file, api_key, batch_size)
-        
-        if success:
-            successful_files += 1
-        else:
-            print(f"✗ Failed to process {pdf_file.name}")
-    
-    print(f"\n" + "="*60)
-    print(f"SUMMARY: {successful_files}/{len(pdf_files)} files processed successfully")
-    print("="*60)
+        # Process PDF in batches of 20 pages
+        process_pdf_in_batches(pdf_file, api_key, batch_size=20)
 
 def save_rewritten_content(content, output_path):
     """Save rewritten content to file"""
@@ -323,7 +340,6 @@ def main():
     # Configuration
     API_KEY = "sk-467f5288c9ef40a4ae6ccec5978019ea"  # Replace with your actual API key
     DIRECTORY_PATH = r"C:\Users\menha\Downloads\test11"
-    BATCH_SIZE = 20  # Process 5 pages at a time (adjust as needed)
     
     # Check if API key is provided
     if API_KEY == "your_deepseek_api_key_here":
@@ -340,11 +356,8 @@ def main():
         print("Please install the missing dependencies first.")
         return
     
-    print(f"🚀 Starting batch processing (Batch size: {BATCH_SIZE} pages)")
-    print("This will process PDFs in small batches to avoid timeouts and ensure completeness")
-    
     # Process files
-    process_pdf_files(DIRECTORY_PATH, API_KEY, BATCH_SIZE)
+    process_pdf_files(DIRECTORY_PATH, API_KEY)
 
 if __name__ == "__main__":
     main()
