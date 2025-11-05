@@ -1,0 +1,350 @@
+import os
+import requests
+import json
+from pathlib import Path
+import time
+
+class DeepSeekRewriter:
+    def __init__(self, api_key):
+        self.api_key = api_key
+        self.base_url = "https://api.deepseek.com/v1/chat/completions"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+    
+    def rewrite_content(self, content):
+        """Rewrite content using DeepSeek API - process in one go for better quality"""
+        print(f"  Preparing to rewrite {len(content)} characters...")
+        
+        payload = {
+            "model": "deepseek-chat",
+            "messages": [
+                {
+                    "role": "user", 
+                    "content": f"""Please carefully rewrite the following content to improve clarity, grammar, and readability while PRESERVING ALL ORIGINAL CONTENT. 
+
+IMPORTANT: Do not omit any text, questions, options, or technical details. Keep all mathematical notation, question numbers, and options exactly as they appear.
+
+Content to rewrite:
+
+{content}"""
+                }
+            ],
+            "temperature": 0.3,
+            "max_tokens": 4000
+        }
+        
+        try:
+            print("  Sending to DeepSeek API...")
+            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=60)
+            response.raise_for_status()
+            result = response.json()
+            rewritten = result['choices'][0]['message']['content']
+            print(f"  ✓ Successfully rewritten {len(rewritten)} characters")
+            return rewritten
+        except Exception as e:
+            print(f"  Error calling API: {e}")
+            return content
+
+def extract_text_from_scanned_pdf(pdf_path, start_page=1, end_page=None):
+    """Extract text from scanned PDF using OCR - specific page range"""
+    try:
+        from pdf2image import convert_from_path
+        import pytesseract
+        
+        print(f"  Converting PDF pages {start_page} to {end_page if end_page else 'end'} to images...")
+        
+        # Convert specific page range
+        if end_page:
+            images = convert_from_path(pdf_path, dpi=300, first_page=start_page, last_page=end_page)
+        else:
+            images = convert_from_path(pdf_path, dpi=300, first_page=start_page)
+        
+        text = ""
+        actual_start_page = start_page
+        print(f"  Performing OCR on {len(images)} pages...")
+        
+        for i, image in enumerate(images):
+            current_page = actual_start_page + i
+            print(f"    Page {current_page}")
+            page_text = pytesseract.image_to_string(image, lang='eng')
+            text += f"--- Page {current_page} ---\n{page_text}\n\n"
+        
+        return text.strip()
+            
+    except ImportError as e:
+        print(f"OCR libraries not available: {e}")
+        return None
+    except Exception as e:
+        print(f"Error in OCR processing: {e}")
+        return None
+
+def try_regular_extraction(pdf_path, start_page=1, end_page=None):
+    """Try regular text extraction first - specific page range"""
+    try:
+        # Try PyMuPDF (fitz) first - often best for regular PDFs
+        try:
+            import fitz
+            doc = fitz.open(pdf_path)
+            text = ""
+            
+            # Calculate page range
+            total_pages = len(doc)
+            if end_page is None or end_page > total_pages:
+                end_page = total_pages
+            
+            for page_num in range(start_page - 1, end_page):  # 0-based indexing
+                page = doc[page_num]
+                page_text = page.get_text()
+                text += f"--- Page {page_num + 1} ---\n{page_text}\n\n"
+            
+            doc.close()
+            if len(text.strip()) > 100:  # If we got substantial text
+                return text
+        except ImportError:
+            pass
+        
+        # Try pdfplumber with page range
+        try:
+            import pdfplumber
+            text = ""
+            with pdfplumber.open(pdf_path) as pdf:
+                total_pages = len(pdf.pages)
+                if end_page is None or end_page > total_pages:
+                    end_page = total_pages
+                
+                for page_num in range(start_page - 1, end_page):
+                    page = pdf.pages[page_num]
+                    page_text = page.extract_text() or ""
+                    text += f"--- Page {page_num + 1} ---\n{page_text}\n\n"
+            
+            if len(text.strip()) > 100:
+                return text
+        except ImportError:
+            pass
+        
+        # Try PyPDF2 with page range
+        try:
+            import PyPDF2
+            with open(pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                text = ""
+                total_pages = len(reader.pages)
+                if end_page is None or end_page > total_pages:
+                    end_page = total_pages
+                
+                for page_num in range(start_page - 1, end_page):
+                    page = reader.pages[page_num]
+                    page_text = page.extract_text()
+                    text += f"--- Page {page_num + 1} ---\n{page_text}\n\n"
+            
+            if len(text.strip()) > 100:
+                return text
+        except ImportError:
+            pass
+        
+        return None
+        
+    except Exception as e:
+        print(f"Error in regular extraction: {e}")
+        return None
+
+def extract_text_from_pdf(pdf_path, start_page=1, end_page=None):
+    """Extract text from PDF - try regular methods first, then OCR - specific page range"""
+    print(f"  Attempting text extraction (pages {start_page}-{end_page if end_page else 'end'})...")
+    
+    # First try regular extraction
+    text = try_regular_extraction(pdf_path, start_page, end_page)
+    
+    if text and len(text.strip()) > 100:
+        print("  ✓ Success with regular extraction")
+        return text
+    else:
+        print("  ✗ Regular extraction failed, trying OCR...")
+        ocr_text = extract_text_from_scanned_pdf(pdf_path, start_page, end_page)
+        if ocr_text and len(ocr_text.strip()) > 100:
+            print("  ✓ Success with OCR extraction")
+            return ocr_text
+        else:
+            print("  ✗ All extraction methods failed for this page range")
+            return None
+
+def get_pdf_page_count(pdf_path):
+    """Get total number of pages in PDF"""
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        page_count = len(doc)
+        doc.close()
+        return page_count
+    except:
+        try:
+            from pdf2image import convert_from_path
+            images = convert_from_path(pdf_path, dpi=1)  # Low DPI for quick count
+            return len(images)
+        except:
+            return None
+
+def process_pdf_in_batches(pdf_file, api_key, batch_size=5):
+    """Process PDF in batches of pages to avoid timeouts"""
+    rewriter = DeepSeekRewriter(api_key)
+    
+    # Get total page count
+    total_pages = get_pdf_page_count(pdf_file)
+    if total_pages is None:
+        print("  ✗ Could not determine page count")
+        return False
+    
+    print(f"  Total pages: {total_pages}, processing in batches of {batch_size}")
+    
+    all_rewritten_content = []
+    processed_successfully = True
+    
+    # Process in batches
+    for batch_start in range(1, total_pages + 1, batch_size):
+        batch_end = min(batch_start + batch_size - 1, total_pages)
+        
+        print(f"\n  Processing batch: Pages {batch_start}-{batch_end}")
+        
+        # Extract text for this batch
+        content = extract_text_from_pdf(pdf_file, batch_start, batch_end)
+        
+        if content:
+            print(f"    Extracted {len(content)} characters")
+            
+            if len(content.strip()) < 50:
+                print("    ✗ Extracted text too short, skipping batch...")
+                all_rewritten_content.append(f"\n--- Pages {batch_start}-{batch_end} (Skipped - Too Short) ---\n")
+                continue
+                
+            # Rewrite the content for this batch
+            print("    Rewriting content with AI...")
+            rewritten_content = rewriter.rewrite_content(content)
+            
+            all_rewritten_content.append(f"\n--- Pages {batch_start}-{batch_end} ---\n{rewritten_content}")
+            
+            print(f"    ✓ Batch {batch_start}-{batch_end} completed")
+            
+            # Add delay between batches to avoid rate limiting
+            if batch_end < total_pages:
+                print("    Waiting 2 seconds before next batch...")
+                time.sleep(2)
+        else:
+            print(f"    ✗ Failed to extract text for pages {batch_start}-{batch_end}")
+            all_rewritten_content.append(f"\n--- Pages {batch_start}-{batch_end} (Extraction Failed) ---\n")
+            processed_successfully = False
+    
+    # Combine all batches
+    if all_rewritten_content:
+        final_content = "".join(all_rewritten_content)
+        
+        # Save rewritten content
+        output_file = pdf_file.parent / f"rewritten_{pdf_file.stem}.txt"
+        save_rewritten_content(final_content, output_file)
+        
+        print(f"✓ Completed: {output_file.name}")
+        return True
+    else:
+        print("✗ No content was processed successfully")
+        return False
+
+def process_pdf_files(directory_path, api_key, batch_size=5):
+    """Process all PDF files in the given directory in batches"""
+    
+    # Find all PDF files in directory
+    directory = Path(directory_path)
+    pdf_files = list(directory.glob("*.pdf"))
+    
+    if not pdf_files:
+        print(f"No PDF files found in {directory_path}")
+        return
+    
+    print(f"Found {len(pdf_files)} PDF files to process (batch size: {batch_size} pages):")
+    
+    successful_files = 0
+    
+    for pdf_file in pdf_files:
+        print(f"\n" + "="*60)
+        print(f"Processing: {pdf_file.name}")
+        print("="*60)
+        
+        # Process PDF in batches
+        success = process_pdf_in_batches(pdf_file, api_key, batch_size)
+        
+        if success:
+            successful_files += 1
+        else:
+            print(f"✗ Failed to process {pdf_file.name}")
+    
+    print(f"\n" + "="*60)
+    print(f"SUMMARY: {successful_files}/{len(pdf_files)} files processed successfully")
+    print("="*60)
+
+def save_rewritten_content(content, output_path):
+    """Save rewritten content to file"""
+    try:
+        with open(output_path, 'w', encoding='utf-8') as f:
+            f.write(content)
+    except Exception as e:
+        print(f"Error saving file: {e}")
+
+def check_dependencies():
+    """Check and install required dependencies"""
+    required_packages = {
+        'requests': 'requests',
+        'PyPDF2': 'PyPDF2',
+        'pdfplumber': 'pdfplumber',
+        'pymupdf': 'fitz',
+        'pdf2image': 'pdf2image',
+        'pytesseract': 'pytesseract',
+        'Pillow': 'PIL'
+    }
+    
+    missing = []
+    for package, import_name in required_packages.items():
+        try:
+            if import_name == 'fitz':
+                import fitz
+            elif import_name == 'PIL':
+                from PIL import Image
+            else:
+                __import__(import_name)
+        except ImportError:
+            missing.append(package)
+    
+    if missing:
+        print("Missing dependencies. Please install:")
+        print(f"pip install {' '.join(missing)}")
+        return False
+    return True
+
+def main():
+    # Configuration
+    API_KEY = "sk-467f5288c9ef40a4ae6ccec5978019ea"  # Replace with your actual API key
+    DIRECTORY_PATH = r"C:\Users\menha\Downloads\test11"
+    BATCH_SIZE = 20  # Process 5 pages at a time (adjust as needed)
+    
+    # Check if API key is provided
+    if API_KEY == "your_deepseek_api_key_here":
+        print("Please replace 'your_deepseek_api_key_here' with your actual DeepSeek API key")
+        return
+    
+    # Check if directory exists
+    if not os.path.exists(DIRECTORY_PATH):
+        print(f"Directory {DIRECTORY_PATH} does not exist!")
+        return
+    
+    # Check dependencies
+    if not check_dependencies():
+        print("Please install the missing dependencies first.")
+        return
+    
+    print(f"🚀 Starting batch processing (Batch size: {BATCH_SIZE} pages)")
+    print("This will process PDFs in small batches to avoid timeouts and ensure completeness")
+    
+    # Process files
+    process_pdf_files(DIRECTORY_PATH, API_KEY, BATCH_SIZE)
+
+if __name__ == "__main__":
+    main()
