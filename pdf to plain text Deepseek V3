@@ -3,146 +3,261 @@ import requests
 import json
 from pathlib import Path
 import time
+import logging
+from typing import Optional, List
+import re
+
+# Set up logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
 
 class DeepSeekRewriter:
-    def __init__(self, api_key):
+    def __init__(self, api_key, temperature=0.1, max_tokens=8000):
         self.api_key = api_key
         self.base_url = "https://api.deepseek.com/v1/chat/completions"
         self.headers = {
             "Content-Type": "application/json",
             "Authorization": f"Bearer {api_key}"
         }
+        self.temperature = temperature
+        self.max_tokens = max_tokens
     
-    def rewrite_content(self, content):
-        """Rewrite content using DeepSeek API"""
+    def rewrite_content(self, content, retries=3):
+        """Rewrite content using DeepSeek API with retry logic"""
+        
         prompt = """
-        Please rewrite the following content to improve clarity, grammar, and readability while preserving:
-        1. All technical accuracy and terminology
-        2. The original meaning and context
-        3. Mathematical notation and formulas
-        4. Question structure and options
-        5. Professional tone
+        You are an expert academic content rewriter. Please rewrite the following content to improve clarity, grammar, and readability while STRICTLY preserving:
+        
+        CRITICAL PRESERVATION RULES:
+        1. ALL technical accuracy, formulas, equations, and mathematical notation exactly as written
+        2. The original meaning and context without any interpretation
+        3. Question numbers, options (A/B/C/D), and structure precisely
+        4. All numerical values, units, and scientific notation
+        5. Technical terminology and domain-specific language
+        6. Multiple choice question formats exactly
+        
+        Focus only on improving:
+        - Grammar and sentence structure
+        - Spelling corrections
+        - Punctuation
+        - Readability of explanatory text
         
         Content to rewrite:
         """
         
-        # Split content if too long (DeepSeek has token limits)
-        max_chunk_size = 12000  # Conservative chunk size
+        max_chunk_size = 6000  # Reduced for better handling
         if len(content) > max_chunk_size:
-            chunks = self.split_content(content, max_chunk_size)
+            chunks = self.split_content_preserving_questions(content, max_chunk_size)
             rewritten_chunks = []
             for i, chunk in enumerate(chunks):
-                print(f"  Processing chunk {i+1}/{len(chunks)}...")
-                rewritten_chunk = self.process_chunk(chunk)
-                rewritten_chunks.append(rewritten_chunk)
-                time.sleep(1)  # Rate limiting
-            return "\n\n".join(rewritten_chunks)
+                logger.info(f"Processing chunk {i+1}/{len(chunks)}...")
+                rewritten_chunk = self.process_chunk_with_retry(chunk, prompt, retries)
+                if rewritten_chunk and rewritten_chunk.strip():
+                    rewritten_chunks.append(rewritten_chunk)
+                time.sleep(3)
+            return "\n\n".join(rewritten_chunks) if rewritten_chunks else content
         else:
-            return self.process_chunk(content)
+            result = self.process_chunk_with_retry(content, prompt, retries)
+            return result if result else content
     
-    def process_chunk(self, chunk):
+    def process_chunk_with_retry(self, chunk, prompt, retries):
+        """Process chunk with retry logic"""
+        for attempt in range(retries):
+            try:
+                return self.process_chunk(chunk, prompt)
+            except Exception as e:
+                logger.warning(f"API call failed (attempt {attempt + 1}/{retries}): {e}")
+                if attempt < retries - 1:
+                    time.sleep(10 * (attempt + 1))
+                else:
+                    logger.error("All retries failed. Returning original content.")
+                    return chunk
+    
+    def process_chunk(self, chunk, prompt):
         """Process a single chunk of content"""
+        # Skip if chunk is too small or doesn't contain substantial content
+        if len(chunk.strip()) < 50:
+            return chunk
+            
         payload = {
             "model": "deepseek-chat",
             "messages": [
                 {
-                    "role": "user",
-                    "content": "Please rewrite the following content to improve clarity while preserving all technical accuracy, mathematical notation, and question structure:\n\n" + chunk
+                    "role": "system",
+                    "content": "You are a technical content rewriter specializing in academic and engineering materials. You preserve all technical details exactly while improving readability."
+                },
+                {
+                    "role": "user", 
+                    "content": prompt + chunk
                 }
             ],
-            "temperature": 0.2,
-            "max_tokens": 4000
+            "temperature": self.temperature,
+            "max_tokens": self.max_tokens,
+            "top_p": 0.9
         }
         
         try:
-            response = requests.post(self.base_url, headers=self.headers, json=payload)
+            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=120)
             response.raise_for_status()
             result = response.json()
-            return result['choices'][0]['message']['content']
-        except Exception as e:
-            print(f"Error calling API: {e}")
-            return chunk
-    
-    def split_content(self, content, chunk_size):
-        """Split content into manageable chunks"""
-        chunks = []
-        paragraphs = content.split('\n\n')
-        
-        current_chunk = ""
-        for paragraph in paragraphs:
-            if len(current_chunk) + len(paragraph) < chunk_size:
-                current_chunk += paragraph + "\n\n"
+            
+            if 'choices' in result and len(result['choices']) > 0:
+                content = result['choices'][0]['message']['content']
+                # Validate that we got meaningful content back
+                if len(content.strip()) > len(chunk.strip()) * 0.1:  # At least 10% of original length
+                    return content
+                else:
+                    logger.warning("API returned very short content, using original")
+                    return chunk
             else:
-                if current_chunk:
-                    chunks.append(current_chunk.strip())
-                current_chunk = paragraph + "\n\n"
+                logger.warning("Unexpected API response format")
+                return chunk
+                
+        except requests.exceptions.RequestException as e:
+            logger.error(f"API request failed: {e}")
+            raise
+        except Exception as e:
+            logger.error(f"Unexpected error: {e}")
+            raise
+    
+    def split_content_preserving_questions(self, content, chunk_size):
+        """Split content while preserving question boundaries"""
+        chunks = []
         
-        if current_chunk:
-            chunks.append(current_chunk.strip())
+        # Split by question patterns (Q.1, Q.2, etc.)
+        question_pattern = r'(Q\.\s*\d+[^\n]*(?:\n(?!Q\.\s*\d+).*)*)'
+        questions = re.findall(question_pattern, content, re.IGNORECASE | re.DOTALL)
+        
+        if questions:
+            current_chunk = ""
+            for question in questions:
+                if len(current_chunk) + len(question) < chunk_size:
+                    current_chunk += question + "\n\n"
+                else:
+                    if current_chunk.strip():
+                        chunks.append(current_chunk.strip())
+                    current_chunk = question + "\n\n"
+            if current_chunk.strip():
+                chunks.append(current_chunk.strip())
+        else:
+            # Fallback: split by pages or paragraphs
+            pages = content.split('===== Page')
+            if len(pages) > 1:
+                current_chunk = f"===== Page{pages[1]}"
+                for page in pages[2:]:
+                    page_content = f"===== Page{page}"
+                    if len(current_chunk) + len(page_content) < chunk_size:
+                        current_chunk += page_content
+                    else:
+                        if current_chunk.strip():
+                            chunks.append(current_chunk.strip())
+                        current_chunk = page_content
+                if current_chunk.strip():
+                    chunks.append(current_chunk.strip())
+            else:
+                # Simple paragraph splitting
+                paragraphs = content.split('\n\n')
+                current_chunk = ""
+                for para in paragraphs:
+                    if len(current_chunk) + len(para) + 2 < chunk_size:
+                        current_chunk += para + "\n\n"
+                    else:
+                        if current_chunk.strip():
+                            chunks.append(current_chunk.strip())
+                        current_chunk = para + "\n\n"
+                if current_chunk.strip():
+                    chunks.append(current_chunk.strip())
         
         return chunks
 
-def extract_text_from_scanned_pdf(pdf_path, start_page=1, end_page=None):
-    """Extract text from scanned PDF using OCR - specific page range"""
-    try:
-        # Option 1: Using pdf2image + pytesseract
-        try:
-            from pdf2image import convert_from_path
-            import pytesseract
-            
-            print(f"  Converting PDF pages {start_page} to {end_page if end_page else 'end'} to images...")
-            
-            # Convert specific page range
-            if end_page:
-                images = convert_from_path(pdf_path, dpi=300, first_page=start_page, last_page=end_page)
-            else:
-                images = convert_from_path(pdf_path, dpi=300, first_page=start_page)
-            
-            text = ""
-            actual_start_page = start_page
-            print(f"  Performing OCR on {len(images)} pages...")
-            for i, image in enumerate(images):
-                current_page = actual_start_page + i
-                print(f"    Page {current_page}")
-                page_text = pytesseract.image_to_string(image, lang='eng')
-                text += f"--- Page {current_page} ---\n{page_text}\n\n"
-            
-            return text.strip()
-            
-        except ImportError as e:
-            print(f"OCR libraries not available: {e}")
+class AdvancedPDFProcessor:
+    def __init__(self):
+        self.extraction_methods = [
+            self.try_enhanced_pymupdf,
+            self.try_enhanced_pdfplumber,
+            self.try_enhanced_ocr,
+            self.try_pypdf2_extraction
+        ]
+    
+    def extract_text_from_pdf(self, pdf_path, start_page=1, end_page=None):
+        """Extract text from PDF using multiple enhanced methods"""
+        logger.info(f"Extracting text from {pdf_path.name} (pages {start_page}-{end_page if end_page else 'end'})")
+        
+        # Try each method with enhanced capabilities
+        all_extracted_text = ""
+        
+        for method in self.extraction_methods:
+            try:
+                logger.info(f"Trying {method.__name__}...")
+                text = method(pdf_path, start_page, end_page)
+                if text and self.is_substantial_text(text):
+                    method_name = method.__name__.replace('try_', '').replace('_extraction', '')
+                    logger.info(f"✓ Success with {method_name}")
+                    
+                    # Combine text from different methods
+                    all_extracted_text = self.merge_extracted_text(all_extracted_text, text)
+                    
+                    # If we got good text, we can stop or continue for enhancement
+                    if len(text) > 1000:  # Good substantial text
+                        break
+                        
+            except Exception as e:
+                logger.debug(f"Method {method.__name__} failed: {e}")
+                continue
+        
+        if all_extracted_text:
+            # Clean and post-process the extracted text
+            cleaned_text = self.clean_extracted_text(all_extracted_text)
+            return cleaned_text
+        else:
+            logger.error("✗ All extraction methods failed")
             return None
-            
-    except Exception as e:
-        print(f"Error in OCR processing: {e}")
-        return None
-
-def try_regular_extraction(pdf_path, start_page=1, end_page=None):
-    """Try regular text extraction first - specific page range"""
-    try:
-        # Try PyMuPDF (fitz) first - often best for regular PDFs
+    
+    def try_enhanced_pymupdf(self, pdf_path, start_page, end_page):
+        """Enhanced PyMuPDF extraction with multiple text extraction methods"""
         try:
             import fitz
             doc = fitz.open(pdf_path)
-            text = ""
             
-            # Calculate page range
             total_pages = len(doc)
             if end_page is None or end_page > total_pages:
                 end_page = total_pages
             
-            for page_num in range(start_page - 1, end_page):  # 0-based indexing
+            text = ""
+            for page_num in range(start_page - 1, end_page):
                 page = doc[page_num]
-                page_text = page.get_text()
-                text += f"--- Page {page_num + 1} ---\n{page_text}\n\n"
+                
+                # Try multiple extraction methods
+                methods = [
+                    lambda p: p.get_text(),  # Standard extraction
+                    lambda p: p.get_text("words"),  # Word-based extraction
+                    lambda p: p.get_text("blocks"),  # Block-based extraction
+                ]
+                
+                page_text = ""
+                for method in methods:
+                    try:
+                        result = method(page)
+                        if isinstance(result, str):
+                            extracted = result
+                        else:
+                            # Convert words/blocks to text
+                            extracted = " ".join([str(item) for item in result])
+                        
+                        if len(extracted.strip()) > len(page_text):
+                            page_text = extracted
+                    except:
+                        continue
+                
+                text += f"===== Page {page_num + 1} =====\n\n{page_text}\n\n"
             
             doc.close()
-            if len(text.strip()) > 100:  # If we got substantial text
-                return text
-        except ImportError:
-            pass
-        
-        # Try pdfplumber with page range
+            return text.strip()
+        except Exception as e:
+            raise Exception(f"PyMuPDF error: {e}")
+    
+    def try_enhanced_pdfplumber(self, pdf_path, start_page, end_page):
+        """Enhanced pdfplumber extraction with layout preservation"""
         try:
             import pdfplumber
             text = ""
@@ -153,15 +268,102 @@ def try_regular_extraction(pdf_path, start_page=1, end_page=None):
                 
                 for page_num in range(start_page - 1, end_page):
                     page = pdf.pages[page_num]
-                    page_text = page.extract_text() or ""
-                    text += f"--- Page {page_num + 1} ---\n{page_text}\n\n"
+                    
+                    # Try different extraction strategies
+                    strategies = [
+                        {"layout": True, "x_tolerance": 2, "y_tolerance": 2},
+                        {"layout": False},
+                        {"x_tolerance": 5, "y_tolerance": 5}
+                    ]
+                    
+                    best_page_text = ""
+                    for strategy in strategies:
+                        try:
+                            page_text = page.extract_text(**strategy) or ""
+                            if len(page_text.strip()) > len(best_page_text.strip()):
+                                best_page_text = page_text
+                        except:
+                            continue
+                    
+                    # If still poor, try character-based extraction
+                    if len(best_page_text.strip()) < 100:
+                        try:
+                            chars = page.chars
+                            if chars:
+                                char_text = "".join([char['text'] for char in chars if 'text' in char])
+                                if len(char_text) > len(best_page_text):
+                                    best_page_text = char_text
+                        except:
+                            pass
+                    
+                    text += f"===== Page {page_num + 1} =====\n\n{best_page_text}\n\n"
             
-            if len(text.strip()) > 100:
-                return text
-        except ImportError:
-            pass
-        
-        # Try PyPDF2 with page range
+            return text.strip()
+        except Exception as e:
+            raise Exception(f"pdfplumber error: {e}")
+    
+    def try_enhanced_ocr(self, pdf_path, start_page, end_page):
+        """Enhanced OCR with multiple configurations for technical content"""
+        try:
+            from pdf2image import convert_from_path
+            import pytesseract
+            
+            logger.info("Attempting enhanced OCR extraction...")
+            
+            # Convert PDF to images with optimal DPI
+            dpi_values = [400, 300, 500]  # Try different DPI settings
+            
+            best_text = ""
+            for dpi in dpi_values:
+                try:
+                    if end_page:
+                        images = convert_from_path(pdf_path, dpi=dpi, first_page=start_page, last_page=end_page)
+                    else:
+                        images = convert_from_path(pdf_path, dpi=dpi, first_page=start_page)
+                    
+                    current_text = ""
+                    actual_start_page = start_page
+                    
+                    # OCR configurations for technical/mathematical content
+                    ocr_configs = [
+                        r'--oem 3 --psm 6',  # Uniform block of text
+                        r'--oem 3 --psm 4',  # Single column of text
+                        r'--oem 3 --psm 3',  # Fully automatic page segmentation
+                        r'--oem 3 --psm 11'  # Sparse text
+                    ]
+                    
+                    for i, image in enumerate(images):
+                        current_page = actual_start_page + i
+                        logger.info(f"OCR processing page {current_page} at DPI {dpi}")
+                        
+                        page_text = ""
+                        for config in ocr_configs:
+                            try:
+                                config_text = pytesseract.image_to_string(image, config=config, lang='eng')
+                                if len(config_text.strip()) > len(page_text.strip()):
+                                    page_text = config_text
+                            except:
+                                continue
+                        
+                        current_text += f"===== Page {current_page} =====\n\n{page_text}\n\n"
+                    
+                    if len(current_text.strip()) > len(best_text.strip()):
+                        best_text = current_text
+                        
+                except Exception as e:
+                    logger.warning(f"OCR failed at DPI {dpi}: {e}")
+                    continue
+            
+            return best_text.strip()
+            
+        except ImportError as e:
+            logger.warning(f"OCR libraries not available: {e}")
+            return None
+        except Exception as e:
+            raise Exception(f"OCR error: {e}")
+    
+    def try_pypdf2_extraction(self, pdf_path, start_page, end_page):
+        """Standard PyPDF2 extraction as fallback"""
         try:
             import PyPDF2
             with open(pdf_path, 'rb') as file:
@@ -173,111 +375,144 @@ def try_regular_extraction(pdf_path, start_page=1, end_page=None):
                 
                 for page_num in range(start_page - 1, end_page):
                     page = reader.pages[page_num]
-                    page_text = page.extract_text()
-                    text += f"--- Page {page_num + 1} ---\n{page_text}\n\n"
+                    page_text = page.extract_text() or ""
+                    text += f"===== Page {page_num + 1} =====\n\n{page_text}\n\n"
             
-            if len(text.strip()) > 100:
-                return text
-        except ImportError:
-            pass
-        
-        return None
-        
-    except Exception as e:
-        print(f"Error in regular extraction: {e}")
-        return None
-
-def extract_text_from_pdf(pdf_path, start_page=1, end_page=None):
-    """Extract text from PDF - try regular methods first, then OCR - specific page range"""
-    print(f"  Attempting text extraction (pages {start_page}-{end_page if end_page else 'end'})...")
+            return text.strip()
+        except Exception as e:
+            raise Exception(f"PyPDF2 error: {e}")
     
-    # First try regular extraction
-    text = try_regular_extraction(pdf_path, start_page, end_page)
-    
-    if text and len(text.strip()) > 100:
-        print("  ✓ Success with regular extraction")
-        return text
-    else:
-        print("  ✗ Regular extraction failed, trying OCR...")
-        ocr_text = extract_text_from_scanned_pdf(pdf_path, start_page, end_page)
-        if ocr_text and len(ocr_text.strip()) > 100:
-            print("  ✓ Success with OCR extraction")
-            return ocr_text
+    def merge_extracted_text(self, existing_text, new_text):
+        """Merge text from different extraction methods"""
+        if not existing_text:
+            return new_text
+        
+        # Simple merge - use the longer text
+        if len(new_text.strip()) > len(existing_text.strip()):
+            return new_text
         else:
-            print("  ✗ All extraction methods failed for this page range")
-            return None
-
-def get_pdf_page_count(pdf_path):
-    """Get total number of pages in PDF"""
-    try:
-        import fitz
-        doc = fitz.open(pdf_path)
-        page_count = len(doc)
-        doc.close()
-        return page_count
-    except:
+            return existing_text
+    
+    def clean_extracted_text(self, text):
+        """Clean and normalize extracted text"""
+        # Remove excessive whitespace but preserve structure
+        lines = text.split('\n')
+        cleaned_lines = []
+        
+        for line in lines:
+            line = line.strip()
+            if line:  # Only keep non-empty lines
+                # Normalize spacing
+                line = re.sub(r'\s+', ' ', line)
+                cleaned_lines.append(line)
+        
+        # Reconstruct with reasonable spacing
+        cleaned_text = '\n'.join(cleaned_lines)
+        
+        # Fix common OCR issues in technical content
+        replacements = {
+            r'\\s+': ' ',
+            r'Q\s*\.\s*': 'Q.',
+            r'\(\s*A\s*\)': '(A)',
+            r'\(\s*B\s*\)': '(B)', 
+            r'\(\s*C\s*\)': '(C)',
+            r'\(\s*D\s*\)': '(D)',
+        }
+        
+        for pattern, replacement in replacements.items():
+            cleaned_text = re.sub(pattern, replacement, cleaned_text)
+        
+        return cleaned_text
+    
+    def is_substantial_text(self, text, threshold=200):
+        """Check if extracted text is substantial"""
+        # Remove whitespace and check for meaningful content
+        cleaned_text = re.sub(r'\s+', ' ', text).strip()
+        
+        # Check for question patterns or technical content
+        has_questions = bool(re.search(r'Q\.\s*\d+', cleaned_text, re.IGNORECASE))
+        has_options = bool(re.search(r'\([A-D]\)', cleaned_text))
+        has_math = bool(re.search(r'[0-9]+\.[0-9]+|\d+', cleaned_text))  # Numbers
+        
+        return len(cleaned_text) >= threshold or has_questions or has_options or has_math
+    
+    def get_pdf_page_count(self, pdf_path):
+        """Get total number of pages in PDF"""
         try:
-            from pdf2image import convert_from_path
-            images = convert_from_path(pdf_path, dpi=1)  # Low DPI for quick count
-            return len(images)
+            import fitz
+            doc = fitz.open(pdf_path)
+            page_count = len(doc)
+            doc.close()
+            return page_count
         except:
-            return None
+            try:
+                from pdf2image import convert_from_path
+                images = convert_from_path(pdf_path, dpi=1)
+                return len(images)
+            except:
+                return None
 
-def process_pdf_in_batches(pdf_file, api_key, batch_size=20):
-    """Process PDF in batches of pages"""
-    rewriter = DeepSeekRewriter(api_key)
+def process_pdf_in_batches(pdf_file, api_key, batch_size=5):  # Smaller batches for reliability
+    """Process PDF in smaller batches for better reliability"""
+    pdf_processor = AdvancedPDFProcessor()
+    rewriter = DeepSeekRewriter(api_key, temperature=0.1, max_tokens=8000)
     
     # Get total page count
-    total_pages = get_pdf_page_count(pdf_file)
+    total_pages = pdf_processor.get_pdf_page_count(pdf_file)
     if total_pages is None:
-        print("  ✗ Could not determine page count")
+        logger.error("Could not determine page count")
         return False
     
-    print(f"  Total pages: {total_pages}, processing in batches of {batch_size}")
+    logger.info(f"Total pages: {total_pages}, processing in batches of {batch_size}")
     
     all_rewritten_content = []
     
-    # Process in batches
+    # Process in smaller batches
     for batch_start in range(1, total_pages + 1, batch_size):
         batch_end = min(batch_start + batch_size - 1, total_pages)
         
-        print(f"  Processing batch: Pages {batch_start}-{batch_end}")
+        logger.info(f"Processing batch: Pages {batch_start}-{batch_end}")
         
         # Extract text for this batch
-        content = extract_text_from_pdf(pdf_file, batch_start, batch_end)
+        content = pdf_processor.extract_text_from_pdf(pdf_file, batch_start, batch_end)
         
-        if content:
-            print(f"  Extracted {len(content)} characters")
+        if content and pdf_processor.is_substantial_text(content):
+            logger.info(f"Extracted {len(content)} characters")
             
-            # Check if content is substantial
-            if len(content.strip()) < 50:
-                print("  ✗ Extracted text too short, skipping batch...")
-                all_rewritten_content.append(f"\n--- Pages {batch_start}-{batch_end} (Skipped - Too Short) ---\n")
-                continue
-                
             # Rewrite the content for this batch
-            print("  Rewriting content with AI...")
-            rewritten_content = rewriter.rewrite_content(content)
-            
-            all_rewritten_content.append(f"\n--- Pages {batch_start}-{batch_end} ---\n{rewritten_content}")
-            
-            print(f"  ✓ Batch {batch_start}-{batch_end} completed")
+            logger.info("Rewriting content with AI...")
+            try:
+                rewritten_content = rewriter.rewrite_content(content)
+                if rewritten_content and rewritten_content.strip():
+                    all_rewritten_content.append(f"\n===== Pages {batch_start}-{batch_end} =====\n{rewritten_content}")
+                    logger.info(f"✓ Batch {batch_start}-{batch_end} completed")
+                else:
+                    logger.warning("AI returned empty content, using original")
+                    all_rewritten_content.append(f"\n===== Pages {batch_start}-{batch_end} =====\n{content}")
+            except Exception as e:
+                logger.error(f"Failed to rewrite batch {batch_start}-{batch_end}: {e}")
+                all_rewritten_content.append(f"\n===== Pages {batch_start}-{batch_end} (Rewrite Failed) =====\n{content}")
         else:
-            print(f"  ✗ Failed to extract text for pages {batch_start}-{batch_end}")
-            all_rewritten_content.append(f"\n--- Pages {batch_start}-{batch_end} (Extraction Failed) ---\n")
+            logger.warning(f"Poor extraction for pages {batch_start}-{batch_end}")
+            if content:
+                all_rewritten_content.append(f"\n===== Pages {batch_start}-{batch_end} (Poor Extraction) =====\n{content}")
+            else:
+                all_rewritten_content.append(f"\n===== Pages {batch_start}-{batch_end} (Extraction Failed) =====\n")
+        
+        time.sleep(5)  # Increased delay between batches
     
     # Combine all batches
     if all_rewritten_content:
         final_content = "".join(all_rewritten_content)
         
-        # Save rewritten content in the same directory as the original PDF
+        # Save rewritten content
         output_file = pdf_file.parent / f"rewritten_{pdf_file.stem}.txt"
         save_rewritten_content(final_content, output_file)
         
-        print(f"✓ Rewritten: {output_file.name}")
+        logger.info(f"✓ Successfully processed: {output_file.name}")
         return True
     else:
-        print("✗ No content was processed successfully")
+        logger.error("No content was processed successfully")
         return False
 
 def find_all_pdf_files(root_directory):
@@ -288,44 +523,46 @@ def find_all_pdf_files(root_directory):
 
 def process_all_pdf_files(root_directory, api_key):
     """Process all PDF files in the given directory and all subdirectories"""
-    # Find all PDF files recursively
     pdf_files = find_all_pdf_files(root_directory)
     
     if not pdf_files:
-        print(f"No PDF files found in {root_directory} and its subdirectories")
+        logger.error(f"No PDF files found in {root_directory} and its subdirectories")
         return
     
-    print(f"Found {len(pdf_files)} PDF files to process:")
-    for pdf_file in pdf_files:
-        print(f"  - {pdf_file}")
+    logger.info(f"Found {len(pdf_files)} PDF files to process:")
     
     successful_count = 0
     
-    for pdf_file in pdf_files:
-        print(f"\n{'='*60}")
-        print(f"Processing: {pdf_file}")
-        print(f"Relative path: {pdf_file.relative_to(root_directory)}")
+    for i, pdf_file in enumerate(pdf_files, 1):
+        logger.info(f"\n{'='*80}")
+        logger.info(f"Processing file {i}/{len(pdf_files)}: {pdf_file.name}")
+        logger.info(f"Full path: {pdf_file}")
         
-        # Process PDF in batches of 20 pages
-        if process_pdf_in_batches(pdf_file, api_key, batch_size=20):
+        # Process PDF
+        if process_pdf_in_batches(pdf_file, api_key, batch_size=5):
             successful_count += 1
         
-        print(f"Completed: {pdf_file.name}")
+        logger.info(f"Progress: {i}/{len(pdf_files)} files completed")
+        
+        # Delay between files
+        if i < len(pdf_files):
+            logger.info("Waiting before processing next file...")
+            time.sleep(15)
     
-    print(f"\n{'='*60}")
-    print(f"Processing complete!")
-    print(f"Successfully processed: {successful_count}/{len(pdf_files)} files")
+    logger.info(f"\n{'='*80}")
+    logger.info(f"Processing complete!")
+    logger.info(f"Successfully processed: {successful_count}/{len(pdf_files)} files")
 
 def save_rewritten_content(content, output_path):
     """Save rewritten content to file"""
     try:
-        # Ensure the directory exists
         output_path.parent.mkdir(parents=True, exist_ok=True)
         
         with open(output_path, 'w', encoding='utf-8') as f:
             f.write(content)
+        logger.info(f"Saved rewritten content to: {output_path}")
     except Exception as e:
-        print(f"Error saving file: {e}")
+        logger.error(f"Error saving file {output_path}: {e}")
 
 def check_dependencies():
     """Check and install required dependencies"""
@@ -352,38 +589,36 @@ def check_dependencies():
             missing.append(package)
     
     if missing:
-        print("Missing dependencies. Please install:")
-        print(f"pip install {' '.join(missing)}")
+        logger.error("Missing dependencies. Please install:")
+        logger.error(f"pip install {' '.join(missing)}")
         return False
+    
+    logger.info("All dependencies are available")
     return True
 
 def main():
     # Configuration
-    API_KEY = "sk-467f5288c9ef40a4ae6ccec5978019ea"  # Replace with your actual API key
+    API_KEY = "sk-467f5288c9ef40a4ae6ccec5978019ea"
     ROOT_DIRECTORY = r"D:\Vector Academy\Contents\GATE"
     
-    # Check if API key is provided
-    if API_KEY == "your_deepseek_api_key_here":
-        print("Please replace 'your_deepseek_api_key_here' with your actual DeepSeek API key")
+    # Validate API key
+    if API_KEY == "your_deepseek_api_key_here" or len(API_KEY) < 20:
+        logger.error("Please provide a valid DeepSeek API key")
         return
     
-    # Check if directory exists
     if not os.path.exists(ROOT_DIRECTORY):
-        print(f"Directory {ROOT_DIRECTORY} does not exist!")
+        logger.error(f"Directory {ROOT_DIRECTORY} does not exist!")
         return
     
-    # Check dependencies
     if not check_dependencies():
-        print("Please install the missing dependencies first.")
+        logger.error("Please install the missing dependencies first.")
         return
     
-    print(f"Starting PDF processing from: {ROOT_DIRECTORY}")
-    print("This will process all PDF files in all subdirectories recursively.")
-    print("Output files will be saved in the same directories as the original PDFs.")
-    print(f"Output filename format: 'rewritten_original_name.txt'")
-    print(f"{'='*60}")
+    logger.info(f"Starting PDF processing from: {ROOT_DIRECTORY}")
+    logger.info("This will process all PDF files in all subdirectories recursively.")
+    logger.info("Output files will be saved in the same directories as the original PDFs.")
+    logger.info(f"{'='*80}")
     
-    # Process files recursively
     process_all_pdf_files(ROOT_DIRECTORY, API_KEY)
 
 if __name__ == "__main__":
