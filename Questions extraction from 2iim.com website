@@ -1,0 +1,172 @@
+import os, csv, time, html, re
+import pandas as pd
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from bs4 import BeautifulSoup
+from urllib.parse import urljoin
+
+# ---------------- CONFIG ----------------
+DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
+INPUT_CSV = os.path.join(DOWNLOADS, "201.csv")
+FINAL_OUT = os.path.join(DOWNLOADS, "questions_final.csv")
+WAIT_TIME = 6
+HEADLESS = True
+# ----------------------------------------
+
+def norm(text):
+    """Normalize text but preserve LaTeX and math."""
+    if not text:
+        return ""
+    text = html.unescape(text)
+    text = text.replace("□", "").replace("�", "")
+    return re.sub(r"[ \t]+", " ", text).strip()
+
+def extract_text_with_images(tag, base_url):
+    """Extract text and inline image URLs as [IMAGE: ...]."""
+    if not tag:
+        return ""
+    text = ""
+    for elem in tag.descendants:
+        if elem.name == "img" and elem.get("src"):
+            text += f" [IMAGE: {urljoin(base_url, elem['src'])}] "
+        elif isinstance(elem, str):
+            text += elem
+    return norm(text)
+
+def split_correct_option(correct_html):
+    """Parse the full HTML inside tooltiptext to extract choice and value."""
+    if not correct_html:
+        return "", ""
+
+    # Extract raw HTML for better accuracy
+    raw = str(correct_html)
+
+    # Extract the bolded part <b>Choice X</b>
+    choice_match = re.search(r"Choice\s*([A-D])", raw, re.I)
+    choice_letter = choice_match.group(1).upper() if choice_match else ""
+
+    # Remove 'Choice A' from the text
+    clean_text = BeautifulSoup(raw, "html.parser").get_text(" ", strip=True)
+    clean_text = re.sub(r"Choice\s*[A-D]", "", clean_text, flags=re.I)
+    clean_text = norm(clean_text)
+
+    return choice_letter, clean_text
+
+def parse_group_section(container, base_url):
+    """Extract question, options, correct answer, and explanation."""
+    question_text = ""
+    options = ["", "", "", ""]
+    correct_letter, correct_value = "", ""
+    explanation_url = ""
+
+    # 1️⃣ Question text
+    p_tag = container.find("p")
+    if p_tag:
+        question_text = extract_text_with_images(p_tag, base_url)
+
+    # 2️⃣ Options
+    choice_block = container.find("ol", class_="choice")
+    if choice_block:
+        li_tags = choice_block.find_all("li", recursive=False)
+        for i in range(min(4, len(li_tags))):
+            options[i] = extract_text_with_images(li_tags[i], base_url)
+
+    # 3️⃣ Correct option (look for tooltiptext anywhere inside)
+    correct_tag = container.find("span", class_="tooltiptext")
+    if correct_tag:
+        correct_letter, correct_value = split_correct_option(correct_tag)
+
+    # 4️⃣ Explanation link
+    expl_tag = container.find("a", href=True)
+    if expl_tag:
+        explanation_url = urljoin(base_url, expl_tag["href"])
+
+    return question_text, options, correct_letter, correct_value, explanation_url
+
+def scrape_page(driver, url):
+    """Scrape all question blocks."""
+    driver.get(url)
+    time.sleep(WAIT_TIME)
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(3)
+
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+
+    all_ques_blocks = soup.find_all("ol", class_="ques ques1")
+    if not all_ques_blocks:
+        print(f"⚠️ No <ol class='ques ques1'> found on {url}")
+        return []
+
+    results = []
+    for question_container in all_ques_blocks:
+        question_blocks = question_container.find_all("li", recursive=False)
+
+        for li in question_blocks:
+            h4_tag = li.find("h4")
+            para_tag = li.find("p")
+
+            title = norm(h4_tag.get_text()) if h4_tag else ""
+            description = extract_text_with_images(para_tag, url)
+
+            qtext, options, correct_letter, correct_value, explanation_url = parse_group_section(li, url)
+
+            if not title and not qtext and not any(options):
+                continue
+
+            results.append({
+                "Title (h4)": title,
+                "Description (p)": description,
+                "Question Text": qtext,
+                "Option 1": options[0],
+                "Option 2": options[1],
+                "Option 3": options[2],
+                "Option 4": options[3],
+                "Correct Option (Letter)": correct_letter,
+                "Correct Option (Value)": correct_value,
+                "Explanation URL": explanation_url,
+                "Source URL": url
+            })
+
+    print(f"✅ Extracted {len(results)} questions from {url}")
+    return results
+
+def main():
+    options = Options()
+    if HEADLESS:
+        options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")
+
+    driver = webdriver.Chrome(options=options)
+
+    urls = []
+    with open(INPUT_CSV, newline='', encoding="utf-8") as f:
+        for row in csv.reader(f):
+            if row and row[0].startswith("http"):
+                urls.append(row[0].strip())
+
+    print(f"🔍 Found {len(urls)} URLs")
+
+    all_results = []
+    for i, url in enumerate(urls, start=1):
+        print(f"\n[{i}/{len(urls)}] Extracting from: {url}")
+        try:
+            page_results = scrape_page(driver, url)
+            all_results.extend(page_results)
+        except Exception as e:
+            print(f"❌ Error on {url}: {e}")
+            continue
+
+    driver.quit()
+
+    if all_results:
+        pd.DataFrame(all_results).to_csv(FINAL_OUT, index=False, encoding="utf-8-sig")
+        print(f"\n✅ Done! Extracted {len(all_results)} total questions.")
+        print(f"💾 File saved to: {FINAL_OUT}")
+    else:
+        print("\n⚠️ No questions extracted — try increasing WAIT_TIME.")
+
+if __name__ == "__main__":
+    main()
