@@ -1,0 +1,324 @@
+#!/usr/bin/env python3
+"""
+2IIM scraper — handles multiple question sets per page.
+Detects new sections when a new <h2> appears or question numbering restarts at 1.
+Preserves text, images, tables, LaTeX, and correct answers.
+UPDATED: Explanation Button URL extraction for the specific structure
+"""
+
+import os, csv, time, html, re
+import pandas as pd
+from bs4 import BeautifulSoup, NavigableString, Tag
+from urllib.parse import urljoin
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+# ------------ CONFIG ------------
+DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
+INPUT_CSV = os.path.join(DOWNLOADS, "201.csv")
+FINAL_OUT = os.path.join(DOWNLOADS, "questions_final.csv")
+WAIT_TIME = 6
+HEADLESS = True
+# --------------------------------
+
+def norm(s: str) -> str:
+    if not s:
+        return ""
+    s = html.unescape(s).replace("□", "").replace("�", "")
+    s = re.sub(r"[ \t]+", " ", s)
+    return s.strip()
+
+def choose_src_from_img(tag: Tag):
+    for attr in ("src", "data-src", "data-original", "data-srcset", "srcset"):
+        if tag.has_attr(attr) and tag[attr]:
+            val = tag[attr]
+            if "," in val:
+                return val.split(",")[0].split()[0]
+            return val
+    return None
+
+def table_to_markdown(table_tag: Tag) -> str:
+    """Convert <table> into a markdown-style table."""
+    rows = []
+    for tr in table_tag.find_all("tr"):
+        cells = [norm(td.get_text(" ", strip=True)) for td in tr.find_all(["th", "td"])]
+        if cells:
+            rows.append(cells)
+    if not rows:
+        return ""
+    header = rows[0]
+    sep = "| " + " | ".join("---" for _ in header) + " |"
+    body = ["| " + " | ".join(row + [""]*(len(header)-len(row))) + " |" for row in rows[1:]]
+    out = "| " + " | ".join(header) + " |\n" + sep
+    if body:
+        out += "\n" + "\n".join(body)
+    return out
+
+def extract_complete_content_from_node(node, base_url):
+    """
+    Extract complete content from a node including text and inline images.
+    Returns a single string with text and [IMAGE: url] markers.
+    """
+    if isinstance(node, NavigableString):
+        return str(node)
+    
+    if not isinstance(node, Tag):
+        return ""
+    
+    name = node.name.lower()
+    
+    if name == "img":
+        src = choose_src_from_img(node)
+        if src:
+            url = urljoin(base_url, src)
+            return f" [IMAGE: {url}] "
+        return ""
+    
+    if name == "noscript":
+        m = re.search(r'src=["\']([^"\']+)["\']', str(node))
+        if m:
+            url = urljoin(base_url, m.group(1))
+            return f" [IMAGE: {url}] "
+        # Process text content in noscript
+        return "".join(extract_complete_content_from_node(child, base_url) for child in node.children)
+    
+    if name == "table":
+        return "\n" + table_to_markdown(node) + "\n"
+    
+    if name == "br":
+        return "\n"
+    
+    # For all other tags, process children recursively
+    content_parts = []
+    for child in node.children:
+        content_parts.append(extract_complete_content_from_node(child, base_url))
+    
+    return "".join(content_parts)
+
+def extract_images_from_content(content):
+    """Extract all image URLs from content that has [IMAGE: url] markers."""
+    return re.findall(r'\[IMAGE: ([^\]]+)\]', content)
+
+def split_correct_option(span_tag):
+    if not span_tag:
+        return "", ""
+    text = BeautifulSoup(str(span_tag), "html.parser").get_text(" ", strip=True)
+    m = re.search(r"Choice\s*([A-D])", text, re.I)
+    letter = m.group(1).upper() if m else ""
+    text = re.sub(r"Choice\s*[A-D]\s*[:\-–]*", "", text, flags=re.I)
+    return letter, norm(text)
+
+def parse_question_block(li, base_url, is_first_set=False):
+    """
+    Extract question from a single li element.
+    Question column only contains actual question content, stops at options.
+    """
+    # Extract question title (h4)
+    h4_tag = li.find("h4")
+    title = norm(h4_tag.get_text()) if h4_tag else ""
+    
+    # For first question set, find and include the h2 content
+    combined_question_content = ""
+    
+    if is_first_set:
+        # Find the h2 before this question
+        prev_h2 = li.find_previous("h2")
+        if prev_h2:
+            h2_content = extract_complete_content_from_node(prev_h2, base_url)
+            combined_question_content += h2_content + "\n\n"
+            
+            # Extract all content between h2 and the first question (for passage)
+            current = prev_h2.next_sibling
+            while current and current != li.find_previous("ol", class_="ques1"):
+                if isinstance(current, Tag):
+                    # Stop if we reach choice options or any answer-related content
+                    if (current.name == "ol" and "choice" in (current.get("class") or [])) or \
+                       (current.name == "span" and "tooltiptext" in (current.get("class") or [])):
+                        break
+                    content = extract_complete_content_from_node(current, base_url)
+                    if content.strip():
+                        combined_question_content += content + "\n"
+                current = current.next_sibling
+    
+    # Now extract all content from the li element until we hit ANY option/answer related content
+    question_content_parts = []
+    
+    for child in li.children:
+        # Stop when we reach ANY of these:
+        # - Choice list (options)
+        if isinstance(child, Tag) and child.name == "ol" and "choice" in (child.get("class") or []):
+            break
+        
+        # - Tooltip (correct answer)
+        if isinstance(child, Tag) and child.name == "span" and "tooltiptext" in (child.get("class") or []):
+            break
+            
+        # - Any div that contains choice or answer content
+        if isinstance(child, Tag) and child.name == "div":
+            div_class = child.get("class") or []
+            if any(x in str(div_class).lower() for x in ["choice", "answer", "tooltip", "explain"]):
+                break
+        
+        # - Any element that contains option percentages or choice text
+        child_text = child.get_text() if isinstance(child, Tag) else str(child)
+        if re.search(r'\b\d+%\b', child_text) and len(child_text.strip()) < 50:
+            # This looks like option percentages, stop here
+            break
+        
+        # Skip h4 tag as we already have the title separately
+        if isinstance(child, Tag) and child.name == "h4":
+            continue
+            
+        content = extract_complete_content_from_node(child, base_url)
+        if content.strip():
+            # Check if this content contains option-like text (percentages, choices)
+            if not re.search(r'\b\d+%\s*\d+%\s*\d+%\s*\d+%', content):  # Multiple percentages
+                if not re.search(r'Choice\s*[A-D]', content, re.I):  # Choice text
+                    question_content_parts.append(content)
+    
+    question_content = "\n".join(question_content_parts)
+    
+    # Combine with previous content if it's the first set
+    if is_first_set:
+        combined_question_content += question_content
+    else:
+        combined_question_content = question_content
+    
+    # Clean up any remaining option/answer text that might have slipped through
+    combined_question_content = re.sub(r'\s*\d+%\s*\d+%\s*\d+%\s*\d+%.*', '', combined_question_content)
+    combined_question_content = re.sub(r'Choice\s*[A-D].*', '', combined_question_content, flags=re.I)
+    combined_question_content = re.sub(r'Correct Answer.*', '', combined_question_content, flags=re.I)
+    combined_question_content = re.sub(r'Explanation.*', '', combined_question_content, flags=re.I)
+    
+    # Extract options (separate from question content)
+    options = ["", "", "", ""]
+    option_images = [[] for _ in range(4)]
+    
+    choice_ol = li.find("ol", class_=re.compile(r"choice"))
+    if choice_ol:
+        option_li_tags = choice_ol.find_all("li", recursive=False)
+        for i, opt_li in enumerate(option_li_tags[:4]):
+            options[i] = extract_complete_content_from_node(opt_li, base_url)
+            option_images[i] = extract_images_from_content(options[i])
+    
+    # Extract correct answer (separate from question content)
+    correct_letter, correct_value = "", ""
+    tooltip_span = li.find("span", class_="tooltiptext")
+    if tooltip_span:
+        correct_letter, correct_value = split_correct_option(tooltip_span)
+    
+    # Extract explanation URL (separate from question content)
+    explanation_url = ""
+    explain_link = li.find("a", href=lambda x: x and ("explain" in x.lower() or "solution" in x.lower()))
+    if explain_link:
+        explanation_url = urljoin(base_url, explain_link["href"])
+    
+    # Extract explanation button URL - UPDATED for the specific structure
+    explanation_button_url = ""
+    
+    # Look for the specific structure: <a> tag containing <button> with text "Explanation"
+    explanation_button_a = li.find('a', href=True)
+    if explanation_button_a:
+        explanation_button = explanation_button_a.find('button', string=re.compile(r'Explanation', re.I))
+        if explanation_button:
+            explanation_button_url = urljoin(base_url, explanation_button_a['href'])
+    
+    # If not found with button, look for any a tag with "Explanation" text
+    if not explanation_button_url:
+        explanation_a = li.find('a', href=True, string=re.compile(r'Explanation', re.I))
+        if explanation_a:
+            explanation_button_url = urljoin(base_url, explanation_a['href'])
+    
+    # Extract all images from the combined question content
+    question_images = extract_images_from_content(combined_question_content)
+    
+    return title, norm(combined_question_content), question_images, options, option_images, correct_letter, correct_value, explanation_url, explanation_button_url
+
+# ---------- Scrape Page ----------
+
+def scrape_page(driver, url):
+    driver.get(url)
+    time.sleep(WAIT_TIME)
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(2)
+
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    main_div = soup.find("div", class_=re.compile(r"col\s+span_4_of_5")) or soup
+
+    results = []
+    
+    # Find all question lists
+    question_lists = main_div.find_all("ol", class_="ques1")
+    
+    for list_index, q_list in enumerate(question_lists):
+        li_items = q_list.find_all("li", recursive=False)
+        
+        for li_index, li in enumerate(li_items):
+            # Check if this is the first question of the first set
+            is_first_set_question = (list_index == 0 and li_index == 0)
+            
+            # Parse the individual question
+            title, question_text, question_imgs, options, option_imgs, cL, cV, exp_url, exp_button_url = parse_question_block(li, url, is_first_set_question)
+
+            if not any([title, question_text, *options]):
+                continue
+
+            row = {
+                "Section Title": title,
+                "Question Text": question_text,
+                "Question Images": ", ".join(question_imgs),
+                "Option 1": options[0],
+                "Option 1 Images": ", ".join(option_imgs[0]),
+                "Option 2": options[1],
+                "Option 2 Images": ", ".join(option_imgs[1]),
+                "Option 3": options[2],
+                "Option 3 Images": ", ".join(option_imgs[2]),
+                "Option 4": options[3],
+                "Option 4 Images": ", ".join(option_imgs[3]),
+                "Correct Option Letter": cL,
+                "Correct Option Value": cV,
+                "Explanation URL": exp_url,
+                "Explanation Button URL": exp_button_url,  # New column
+                "Source URL": url
+            }
+            results.append(row)
+
+    print(f"✅ Extracted {len(results)} questions from {url}")
+    return results
+
+# ---------- Main ----------
+
+def main():
+    options = Options()
+    if HEADLESS:
+        options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")
+    driver = webdriver.Chrome(options=options)
+
+    urls = []
+    with open(INPUT_CSV, newline='', encoding="utf-8") as f:
+        for row in csv.reader(f):
+            if row and row[0].startswith("http"):
+                urls.append(row[0].strip())
+    print(f"🔍 Found {len(urls)} URLs")
+
+    all_results = []
+    for i, u in enumerate(urls, 1):
+        print(f"[{i}/{len(urls)}] Scraping: {u}")
+        try:
+            all_results.extend(scrape_page(driver, u))
+        except Exception as e:
+            print(f"❌ Error on {u}: {e}")
+
+    driver.quit()
+    if all_results:
+        pd.DataFrame(all_results).to_csv(FINAL_OUT, index=False, encoding="utf-8-sig")
+        print(f"\n✅ Saved {len(all_results)} rows → {FINAL_OUT}")
+    else:
+        print("\n⚠️ No data extracted — check WAIT_TIME or structure.")
+
+if __name__ == "__main__":
+    main()
