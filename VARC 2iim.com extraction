@@ -1,0 +1,406 @@
+#!/usr/bin/env python3
+"""
+2IIM CAT Question Scraper - Fixed question text extraction using working method
+"""
+
+import os, csv, time, html, re
+import pandas as pd
+from bs4 import BeautifulSoup, NavigableString, Tag
+from urllib.parse import urljoin
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+
+# ------------ CONFIG ------------
+DOWNLOADS = os.path.join(os.path.expanduser("~"), "Downloads")
+INPUT_CSV = os.path.join(DOWNLOADS, "201.csv")
+FINAL_OUT = os.path.join(DOWNLOADS, "questions_final.csv")
+WAIT_TIME = 6
+HEADLESS = True
+# --------------------------------
+
+def norm(s: str) -> str:
+    if not s:
+        return ""
+    s = html.unescape(s).replace("□", "").replace("�", "")
+    s = re.sub(r"[ \t]+", " ", s)
+    s = re.sub(r"\n+", "\n", s)
+    return s.strip()
+
+def choose_src_from_img(tag: Tag):
+    for attr in ("src", "data-src", "data-original", "data-srcset", "srcset"):
+        if tag.has_attr(attr) and tag[attr]:
+            val = tag[attr]
+            if "," in val:
+                return val.split(",")[0].split()[0]
+            return val
+    return None
+
+def extract_complete_content_from_node(node, base_url):
+    """
+    Extract complete content from a node including text and images.
+    """
+    if isinstance(node, NavigableString):
+        text = str(node)
+        text = re.sub(r'\s+', ' ', text)
+        return text
+    
+    if not isinstance(node, Tag):
+        return ""
+    
+    name = node.name.lower()
+    
+    if name == "img":
+        src = choose_src_from_img(node)
+        if src:
+            url = urljoin(base_url, src)
+            return f" [IMAGE: {url}] "
+        return ""
+    
+    if name == "br":
+        return "\n"
+    
+    # For all other tags, process children recursively
+    content_parts = []
+    for child in node.children:
+        content_parts.append(extract_complete_content_from_node(child, base_url))
+    
+    return "".join(content_parts)
+
+def extract_images_from_content(content):
+    """Extract all image URLs from content that has [IMAGE: url] markers."""
+    return re.findall(r'\[IMAGE: ([^\]]+)\]', content)
+
+def extract_images_from_tag(tag, base_url):
+    """Extract images from a specific tag."""
+    imgs = []
+    if not tag:
+        return imgs
+    
+    for img in tag.find_all("img", recursive=True):
+        src = choose_src_from_img(img)
+        if src:
+            imgs.append(urljoin(base_url, src))
+    
+    return imgs
+
+def parse_question_li(li_element, base_url, instruction_text, instruction_images, set_number, question_number):
+    """
+    Parse a single li element containing a question - USING WORKING QUESTION EXTRACTION
+    """
+    # Get all content from li
+    li_content = extract_complete_content_from_node(li_element, base_url)
+    
+    # Extract options using the working method
+    options = ["", "", "", ""]
+    option_images = [[] for _ in range(4)]
+    
+    # Look for structured option lists first
+    choice_ol = li_element.find("ol", class_=re.compile(r"choice"))
+    if choice_ol:
+        option_li_tags = choice_ol.find_all("li", recursive=False)
+        for i, opt_li in enumerate(option_li_tags[:4]):
+            options[i] = extract_complete_content_from_node(opt_li, base_url)
+            option_images[i] = extract_images_from_content(options[i])
+    else:
+        # Fallback to regex pattern matching
+        option_pattern = r'([A-D])[\)\.]\s*([^A-D]*)(?=(?:[A-D][\)\.]|Correct Answer|Explanation|$))'
+        option_matches = list(re.finditer(option_pattern, li_content, re.IGNORECASE | re.DOTALL))
+        
+        if len(option_matches) >= 4:
+            # Extract options
+            for i, match in enumerate(option_matches[:4]):
+                options[i] = norm(match.group(2))
+        else:
+            # Final fallback: look for any option-like patterns
+            for i, letter in enumerate(['A', 'B', 'C', 'D']):
+                pattern = f'{letter}[\)\.]\s*([^\n]+)'
+                match = re.search(pattern, li_content, re.IGNORECASE)
+                if match:
+                    options[i] = norm(match.group(1))
+    
+    # Extract correct answer using the working method
+    correct_letter, correct_value = "", ""
+    tooltip_span = li_element.find("span", class_="tooltiptext")
+    if tooltip_span:
+        text = BeautifulSoup(str(tooltip_span), "html.parser").get_text(" ", strip=True)
+        m = re.search(r"Choice\s*([A-D])", text, re.I)
+        correct_letter = m.group(1).upper() if m else ""
+        text = re.sub(r"Choice\s*[A-D]\s*[:\-–]*", "", text, flags=re.I)
+        correct_value = norm(text)
+    
+    # If no tooltip found, try regex patterns
+    if not correct_letter:
+        correct_patterns = [
+            r'Correct Answer\s*[:\-]?\s*([A-D])',
+            r'Answer\s*[:\-]?\s*([A-D])',
+            r'Choice\s*([A-D])\s*is\s*correct',
+            r'Correct\s*Choice\s*[:\-]?\s*([A-D])'
+        ]
+        
+        for pattern in correct_patterns:
+            match = re.search(pattern, li_content, re.IGNORECASE)
+            if match:
+                correct_letter = match.group(1).upper()
+                break
+    
+    # Extract explanation URLs using the working method
+    explanation_url = ""
+    explanation_button_url = ""
+    
+    # Look for explanation link
+    explain_link = li_element.find("a", href=lambda x: x and ("explain" in x.lower() or "solution" in x.lower()))
+    if explain_link:
+        explanation_url = urljoin(base_url, explain_link["href"])
+    
+    # Look for explanation button
+    explanation_button_a = li_element.find('a', href=True)
+    if explanation_button_a:
+        explanation_button = explanation_button_a.find('button', string=re.compile(r'Explanation', re.I))
+        if explanation_button:
+            explanation_button_url = urljoin(base_url, explanation_button_a['href'])
+    
+    # If not found with button, look for any a tag with "Explanation" text
+    if not explanation_button_url:
+        explanation_a = li_element.find('a', href=True, string=re.compile(r'Explanation', re.I))
+        if explanation_a:
+            explanation_button_url = urljoin(base_url, explanation_a['href'])
+    
+    # FIXED: Use the working method from previous script to extract clean question text
+    # Extract all content from the li element until we hit ANY option/answer related content
+    question_content_parts = []
+    
+    for child in li_element.children:
+        # Stop when we reach ANY of these:
+        # - Choice list (options)
+        if isinstance(child, Tag) and child.name == "ol" and "choice" in (child.get("class") or []):
+            break
+        
+        # - Tooltip (correct answer)
+        if isinstance(child, Tag) and child.name == "span" and "tooltiptext" in (child.get("class") or []):
+            break
+            
+        # - Any div that contains choice or answer content
+        if isinstance(child, Tag) and child.name == "div":
+            div_class = child.get("class") or []
+            if any(x in str(div_class).lower() for x in ["choice", "answer", "tooltip", "explain"]):
+                break
+        
+        # - Any element that contains option percentages or choice text
+        child_text = child.get_text() if isinstance(child, Tag) else str(child)
+        if re.search(r'\b\d+%\b', child_text) and len(child_text.strip()) < 50:
+            # This looks like option percentages, stop here
+            break
+        
+        # Skip h4 tag as we already have the title separately
+        if isinstance(child, Tag) and child.name == "h4":
+            continue
+            
+        content = extract_complete_content_from_node(child, base_url)
+        if content.strip():
+            # Check if this content contains option-like text (percentages, choices)
+            if not re.search(r'\b\d+%\s*\d+%\s*\d+%\s*\d+%', content):  # Multiple percentages
+                if not re.search(r'Choice\s*[A-D]', content, re.I):  # Choice text
+                    question_content_parts.append(content)
+    
+    question_content = "\n".join(question_content_parts)
+    
+    # Clean up any remaining option/answer text that might have slipped through
+    question_content = re.sub(r'\s*\d+%\s*\d+%\s*\d+%\s*\d+%.*', '', question_content)
+    question_content = re.sub(r'Choice\s*[A-D].*', '', question_content, flags=re.I)
+    question_content = re.sub(r'Correct Answer.*', '', question_content, flags=re.I)
+    question_content = re.sub(r'Explanation.*', '', question_content, flags=re.I)
+    
+    clean_question_text = norm(question_content)
+    
+    # Extract images from question
+    question_images = extract_images_from_content(clean_question_text)
+    
+    # Extract option images
+    for i, option in enumerate(options):
+        option_images[i] = extract_images_from_content(option)
+    
+    return {
+        "Set Number": set_number,
+        "Question Number": question_number,
+        "Section Title": f"Set {set_number} - Q{question_number}",
+        "Instruction Text": instruction_text,
+        "Instruction Images": ", ".join(instruction_images),
+        "Question Text": clean_question_text,
+        "Question Images": ", ".join(question_images),
+        "Option 1": options[0],
+        "Option 1 Images": ", ".join(option_images[0]),
+        "Option 2": options[1],
+        "Option 2 Images": ", ".join(option_images[1]),
+        "Option 3": options[2],
+        "Option 3 Images": ", ".join(option_images[2]),
+        "Option 4": options[3],
+        "Option 4 Images": ", ".join(option_images[3]),
+        "Correct Option Letter": correct_letter,
+        "Correct Option Value": correct_value,
+        "Explanation URL": explanation_url,
+        "Explanation Button URL": explanation_button_url,
+        "Source URL": base_url
+    }
+
+def scrape_page(driver, url):
+    """
+    Scrape a single page following the exact structure: h4 -> p -> ol with li
+    KEEPS ORIGINAL INSTRUCTION EXTRACTION - ONLY FIXES QUESTION/OPTION/ANSWER PART
+    """
+    driver.get(url)
+    time.sleep(WAIT_TIME)
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(2)
+
+    soup = BeautifulSoup(driver.page_source, "html.parser")
+    
+    # Find the main container
+    main_container = soup.find("div", class_=re.compile(r"col.*span_4_of_5")) or \
+                    soup.find("section", class_="container") or \
+                    soup.find("div", class_="container") or \
+                    soup
+
+    results = []
+    set_number = 1
+    
+    # Find all heading elements (h2, h3, h4) that mark the start of question sets
+    headings = main_container.find_all(['h2', 'h3', 'h4'])
+    
+    for heading in headings:
+        heading_text = heading.get_text(strip=True)
+        
+        # Skip empty headings
+        if not heading_text:
+            continue
+            
+        print(f"📖 Processing heading: {heading_text}")
+        
+        # Get the next element which should be the instruction paragraph
+        instruction_elem = heading.find_next_sibling('p')
+        instruction_text = ""
+        instruction_images = []
+        
+        if instruction_elem:
+            instruction_text = extract_complete_content_from_node(instruction_elem, url)
+            instruction_images = extract_images_from_tag(instruction_elem, url)
+            instruction_text = norm(instruction_text)
+            print(f"📝 Found instruction: {instruction_text[:100]}...")
+        
+        # Find the next ordered list (ol) which contains questions
+        question_list = heading.find_next_sibling('ol')
+        
+        if question_list:
+            # Find all li elements (questions) in this ol
+            li_questions = question_list.find_all('li', recursive=False)
+            print(f"📋 Found {len(li_questions)} questions in set {set_number}")
+            
+            # Parse each question
+            for i, li in enumerate(li_questions, 1):
+                question_data = parse_question_li(
+                    li, url, instruction_text, instruction_images, set_number, i
+                )
+                results.append(question_data)
+                print(f"✅ Processed Q{i}: {question_data['Question Text'][:50]}...")
+            
+            set_number += 1
+    
+    # If no structured sets found with headings, look for direct ol elements
+    if not results:
+        print("🔍 No structured sets found, looking for direct question lists...")
+        question_lists = main_container.find_all('ol')
+        
+        for i, q_list in enumerate(question_lists, 1):
+            li_questions = q_list.find_all('li', recursive=False)
+            print(f"📋 Found {len(li_questions)} questions in list {i}")
+            
+            # Try to find instruction from previous p or heading
+            instruction_text = ""
+            instruction_images = []
+            prev_elem = q_list.find_previous_sibling(['p', 'h2', 'h3', 'h4'])
+            if prev_elem and prev_elem.name == 'p':
+                instruction_text = extract_complete_content_from_node(prev_elem, url)
+                instruction_images = extract_images_from_tag(prev_elem, url)
+                instruction_text = norm(instruction_text)
+            
+            for j, li in enumerate(li_questions, 1):
+                question_data = parse_question_li(
+                    li, url, instruction_text, instruction_images, i, j
+                )
+                results.append(question_data)
+                print(f"✅ Processed Q{j}: {question_data['Question Text'][:50]}...")
+
+    print(f"✅ Extracted {len(results)} questions from {url}")
+    return results
+
+def main():
+    options = Options()
+    if HEADLESS:
+        options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--window-size=1920,1080")
+    driver = webdriver.Chrome(options=options)
+
+    urls = []
+    with open(INPUT_CSV, newline='', encoding="utf-8") as f:
+        for row in csv.reader(f):
+            if row and row[0].startswith("http"):
+                urls.append(row[0].strip())
+    print(f"🔍 Found {len(urls)} URLs")
+
+    all_results = []
+    for i, u in enumerate(urls, 1):
+        print(f"\n[{i}/{len(urls)}] Scraping: {u}")
+        try:
+            results = scrape_page(driver, u)
+            all_results.extend(results)
+        except Exception as e:
+            print(f"❌ Error on {u}: {e}")
+            import traceback
+            traceback.print_exc()
+
+    driver.quit()
+    
+    if all_results:
+        df = pd.DataFrame(all_results)
+        
+        # Reorder columns for better readability
+        column_order = [
+            'Set Number', 'Question Number', 'Section Title', 
+            'Instruction Text', 'Instruction Images',
+            'Question Text', 'Question Images',
+            'Option 1', 'Option 1 Images',
+            'Option 2', 'Option 2 Images', 
+            'Option 3', 'Option 3 Images',
+            'Option 4', 'Option 4 Images',
+            'Correct Option Letter', 'Correct Option Value',
+            'Explanation URL', 'Explanation Button URL',
+            'Source URL'
+        ]
+        
+        # Only include columns that exist in the dataframe
+        final_columns = [col for col in column_order if col in df.columns]
+        df = df[final_columns]
+        
+        df.to_csv(FINAL_OUT, index=False, encoding="utf-8-sig")
+        print(f"\n✅ Saved {len(all_results)} questions → {FINAL_OUT}")
+        
+        # Print detailed summary
+        print(f"\n📊 EXTRACTION SUMMARY:")
+        print(f"   Total questions: {len(all_results)}")
+        print(f"   Total sets: {df['Set Number'].nunique()}")
+        
+        questions_with_options = len([r for r in all_results if any(r[f'Option {i}'] for i in range(1, 5))])
+        questions_with_answers = len([r for r in all_results if r['Correct Option Letter']])
+        questions_with_explanations = len([r for r in all_results if r['Explanation URL'] or r['Explanation Button URL']])
+        
+        print(f"   Questions with options: {questions_with_options}")
+        print(f"   Questions with answers: {questions_with_answers}") 
+        print(f"   Questions with explanations: {questions_with_explanations}")
+        
+    else:
+        print("\n⚠️ No questions extracted — check website structure or increase WAIT_TIME.")
+
+if __name__ == "__main__":
+    main()
