@@ -2,32 +2,53 @@ import re
 import csv
 import os
 
-# Folder containing text files only
-input_folder = r"C:\Users\menha\Downloads\test11"
+input_folder = r"D:\Vector Academy\Contents\PYQ\Gate\Textile Engineering & Fibre Science (TF)\Textile Engineering & Fibre Science (TF)"
 output_file = "combined_questions.csv"
 
-# Regular expressions
-section_pattern = re.compile(r"####\s*\*\*(.*?)\*\*", re.MULTILINE)
-direction_pattern = re.compile(r"\*\*(Q\.\d+\s*[–-]\s*Q\.\d+.*?)\*\*")
-question_pattern = re.compile(r"\*\*Q\.(\d+)\*\*")
+# -------------------------------------------------------------------
+# UNIVERSAL REGEX PATTERNS
+# -------------------------------------------------------------------
+
+# Section headers — supports -, –, —
+section_pattern = re.compile(
+    r"(?:\*\*)?Q\.?\s*\d+\s*[\-–—]\s*Q\.?\s*\d+.*?(?:\*\*)?",
+    re.IGNORECASE
+)
+
+# Question number formats:
+# **Q.1**, Q.1, Q1., Q1), **Q.1** Question text...
+question_start_pattern = re.compile(
+    r"(?:\*\*)?Q\.?\s*(\d+)(?:\*\*)?",
+    re.IGNORECASE
+)
+
+# Options (A), (B), (C), (D)
 option_pattern = re.compile(r"\([A-D]\)")
 
-# Store all data rows
+# -------------------------------------------------------------------
+def extract_question_number(text):
+    """Extract question number from any pattern."""
+    m = question_start_pattern.search(text)
+    if m:
+        return m.group(1)
+    return None
+
+def remove_q_marker(text):
+    """Remove Q.1 , **Q.1**, Q1., Q1) etc."""
+    return question_start_pattern.sub("", text).strip()
+
+# -------------------------------------------------------------------
 all_rows = []
 
 for filename in os.listdir(input_folder):
-    # ✅ Only process .txt files
+
     if not filename.lower().endswith(".txt"):
-        print(f"⏩ Skipping non-text file: {filename}")
         continue
 
     file_path = os.path.join(input_folder, filename)
-    if not os.path.isfile(file_path):
-        continue
-
     print(f"📄 Processing: {filename}")
 
-    # Try reading with UTF-8, fallback to UTF-16
+    # Read file safely
     try:
         with open(file_path, "r", encoding="utf-8") as f:
             text = f.read()
@@ -35,56 +56,64 @@ for filename in os.listdir(input_folder):
         with open(file_path, "r", encoding="utf-16") as f:
             text = f.read()
 
-    # Clean unwanted content
-    text = re.sub(r"\*\*Organizing Institute:.*?\*\*", "", text, flags=re.DOTALL)
-    text = re.sub(r"Page\s*\d+", "", text)
+    text = text.replace("\r", "")
 
-    current_section = ""
-    current_direction = ""
-    rows = []
+    # Identify section boundaries
+    section_positions = [(m.start(), m.group(0)) for m in section_pattern.finditer(text)]
+    section_positions.append((len(text), ""))
 
-    # Find all section headers
-    section_positions = [(m.start(), m.group(1).strip()) for m in section_pattern.finditer(text)]
-    section_positions.append((len(text), ""))  # artificial end marker
+    found_any = False
 
-    # Parse each section block
+    # -------------------------------------------------------------------
+    # PROCESS SECTIONS
+    # -------------------------------------------------------------------
     for i in range(len(section_positions) - 1):
-        section_start = section_positions[i][0]
-        section_end = section_positions[i + 1][0]
-        current_section = section_positions[i][1]
-        section_block = text[section_start:section_end]
 
-        # Find direction
-        direction_match = direction_pattern.search(section_block)
-        if direction_match:
-            current_direction = direction_match.group(1).strip()
+        sec_start, sec_header = section_positions[i]
+        sec_end = section_positions[i + 1][0]
+        block = text[sec_start:sec_end].strip()
 
-        # Split questions
-        question_blocks = re.split(r"(?=\*\*Q\.\d+\*\*)", section_block)
+        # Split on any question marker (lookahead)
+        question_blocks = re.split(
+            r"(?=(?:\*\*)?Q\.?\s*\d+)",
+            block
+        )
+
+        # -------------------------------------------------------------------
+        # PROCESS QUESTION BLOCKS
+        # -------------------------------------------------------------------
         for qb in question_blocks:
-            q_match = question_pattern.search(qb)
-            if not q_match:
+            qb = qb.strip()
+            if not qb:
                 continue
 
-            q_no = f"Q.{q_match.group(1)}"
-            content = re.sub(r"\*\*Q\.\d+\*\*", "", qb).strip()
+            qnum = extract_question_number(qb)
+            if not qnum:
+                continue
 
-            # Split options
-            option_splits = option_pattern.split(content)
-            option_labels = option_pattern.findall(content)
+            found_any = True
 
-            question_text = option_splits[0].strip()
+            # Remove **Q.1** marker
+            body = remove_q_marker(qb).strip()
+
+            # Now split by options
+            splitted = option_pattern.split(body)
+            labels = option_pattern.findall(body)
+
+            question_text = splitted[0].strip()
             options = {"A": "", "B": "", "C": "", "D": ""}
-            for j, label in enumerate(option_labels):
-                key = label.strip("()")
-                if j + 1 < len(option_splits):
-                    options[key] = option_splits[j + 1].strip()
 
-            rows.append([
+            # Fill options
+            for idx, label in enumerate(labels):
+                key = label.strip("()")
+                if idx + 1 < len(splitted):
+                    options[key] = splitted[idx + 1].strip()
+
+            # Add row
+            all_rows.append([
                 filename,
-                current_section,
-                current_direction,
-                q_no,
+                sec_header.strip(),
+                f"Q.{qnum}",
                 question_text,
                 options["A"],
                 options["B"],
@@ -92,19 +121,20 @@ for filename in os.listdir(input_folder):
                 options["D"]
             ])
 
-    if not rows:
+    if not found_any:
         print(f"⚠️ No questions found in: {filename}")
 
-    all_rows.extend(rows)
-
-# ✅ Write all results to CSV
-with open(output_file, "w", newline="", encoding="utf-8") as csvfile:
-    writer = csv.writer(csvfile)
+# -------------------------------------------------------------------
+# SAVE OUTPUT CSV
+# -------------------------------------------------------------------
+with open(output_file, "w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
     writer.writerow([
-        "File Name", "Section", "Directions", "Question No",
+        "File Name", "Section", "Question No",
         "Question Text", "Option A", "Option B", "Option C", "Option D"
     ])
     writer.writerows(all_rows)
 
-print(f"\n✅ Completed! Extracted {len(all_rows)} questions.")
-print(f"📁 Output file saved as: {os.path.abspath(output_file)}")
+print("\n✅ Completed!")
+print(f"📁 Saved: {os.path.abspath(output_file)}")
+print(f"📌 Total Questions Extracted: {len(all_rows)}")
