@@ -148,10 +148,6 @@ def is_likely_diagram(contour, img_width, img_height):
     if area < min_area or w < 50 or h < 50:
         return False
     
-    # Skip if too large (almost full page)
-    if w > 0.9 * img_width and h > 0.9 * img_height:
-        return False
-    
     # Skip very wide or very tall thin regions (likely text lines)
     aspect_ratio = w / h if h > 0 else 0
     if aspect_ratio > 12 or aspect_ratio < 0.08:
@@ -162,6 +158,31 @@ def is_likely_diagram(contour, img_width, img_height):
         return False
     
     return True
+
+def get_content_width(img_array):
+    """Detect content width by analyzing horizontal pixel density."""
+    gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
+    
+    # Calculate horizontal projection (sum of non-white pixels per column)
+    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    horizontal_projection = np.sum(thresh, axis=0)
+    
+    # Find left and right boundaries where content starts
+    threshold = np.max(horizontal_projection) * 0.05  # 5% of max density
+    
+    left_bound = 0
+    for i in range(len(horizontal_projection)):
+        if horizontal_projection[i] > threshold:
+            left_bound = max(0, i - 10)  # Small buffer
+            break
+    
+    right_bound = len(horizontal_projection) - 1
+    for i in range(len(horizontal_projection)-1, -1, -1):
+        if horizontal_projection[i] > threshold:
+            right_bound = min(len(horizontal_projection)-1, i + 10)  # Small buffer
+            break
+    
+    return left_bound, right_bound
 
 def extract_from_pdf(pdf_path):
     pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
@@ -184,6 +205,11 @@ def extract_from_pdf(pdf_path):
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         img_array = np.array(img)[:, :, ::-1].copy()
 
+        # Get content width (excluding margins)
+        left_bound, right_bound = get_content_width(img_array)
+        content_width = right_bound - left_bound
+        print(f"    Content area: {left_bound} to {right_bound} (width: {content_width}px)")
+
         gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
         th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
@@ -200,12 +226,11 @@ def extract_from_pdf(pdf_path):
                 
             x, y, w, h = cv2.boundingRect(cnt)
             
-            # Expand box
-            pad_w = int(0.1 * w + base_pad)
+            # UPDATED: Use content width (excluding margins) instead of full page width
             pad_h = int(0.1 * h + base_pad)
-            x0 = max(0, x - pad_w)
+            x0 = left_bound  # Start from content left boundary
             y0 = max(0, y - pad_h)
-            x1 = min(pix.width, x + w + pad_w)
+            x1 = right_bound  # End at content right boundary
             y1 = min(pix.height, y + h + pad_h)
             boxes.append((x0, y0, x1, y1))
 
