@@ -11,7 +11,7 @@ import re
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # === SETTINGS ===
-input_folder = r"C:\Users\menha\Downloads\test12"
+input_folder = r"D:\Vector Academy\Contents\PYQ\Gate"
 output_folder = os.path.join(input_folder, "extracted_diagrams_fixed")
 os.makedirs(output_folder, exist_ok=True)
 
@@ -193,63 +193,77 @@ def is_likely_diagram(contour, img_width, img_height):
     return True
 
 def get_content_width(img_array):
-    """Detect content width by analyzing horizontal pixel density - IMPROVED for full text width."""
+    """Detect ACTUAL TEXT CONTENT width by analyzing horizontal pixel density - IMPROVED."""
     gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
     
     # Calculate horizontal projection (sum of non-white pixels per column)
     _, thresh = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY_INV)
     
-    # Apply morphological operations to remove noise
-    kernel = np.ones((3, 3), np.uint8)
-    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    # Apply morphological operations to remove noise and connect text regions
+    kernel_horizontal = np.ones((1, 15), np.uint8)  # Horizontal kernel to connect text
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_horizontal)
     
     horizontal_projection = np.sum(thresh, axis=0)
     
-    # Find left and right boundaries where content starts
-    threshold = np.max(horizontal_projection) * 0.02
+    # Use a more sensitive threshold to detect text regions
+    threshold = np.max(horizontal_projection) * 0.01  # More sensitive threshold
     
-    # Find left boundary
+    # Find left boundary - first column with significant content
     left_bound = 0
     for i in range(len(horizontal_projection)):
         if horizontal_projection[i] > threshold:
-            left_bound = max(0, i - 10)  # Reduced padding
+            left_bound = max(0, i - 5)  # Minimal padding
             break
     
-    # Find right boundary  
+    # Find right boundary - last column with significant content  
     right_bound = len(horizontal_projection) - 1
     for i in range(len(horizontal_projection)-1, -1, -1):
         if horizontal_projection[i] > threshold:
-            right_bound = min(len(horizontal_projection)-1, i + 10)  # Reduced padding
+            right_bound = min(len(horizontal_projection)-1, i + 5)  # Minimal padding
             break
     
-    # Additional check: Ensure we capture the full text region width
-    # Look for continuous content regions
-    content_threshold = np.max(horizontal_projection) * 0.1
-    content_regions = horizontal_projection > content_threshold
+    # Additional refinement: Look for the main text block
+    # Calculate moving average to find consistent text regions
+    window_size = 20
+    moving_avg = np.convolve(horizontal_projection, np.ones(window_size)/window_size, mode='same')
     
-    # Find the leftmost and rightmost content regions
-    if np.any(content_regions):
-        content_indices = np.where(content_regions)[0]
-        if len(content_indices) > 0:
-            detected_left = max(0, content_indices[0] - 15)
-            detected_right = min(len(horizontal_projection)-1, content_indices[-1] + 15)
+    # Find regions where moving average exceeds threshold
+    text_regions = moving_avg > (np.max(moving_avg) * 0.05)
+    
+    if np.any(text_regions):
+        text_indices = np.where(text_regions)[0]
+        if len(text_indices) > 0:
+            refined_left = max(0, text_indices[0] - 8)
+            refined_right = min(len(horizontal_projection)-1, text_indices[-1] + 8)
             
-            # Use the wider of the two detections
-            if (detected_right - detected_left) > (right_bound - left_bound):
-                left_bound = detected_left
-                right_bound = detected_right
+            # Use the refined bounds if they make sense
+            refined_width = refined_right - refined_left
+            original_width = right_bound - left_bound
+            
+            # Prefer the bounds that give us a reasonable text width (neither too narrow nor too wide)
+            if 0.5 * original_width < refined_width < 1.2 * original_width:
+                left_bound = refined_left
+                right_bound = refined_right
     
-    # Final safety check - ensure reasonable width
-    min_content_width = len(horizontal_projection) * 0.7  # Increased to 70%
-    current_width = right_bound - left_bound
+    # Final validation - ensure we have reasonable text width
+    # Typical text content is between 60-90% of page width
+    page_width = len(horizontal_projection)
+    content_width = right_bound - left_bound
+    min_reasonable_width = page_width * 0.6
+    max_reasonable_width = page_width * 0.95
     
-    if current_width < min_content_width:
-        # Expand to capture more content
-        expansion = (min_content_width - current_width) / 2
-        left_bound = max(0, int(left_bound - expansion))
-        right_bound = min(len(horizontal_projection)-1, int(right_bound + expansion))
+    if content_width < min_reasonable_width:
+        # Expand slightly to capture more content
+        expand_by = (min_reasonable_width - content_width) / 2
+        left_bound = max(0, int(left_bound - expand_by))
+        right_bound = min(page_width - 1, int(right_bound + expand_by))
+    elif content_width > max_reasonable_width:
+        # Contract slightly - we're probably including margins
+        contract_by = (content_width - max_reasonable_width) / 2
+        left_bound = min(page_width - 1, int(left_bound + contract_by))
+        right_bound = max(0, int(right_bound - contract_by))
     
-    print(f"    Content bounds: {left_bound} to {right_bound} (width: {right_bound - left_bound}px)")
+    print(f"    Text content bounds: {left_bound} to {right_bound} (width: {right_bound - left_bound}px, {((right_bound - left_bound)/page_width)*100:.1f}% of page)")
     return left_bound, right_bound
 
 def extract_from_pdf(pdf_path, relative_path=""):
@@ -294,7 +308,7 @@ def extract_from_pdf(pdf_path, relative_path=""):
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         img_array = np.array(img)[:, :, ::-1].copy()
 
-        # Get content width (excluding margins) - FULL TEXT WIDTH
+        # Get ACTUAL TEXT CONTENT width (excluding margins)
         left_bound, right_bound = get_content_width(img_array)
 
         gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
@@ -313,11 +327,11 @@ def extract_from_pdf(pdf_path, relative_path=""):
                 
             x, y, w, h = cv2.boundingRect(cnt)
             
-            # UPDATED: Use full content width (left_bound to right_bound)
-            pad_h = int(0.14 * h + base_pad)
-            x0 = left_bound  # Start from content left boundary
+            # Use ACTUAL TEXT CONTENT width (left_bound to right_bound)
+            pad_h = int(0.15 * h + base_pad)
+            x0 = left_bound  # Start from text content left boundary
             y0 = max(0, y - pad_h)
-            x1 = right_bound  # End at content right boundary (FULL WIDTH)
+            x1 = right_bound  # End at text content right boundary
             y1 = min(pix.height, y + h + pad_h)
             boxes.append((x0, y0, x1, y1))
 
@@ -339,7 +353,7 @@ def extract_from_pdf(pdf_path, relative_path=""):
             crop_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
             
             # Detect options in the image
-            ocr_text = pytesseract.image_to_string(crop_pil, config='--psm 6').upper()
+            ocr_text = pytesseract.image_to_string(crop_pil, config='psm 6').upper()
             option = ""
             for opt in ["A", "B", "C", "D"]:
                 if f"({opt})" in ocr_text or f"{opt}." in ocr_text:
