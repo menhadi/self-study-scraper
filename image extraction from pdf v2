@@ -11,13 +11,46 @@ import re
 pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 
 # === SETTINGS ===
-input_folder = r"C:\Users\menha\Downloads\test11"
+input_folder = r"C:\Users\menha\Downloads\test12"
 output_folder = os.path.join(input_folder, "extracted_diagrams_fixed")
 os.makedirs(output_folder, exist_ok=True)
 
 zoom = 3.5
 base_pad = 15
 min_area = 3000
+
+# === SCANNED PDF DETECTION ===
+def is_scanned_pdf(pdf_path):
+    """Check if PDF is scanned (image-based) rather than text-based."""
+    try:
+        doc = fitz.open(pdf_path)
+        text_count = 0
+        image_count = 0
+        
+        # Check first few pages to determine PDF type
+        for pno in range(min(3, len(doc))):
+            page = doc[pno]
+            
+            # Count text blocks
+            text_blocks = page.get_text("text")
+            if text_blocks.strip():
+                text_count += 1
+            
+            # Count images
+            image_list = page.get_images()
+            if image_list:
+                image_count += 1
+        
+        doc.close()
+        
+        # If mostly images and little text, consider it scanned
+        is_scanned = image_count > 0 and text_count == 0
+        print(f"    PDF Type Detection: text_pages={text_count}, image_pages={image_count}, scanned={is_scanned}")
+        return is_scanned
+        
+    except Exception as e:
+        print(f"    Error detecting PDF type: {e}")
+        return False  # Default to process if detection fails
 
 # === IMPROVED QUESTION NUMBER EXTRACTION ===
 def extract_question_numbers_from_page(page):
@@ -160,38 +193,94 @@ def is_likely_diagram(contour, img_width, img_height):
     return True
 
 def get_content_width(img_array):
-    """Detect content width by analyzing horizontal pixel density."""
+    """Detect content width by analyzing horizontal pixel density - IMPROVED for full text width."""
     gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
     
     # Calculate horizontal projection (sum of non-white pixels per column)
-    _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
+    _, thresh = cv2.threshold(gray, 220, 255, cv2.THRESH_BINARY_INV)
+    
+    # Apply morphological operations to remove noise
+    kernel = np.ones((3, 3), np.uint8)
+    thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
+    
     horizontal_projection = np.sum(thresh, axis=0)
     
     # Find left and right boundaries where content starts
-    threshold = np.max(horizontal_projection) * 0.05  # 5% of max density
+    threshold = np.max(horizontal_projection) * 0.02
     
+    # Find left boundary
     left_bound = 0
     for i in range(len(horizontal_projection)):
         if horizontal_projection[i] > threshold:
-            left_bound = max(0, i - 10)  # Small buffer
+            left_bound = max(0, i - 10)  # Reduced padding
             break
     
+    # Find right boundary  
     right_bound = len(horizontal_projection) - 1
     for i in range(len(horizontal_projection)-1, -1, -1):
         if horizontal_projection[i] > threshold:
-            right_bound = min(len(horizontal_projection)-1, i + 10)  # Small buffer
+            right_bound = min(len(horizontal_projection)-1, i + 10)  # Reduced padding
             break
     
+    # Additional check: Ensure we capture the full text region width
+    # Look for continuous content regions
+    content_threshold = np.max(horizontal_projection) * 0.1
+    content_regions = horizontal_projection > content_threshold
+    
+    # Find the leftmost and rightmost content regions
+    if np.any(content_regions):
+        content_indices = np.where(content_regions)[0]
+        if len(content_indices) > 0:
+            detected_left = max(0, content_indices[0] - 15)
+            detected_right = min(len(horizontal_projection)-1, content_indices[-1] + 15)
+            
+            # Use the wider of the two detections
+            if (detected_right - detected_left) > (right_bound - left_bound):
+                left_bound = detected_left
+                right_bound = detected_right
+    
+    # Final safety check - ensure reasonable width
+    min_content_width = len(horizontal_projection) * 0.7  # Increased to 70%
+    current_width = right_bound - left_bound
+    
+    if current_width < min_content_width:
+        # Expand to capture more content
+        expansion = (min_content_width - current_width) / 2
+        left_bound = max(0, int(left_bound - expansion))
+        right_bound = min(len(horizontal_projection)-1, int(right_bound + expansion))
+    
+    print(f"    Content bounds: {left_bound} to {right_bound} (width: {right_bound - left_bound}px)")
     return left_bound, right_bound
 
-def extract_from_pdf(pdf_path):
+def extract_from_pdf(pdf_path, relative_path=""):
+    # Check if file exists
+    if not os.path.exists(pdf_path):
+        print(f"❌ File not found: {pdf_path}")
+        return
+        
+    # Check if PDF is scanned - only process scanned PDFs
+    if not is_scanned_pdf(pdf_path):
+        print(f"⏭️  Skipping non-scanned PDF: {pdf_path}")
+        return
+        
     pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
-    pdf_out_dir = os.path.join(output_folder, pdf_name)
+    
+    # Create output directory structure that mirrors input structure
+    if relative_path:
+        pdf_out_dir = os.path.join(output_folder, relative_path, pdf_name)
+    else:
+        pdf_out_dir = os.path.join(output_folder, pdf_name)
+        
     os.makedirs(pdf_out_dir, exist_ok=True)
 
-    doc = fitz.open(pdf_path)
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception as e:
+        print(f"❌ Error opening PDF {pdf_path}: {e}")
+        return
+
     total_saved = 0
-    print(f"\n📘 Processing {pdf_name} ({len(doc)} pages)...")
+    print(f"\n📘 Processing SCANNED PDF {pdf_path} ({len(doc)} pages)...")
 
     for pno in range(len(doc)):
         page = doc[pno]
@@ -205,10 +294,8 @@ def extract_from_pdf(pdf_path):
         img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
         img_array = np.array(img)[:, :, ::-1].copy()
 
-        # Get content width (excluding margins)
+        # Get content width (excluding margins) - FULL TEXT WIDTH
         left_bound, right_bound = get_content_width(img_array)
-        content_width = right_bound - left_bound
-        print(f"    Content area: {left_bound} to {right_bound} (width: {content_width}px)")
 
         gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
         blur = cv2.GaussianBlur(gray, (5, 5), 0)
@@ -226,19 +313,27 @@ def extract_from_pdf(pdf_path):
                 
             x, y, w, h = cv2.boundingRect(cnt)
             
-            # UPDATED: Use content width (excluding margins) instead of full page width
-            pad_h = int(0.1 * h + base_pad)
+            # UPDATED: Use full content width (left_bound to right_bound)
+            pad_h = int(0.14 * h + base_pad)
             x0 = left_bound  # Start from content left boundary
             y0 = max(0, y - pad_h)
-            x1 = right_bound  # End at content right boundary
+            x1 = right_bound  # End at content right boundary (FULL WIDTH)
             y1 = min(pix.height, y + h + pad_h)
             boxes.append((x0, y0, x1, y1))
 
         # Sort boxes top-to-bottom
         boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
 
+        # Remove duplicates and very small boxes
+        boxes = [box for box in boxes if (box[2]-box[0]) * (box[3]-box[1]) > 5000]
+
         for idx, (x0, y0, x1, y1) in enumerate(boxes, start=1):
             crop = img_array[y0:y1, x0:x1]
+            
+            # Skip if it's mostly white space
+            gray_crop = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+            if np.mean(gray_crop) > 240:  # Mostly white
+                continue
             
             # Convert to PIL for OCR
             crop_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
@@ -265,17 +360,49 @@ def extract_from_pdf(pdf_path):
         print(f"  Page {pno+1}: saved {len(boxes)} diagrams")
 
     doc.close()
-    print(f"✅ Finished {pdf_name}: total {total_saved} diagrams saved.\n")
+    print(f"✅ Finished {pdf_path}: total {total_saved} diagrams saved.\n")
+
+def find_pdf_files(root_folder):
+    """Find all PDF files recursively in all subfolders."""
+    pdf_files = []
+    for root, dirs, files in os.walk(root_folder):
+        # Skip the output folder to avoid processing extracted images
+        if "extracted_diagrams_fixed" in root:
+            continue
+            
+        for file in files:
+            if file.lower().endswith('.pdf'):
+                full_path = os.path.join(root, file)
+                # Calculate relative path for output directory structure
+                relative_path = os.path.relpath(root, root_folder)
+                if relative_path == '.':
+                    relative_path = ""
+                pdf_files.append((full_path, relative_path))
+                print(f"📄 Found PDF: {full_path}")
+    return pdf_files
 
 # === MAIN LOOP ===
-pdf_files = [os.path.join(input_folder, f) for f in os.listdir(input_folder) if f.lower().endswith(".pdf")]
-pdf_files.sort()
+print(f"🔍 Searching for PDF files in: {input_folder}")
+print(f"📁 Output folder: {output_folder}")
 
-if not pdf_files:
-    print("❌ No PDF files found in the folder.")
+# Find all PDF files recursively in all subfolders
+pdf_files_with_paths = find_pdf_files(input_folder)
+pdf_files_with_paths.sort(key=lambda x: x[0])  # Sort by file path
+
+if not pdf_files_with_paths:
+    print("❌ No PDF files found in the folder or subfolders.")
+    print("💡 Check that:")
+    print("   - The input folder path is correct")
+    print("   - PDF files exist in the folder or subfolders")
+    print("   - File extensions are .pdf (case insensitive)")
 else:
-    for pdf in pdf_files:
-        extract_from_pdf(pdf)
+    print(f"🎯 Found {len(pdf_files_with_paths)} PDF files to process:")
+    for pdf_path, relative_path in pdf_files_with_paths:
+        print(f"   - {pdf_path}")
+    
+    print("\n🚀 Starting extraction (SCANNED PDFs ONLY)...")
+    for pdf_path, relative_path in pdf_files_with_paths:
+        extract_from_pdf(pdf_path, relative_path)
 
-print("\n🎉 All PDFs processed successfully!")
-print(f"Images saved in: {output_folder}")
+print("\n🎉 All SCANNED PDFs processed successfully!")
+print(f"📂 Images saved in: {output_folder}")
