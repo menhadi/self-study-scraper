@@ -1,0 +1,209 @@
+import fitz           # PyMuPDF
+import cv2
+import numpy as np
+import os
+from PIL import Image
+import pytesseract
+from pytesseract import Output
+import re
+
+# Set this if Tesseract is not in PATH (for Windows)
+pytesseract.pytesseract.tesseract_cmd = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+
+# === SETTINGS ===
+input_folder = r"C:\Users\menha\Downloads\test11"
+output_folder = os.path.join(input_folder, "extracted_diagrams_fixed")
+os.makedirs(output_folder, exist_ok=True)
+
+zoom = 3.5
+base_pad = 15
+min_area = 3000
+
+# === IMPROVED FUNCTIONS ===
+def extract_question_numbers_from_page(page):
+    """Extract ALL question numbers from the page text with improved patterns."""
+    text = page.get_text()
+    question_numbers = []
+    
+    # More comprehensive patterns for question numbers
+    patterns = [
+        r'Q\s*\.\s*(\d+)',                    # Q.19
+        r'Q\s*(\d+)',                         # Q19
+        r'Question\s*(\d+)',                  # Question 19
+        r'^\s*(\d+)\s*\.',                    # 19. (start of line)
+        r'\(\s*(\d+)\s*\)',                   # (19)
+        r'Q\s*\.\s*(\d+)\s*[A-Z]',           # Q.19 In a thin...
+        r'Q\s*\.\s*(\d+)\s*\(',              # Q.19 (A) zero
+        r'QUESTION\s*(\d+)\s*:',              # QUESTION 19:
+        r'Q\s*-\s*(\d+)',                     # Q-19
+        r'\[(\d+)\]',                         # [19]
+    ]
+    
+    for pattern in patterns:
+        matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
+        for match in matches:
+            if match.isdigit():
+                question_numbers.append(f"Q{match}")
+    
+    return list(set(question_numbers))  # Remove duplicates
+
+def get_best_question_number_for_image(crop_img, page_question_numbers, page_text_snippet):
+    """Determine the best question number for this specific image."""
+    # Try OCR on the cropped image first
+    ocr_text = pytesseract.image_to_string(crop_img, config='--psm 6')
+    ocr_text_upper = ocr_text.upper()
+    
+    # Look for question numbers in OCR text
+    ocr_patterns = [
+        r'Q\s*\.\s*(\d+)',
+        r'Q\s*(\d+)',
+        r'QUESTION\s*(\d+)',
+        r'(\d+)\s*\.'
+    ]
+    
+    for pattern in ocr_patterns:
+        match = re.search(pattern, ocr_text_upper)
+        if match:
+            q_num = match.group(1)
+            return f"Q{q_num}"
+    
+    # If multiple question numbers on page, try to find the closest one
+    if len(page_question_numbers) == 1:
+        return page_question_numbers[0]
+    elif len(page_question_numbers) > 1:
+        # For multiple questions, check if OCR text contains any question context
+        for q_num in page_question_numbers:
+            if q_num.replace('Q', '') in ocr_text:
+                return q_num
+        # Return the first one as fallback
+        return page_question_numbers[0]
+    
+    return ""
+
+def is_likely_diagram(contour, img_width, img_height):
+    """Better heuristic to identify actual diagrams vs text blocks."""
+    x, y, w, h = cv2.boundingRect(contour)
+    area = w * h
+    
+    # Skip if too small
+    if area < min_area or w < 50 or h < 50:
+        return False
+    
+    # Skip if too large (almost full page)
+    if w > 0.9 * img_width and h > 0.9 * img_height:
+        return False
+    
+    # Skip very wide or very tall thin regions (likely text lines)
+    aspect_ratio = w / h if h > 0 else 0
+    if aspect_ratio > 12 or aspect_ratio < 0.08:
+        return False
+    
+    # Skip very small regions that are likely text
+    if area < 5000 and (w < 80 or h < 80):
+        return False
+    
+    return True
+
+def extract_from_pdf(pdf_path):
+    pdf_name = os.path.splitext(os.path.basename(pdf_path))[0]
+    pdf_out_dir = os.path.join(output_folder, pdf_name)
+    os.makedirs(pdf_out_dir, exist_ok=True)
+
+    doc = fitz.open(pdf_path)
+    total_saved = 0
+    print(f"\n📘 Processing {pdf_name} ({len(doc)} pages)...")
+
+    for pno in range(len(doc)):
+        page = doc[pno]
+        
+        # Extract ALL question numbers from page text
+        page_question_numbers = extract_question_numbers_from_page(page)
+        page_text = page.get_text()[:1000]  # First 1000 chars for context
+        
+        print(f"  Page {pno+1}: Found question numbers: {page_question_numbers}")
+
+        # Process page for images
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        img_array = np.array(img)[:, :, ::-1].copy()
+
+        gray = cv2.cvtColor(img_array, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        th = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                   cv2.THRESH_BINARY_INV, 11, 9)
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (7, 7))
+        closed = cv2.morphologyEx(th, cv2.MORPH_CLOSE, kernel)
+
+        contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        boxes = []
+
+        for cnt in contours:
+            if not is_likely_diagram(cnt, pix.width, pix.height):
+                continue
+                
+            x, y, w, h = cv2.boundingRect(cnt)
+            
+            # Expand box
+            pad_w = int(0.1 * w + base_pad)
+            pad_h = int(0.1 * h + base_pad)
+            x0 = max(0, x - pad_w)
+            y0 = max(0, y - pad_h)
+            x1 = min(pix.width, x + w + pad_w)
+            y1 = min(pix.height, y + h + pad_h)
+            boxes.append((x0, y0, x1, y1))
+
+        # Sort boxes top-to-bottom
+        boxes = sorted(boxes, key=lambda b: (b[1], b[0]))
+
+        for idx, (x0, y0, x1, y1) in enumerate(boxes, start=1):
+            crop = img_array[y0:y1, x0:x1]
+            
+            # Convert to PIL for OCR
+            crop_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
+            
+            # Get the best question number for this specific image
+            best_qnum = get_best_question_number_for_image(crop_pil, page_question_numbers, page_text)
+            
+            if best_qnum:
+                qnum_label = best_qnum
+            elif page_question_numbers:
+                qnum_label = page_question_numbers[0]  # Use first found question number
+            else:
+                qnum_label = f"P{pno+1}"  # Fallback to page number
+            
+            # Also detect options in the image
+            ocr_text = pytesseract.image_to_string(crop_pil, config='--psm 6').upper()
+            option = ""
+            for opt in ["A", "B", "C", "D"]:
+                if f"({opt})" in ocr_text or f"{opt}." in ocr_text:
+                    option = opt
+                    break
+            
+            opt_label = f"_{option}" if option else ""
+            
+            # Create filename
+            img_name = f"{pdf_name}_{qnum_label}{opt_label}_img{idx:02d}.png"
+            safe_img_name = "".join(c for c in img_name if c.isalnum() or c in "._-")
+            
+            cv2.imwrite(os.path.join(pdf_out_dir, safe_img_name), crop)
+            total_saved += 1
+            
+            print(f"    Saved: {safe_img_name}")
+
+        print(f"  Page {pno+1}: saved {len(boxes)} diagrams")
+
+    doc.close()
+    print(f"✅ Finished {pdf_name}: total {total_saved} diagrams saved.\n")
+
+# === MAIN LOOP ===
+pdf_files = [os.path.join(input_folder, f) for f in os.listdir(input_folder) if f.lower().endswith(".pdf")]
+pdf_files.sort()
+
+if not pdf_files:
+    print("❌ No PDF files found in the folder.")
+else:
+    for pdf in pdf_files:
+        extract_from_pdf(pdf)
+
+print("\n🎉 All PDFs processed successfully!")
+print(f"Images saved in: {output_folder}")
