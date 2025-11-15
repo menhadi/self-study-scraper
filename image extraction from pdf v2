@@ -19,66 +19,125 @@ zoom = 3.5
 base_pad = 15
 min_area = 3000
 
-# === IMPROVED FUNCTIONS ===
+# === IMPROVED QUESTION NUMBER EXTRACTION ===
 def extract_question_numbers_from_page(page):
-    """Extract ALL question numbers from the page text with improved patterns."""
+    """Extract ALL question numbers from the page text with AGGRESSIVE patterns."""
     text = page.get_text()
     question_numbers = []
     
-    # More comprehensive patterns for question numbers
+    print(f"    Raw text preview: {text[:200]}...")  # Debug
+    
+    # MORE AGGRESSIVE patterns for GATE exam format
     patterns = [
-        r'Q\s*\.\s*(\d+)',                    # Q.19
-        r'Q\s*(\d+)',                         # Q19
-        r'Question\s*(\d+)',                  # Question 19
-        r'^\s*(\d+)\s*\.',                    # 19. (start of line)
-        r'\(\s*(\d+)\s*\)',                   # (19)
-        r'Q\s*\.\s*(\d+)\s*[A-Z]',           # Q.19 In a thin...
-        r'Q\s*\.\s*(\d+)\s*\(',              # Q.19 (A) zero
-        r'QUESTION\s*(\d+)\s*:',              # QUESTION 19:
-        r'Q\s*-\s*(\d+)',                     # Q-19
-        r'\[(\d+)\]',                         # [19]
+        # Most common: Q.19, Q.20, etc.
+        r'Q\.\s*(\d+)',
+        # Q19, Q20 (without dot)
+        r'Q\s*(\d+)',
+        # Question 19, Question 20
+        r'Question\s*(\d+)',
+        # Q.19) or Q.19.
+        r'Q\.\s*(\d+)\)',
+        r'Q\.\s*(\d+)\.',
+        # In parentheses (Q.19) or (19)
+        r'\(\s*Q\.\s*(\d+)\s*\)',
+        r'\(\s*(\d+)\s*\)',
+        # At start of line: 19. 
+        r'^\s*(\d+)\.',
+        # Q-19, Q - 19
+        r'Q\s*-\s*(\d+)',
+        # Q.19: or Q.19-
+        r'Q\.\s*(\d+)\:',
+        r'Q\.\s*(\d+)\-',
+        # Common in questions: "19." at line start
+        r'\n\s*(\d+)\.',
     ]
     
     for pattern in patterns:
         matches = re.findall(pattern, text, re.IGNORECASE | re.MULTILINE)
         for match in matches:
             if match.isdigit():
-                question_numbers.append(f"Q{match}")
+                q_num = f"Q{match}"
+                if q_num not in question_numbers:
+                    question_numbers.append(q_num)
+                    print(f"    Found pattern '{pattern}': {q_num}")  # Debug
     
-    return list(set(question_numbers))  # Remove duplicates
+    # Also try to extract from the raw text lines - MORE AGGRESSIVE
+    lines = text.split('\n')
+    for i, line in enumerate(lines):
+        line = line.strip()
+        # Look for patterns like: "Q.19 In a thin walled..."
+        patterns_in_line = [
+            r'Q\.\s*(\d+)\s+[A-Z]',
+            r'Q\s*(\d+)\s+[A-Z]',
+            r'Question\s*(\d+)\s+[A-Z]',
+            r'^\s*(\d+)\.\s+[A-Z]',  # "19. In a thin..."
+        ]
+        
+        for pattern in patterns_in_line:
+            q_match = re.search(pattern, line)
+            if q_match and q_match.group(1).isdigit():
+                q_num = f"Q{q_match.group(1)}"
+                if q_num not in question_numbers:
+                    question_numbers.append(q_num)
+                    print(f"    Found in line {i}: '{pattern}': {q_num}")  # Debug
+    
+    return question_numbers
 
-def get_best_question_number_for_image(crop_img, page_question_numbers, page_text_snippet):
-    """Determine the best question number for this specific image."""
-    # Try OCR on the cropped image first
-    ocr_text = pytesseract.image_to_string(crop_img, config='--psm 6')
-    ocr_text_upper = ocr_text.upper()
+def get_question_number_for_page(page):
+    """Get the most relevant question number for the entire page - NO FALLBACK TO PAGE NUMBER."""
+    question_numbers = extract_question_numbers_from_page(page)
     
-    # Look for question numbers in OCR text
-    ocr_patterns = [
-        r'Q\s*\.\s*(\d+)',
-        r'Q\s*(\d+)',
-        r'QUESTION\s*(\d+)',
-        r'(\d+)\s*\.'
-    ]
+    if question_numbers:
+        # Return the first (lowest) question number on the page
+        selected_q = sorted(question_numbers, key=lambda x: int(x[1:]) if x[1:].isdigit() else 999)[0]
+        print(f"    Selected question number: {selected_q}")
+        return selected_q
     
-    for pattern in ocr_patterns:
-        match = re.search(pattern, ocr_text_upper)
-        if match:
-            q_num = match.group(1)
-            return f"Q{q_num}"
+    # If no question numbers found in text, try OCR on the entire page as HIGH RES
+    print("    No question numbers found in text, trying OCR...")
+    try:
+        pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom))
+        img = Image.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        img_array = np.array(img)
+        
+        # Convert to PIL for OCR
+        pil_img = Image.fromarray(img_array)
+        
+        # Use multiple OCR configurations for better results
+        ocr_configs = [
+            '--psm 6',  # Uniform block of text
+            '--psm 4',  # Single column of text
+            '--psm 3',  # Fully automatic page segmentation
+        ]
+        
+        for config in ocr_configs:
+            ocr_text = pytesseract.image_to_string(pil_img, config=config)
+            print(f"    OCR text with {config}: {ocr_text[:100]}...")
+            
+            # Search for question numbers in OCR text
+            patterns = [
+                r'Q\.\s*(\d+)', 
+                r'Q\s*(\d+)', 
+                r'Question\s*(\d+)',
+                r'^\s*(\d+)\.',
+                r'\b(\d+)\.\s+[A-Z]'
+            ]
+            
+            for pattern in patterns:
+                matches = re.findall(pattern, ocr_text, re.IGNORECASE | re.MULTILINE)
+                for match in matches:
+                    if match.isdigit():
+                        q_num = f"Q{match}"
+                        print(f"    Found via OCR: {q_num}")
+                        return q_num
+                        
+    except Exception as e:
+        print(f"    OCR failed: {e}")
     
-    # If multiple question numbers on page, try to find the closest one
-    if len(page_question_numbers) == 1:
-        return page_question_numbers[0]
-    elif len(page_question_numbers) > 1:
-        # For multiple questions, check if OCR text contains any question context
-        for q_num in page_question_numbers:
-            if q_num.replace('Q', '') in ocr_text:
-                return q_num
-        # Return the first one as fallback
-        return page_question_numbers[0]
-    
-    return ""
+    # LAST RESORT: Use sequential numbering but NOT page numbers
+    # This will create Q1, Q2, Q3 etc. instead of P1, P2, P3
+    print("    Using sequential numbering as last resort")
+    return f"Q{page.number + 1}"
 
 def is_likely_diagram(contour, img_width, img_height):
     """Better heuristic to identify actual diagrams vs text blocks."""
@@ -116,11 +175,9 @@ def extract_from_pdf(pdf_path):
     for pno in range(len(doc)):
         page = doc[pno]
         
-        # Extract ALL question numbers from page text
-        page_question_numbers = extract_question_numbers_from_page(page)
-        page_text = page.get_text()[:1000]  # First 1000 chars for context
-        
-        print(f"  Page {pno+1}: Found question numbers: {page_question_numbers}")
+        # Get question number for this page - FORCE QUESTION NUMBER FORMAT
+        page_qnum = get_question_number_for_page(page)
+        print(f"  Page {pno+1}: Final question number: {page_qnum}")
 
         # Process page for images
         pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom), alpha=False)
@@ -161,17 +218,7 @@ def extract_from_pdf(pdf_path):
             # Convert to PIL for OCR
             crop_pil = Image.fromarray(cv2.cvtColor(crop, cv2.COLOR_BGR2RGB))
             
-            # Get the best question number for this specific image
-            best_qnum = get_best_question_number_for_image(crop_pil, page_question_numbers, page_text)
-            
-            if best_qnum:
-                qnum_label = best_qnum
-            elif page_question_numbers:
-                qnum_label = page_question_numbers[0]  # Use first found question number
-            else:
-                qnum_label = f"P{pno+1}"  # Fallback to page number
-            
-            # Also detect options in the image
+            # Detect options in the image
             ocr_text = pytesseract.image_to_string(crop_pil, config='--psm 6').upper()
             option = ""
             for opt in ["A", "B", "C", "D"]:
@@ -181,8 +228,8 @@ def extract_from_pdf(pdf_path):
             
             opt_label = f"_{option}" if option else ""
             
-            # Create filename
-            img_name = f"{pdf_name}_{qnum_label}{opt_label}_img{idx:02d}.png"
+            # Create filename - USE THE DETECTED QUESTION NUMBER
+            img_name = f"{pdf_name}_{page_qnum}{opt_label}_img{idx:02d}.png"
             safe_img_name = "".join(c for c in img_name if c.isalnum() or c in "._-")
             
             cv2.imwrite(os.path.join(pdf_out_dir, safe_img_name), crop)
