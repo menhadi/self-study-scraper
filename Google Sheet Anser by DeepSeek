@@ -1,0 +1,333 @@
+// Configuration - Replace with your actual API key
+const DEEPSEEK_API_KEY = 'sk-467f5288c9ef40a4ae6ccec5978019ea';
+const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions';
+
+// Main function to process questions
+function processQuestions() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const data = sheet.getDataRange().getValues();
+  
+  console.log(`Processing ${data.length - 1} rows...`);
+  
+  // Skip header row
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    
+    // Extract data based on columns (0-based index)
+    const questionText = row[3];  // Column D - Question Text
+    const instructions = row[4];  // Column E - Instructions
+    const optionA = row[5];       // Column F - Option A
+    const optionB = row[6];       // Column G - Option B
+    const optionC = row[7];       // Column H - Option C
+    const optionD = row[8];       // Column I - Option D
+    const questionImage = row[9]; // Column J - Question Image URL
+    const optionAImage = row[10]; // Column K - Option A Image URL
+    const optionBImage = row[11]; // Column L - Option B Image URL
+    const optionCImage = row[12]; // Column M - Option C Image URL
+    const optionDImage = row[13]; // Column N - Option D Image URL
+    const currentStatus = row[14]; // Column O - Status
+    
+    // Check if we should process this row
+    const hasContent = questionText || questionImage || instructions;
+    const needsProcessing = currentStatus === 'pending' || !currentStatus;
+    
+    if (hasContent && needsProcessing) {
+      try {
+        console.log(`Processing row ${i + 1}...`);
+        
+        // Update status to processing
+        sheet.getRange(i + 1, 15).setValue('processing'); // Column O
+        
+        const result = getAnswerFromDeepSeek(
+          questionText, 
+          instructions, 
+          optionA, optionB, optionC, optionD,
+          questionImage,
+          optionAImage, optionBImage, optionCImage, optionDImage
+        );
+        
+        if (result && result.answer) {
+          // Write results to correct columns
+          sheet.getRange(i + 1, 16).setValue(result.answer);        // Column P - Correct Answer
+          sheet.getRange(i + 1, 17).setValue(result.explanation);   // Column Q - Explanation
+          sheet.getRange(i + 1, 15).setValue('done');               // Column O - Status
+          
+          console.log(`✅ Processed row ${i + 1} successfully: ${result.answer}`);
+        } else {
+          sheet.getRange(i + 1, 15).setValue('error - no answer');
+          sheet.getRange(i + 1, 17).setValue('No valid answer generated from API');
+          console.log(`❌ No answer for row ${i + 1}`);
+        }
+        
+      } catch (error) {
+        console.error(`❌ Error processing row ${i + 1}:`, error);
+        sheet.getRange(i + 1, 15).setValue('error');
+        sheet.getRange(i + 1, 17).setValue(error.toString());
+      }
+      
+      // Add delay to avoid rate limits
+      Utilities.sleep(2000);
+    } else {
+      console.log(`⏭️ Skipping row ${i + 1} - Status: ${currentStatus}`);
+    }
+  }
+  
+  console.log('Processing completed!');
+}
+
+// Fixed test function that writes to sheet
+function testSingleRow(rowNumber = 2) {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const row = sheet.getRange(rowNumber, 1, 1, 14).getValues()[0];
+  
+  const questionText = row[3];
+  const instructions = row[4];
+  const optionA = row[5];
+  const optionB = row[6];
+  const optionC = row[7];
+  const optionD = row[8];
+  const questionImage = row[9];
+  const optionAImage = row[10];
+  const optionBImage = row[11];
+  const optionCImage = row[12];
+  const optionDImage = row[13];
+  
+  console.log("Testing row data:");
+  console.log("Question:", questionText);
+  console.log("Instructions:", instructions);
+  console.log("Options:", optionA, optionB, optionC, optionD);
+  console.log("Question Image:", questionImage);
+  console.log("Option Images:", optionAImage, optionBImage, optionCImage, optionDImage);
+  
+  try {
+    const result = getAnswerFromDeepSeek(
+      questionText, instructions, 
+      optionA, optionB, optionC, optionD,
+      questionImage,
+      optionAImage, optionBImage, optionCImage, optionDImage
+    );
+    
+    console.log("Result:", result);
+    
+    // ✅ FIXED: Actually write to the sheet
+    if (result && result.answer) {
+      sheet.getRange(rowNumber, 15).setValue('done');        // Column O - Status
+      sheet.getRange(rowNumber, 16).setValue(result.answer); // Column P - Correct Answer
+      sheet.getRange(rowNumber, 17).setValue(result.explanation); // Column Q - Explanation
+      console.log(`✅ Successfully wrote to row ${rowNumber}`);
+    }
+    
+    return result;
+  } catch (error) {
+    console.error("Error in testSingleRow:", error);
+    sheet.getRange(rowNumber, 15).setValue('error');
+    sheet.getRange(rowNumber, 17).setValue(error.toString());
+    return null;
+  }
+}
+
+// Function to mark all rows as pending for processing
+function markAllPending() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const data = sheet.getDataRange().getValues();
+  
+  let count = 0;
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const hasContent = row[3] || row[4] || row[9]; // D, E, or J has content
+    
+    if (hasContent) {
+      sheet.getRange(i + 1, 15).setValue('pending'); // Column O
+      count++;
+    }
+  }
+  
+  console.log(`Marked ${count} rows as pending`);
+  return count;
+}
+
+// Function to process just one pending row (useful for testing)
+function processOneRow() {
+  const sheet = SpreadsheetApp.getActiveSheet();
+  const data = sheet.getDataRange().getValues();
+  
+  for (let i = 1; i < data.length; i++) {
+    const row = data[i];
+    const currentStatus = row[14]; // Column O - Status
+    
+    if (currentStatus === 'pending' || !currentStatus) {
+      console.log(`Found pending row at position ${i + 1}`);
+      return testSingleRow(i + 1);
+    }
+  }
+  
+  console.log('No pending rows found');
+  return null;
+}
+
+// Keep the rest of your existing functions (getAnswerFromDeepSeek, createPrompt, parseDeepSeekResponse, etc.)
+// ... [all the other functions remain the same] ...
+
+function getAnswerFromDeepSeek(questionText, instructions, optionA, optionB, optionC, optionD, 
+                              questionImage, optionAImage, optionBImage, optionCImage, optionDImage) {
+  
+  const prompt = createPrompt(
+    questionText, instructions, 
+    optionA, optionB, optionC, optionD,
+    questionImage,
+    optionAImage, optionBImage, optionCImage, optionDImage
+  );
+  
+  const payload = {
+    model: "deepseek-chat",
+    messages: [
+      {
+        role: "system",
+        content: `You are an expert educational assistant. Analyze questions and provide accurate answers.
+
+CRITICAL INSTRUCTIONS:
+1. Analyze ALL available information - text questions, instructions, options, and image URLs
+2. For fill-in-the-blanks questions without options, provide the direct answer
+3. For multiple choice questions, identify the CORRECT option (A, B, C, or D)
+4. Provide clear, step-by-step explanations
+5. Use LaTeX for mathematical equations: $E = mc^2$ or $$\\frac{1}{2}mv^2$$
+6. If image URLs are provided, consider they might contain essential question/option content
+7. For questions with both text and images, combine information from both
+
+RESPONSE FORMAT:
+ANSWER: [Correct option letter OR direct answer for fill-in-blanks]
+EXPLANATION: [Detailed step-by-step explanation]
+
+IMPORTANT: 
+- If no options exist, provide the direct answer
+- If options exist but are images only, analyze based on the context
+- Accuracy is paramount - be certain before answering`
+      },
+      {
+        role: "user",
+        content: prompt
+      }
+    ],
+    temperature: 0.1,
+    max_tokens: 2500,
+    top_p: 0.1,
+    frequency_penalty: 0,
+    presence_penalty: 0
+  };
+  
+  const options = {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${DEEPSEEK_API_KEY}`
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  };
+  
+  try {
+    const response = UrlFetchApp.fetch(DEEPSEEK_API_URL, options);
+    const responseData = JSON.parse(response.getContentText());
+    
+    if (responseData.choices && responseData.choices[0]) {
+      return parseDeepSeekResponse(responseData.choices[0].message.content);
+    } else {
+      throw new Error('No response from API');
+    }
+  } catch (error) {
+    console.error('API Error:', error);
+    throw error;
+  }
+}
+
+function createPrompt(questionText, instructions, optionA, optionB, optionC, optionD, 
+                     questionImage, optionAImage, optionBImage, optionCImage, optionDImage) {
+  
+  let prompt = "Please analyze this educational question and provide the correct answer with explanation.\n\n";
+  
+  // Add question text if available
+  if (questionText) {
+    prompt += `QUESTION TEXT: ${questionText}\n\n`;
+  }
+  
+  // Add instructions if available
+  if (instructions) {
+    prompt += `INSTRUCTIONS: ${instructions}\n\n`;
+  }
+  
+  // Add question image URL if available
+  if (questionImage) {
+    prompt += `QUESTION IMAGE URL: ${questionImage}\n\n`;
+    prompt += "NOTE: This image may contain essential question content not in the text.\n\n";
+  }
+  
+  // Check if we have any options (text or images)
+  const hasTextOptions = optionA || optionB || optionC || optionD;
+  const hasImageOptions = optionAImage || optionBImage || optionCImage || optionDImage;
+  
+  if (hasTextOptions || hasImageOptions) {
+    prompt += "OPTIONS:\n";
+    
+    // Text options
+    if (optionA) prompt += `A) ${optionA}\n`;
+    if (optionB) prompt += `B) ${optionB}\n`;
+    if (optionC) prompt += `C) ${optionC}\n`;
+    if (optionD) prompt += `D) ${optionD}\n`;
+    
+    // Image options
+    if (optionAImage) prompt += `A Image: ${optionAImage}\n`;
+    if (optionBImage) prompt += `B Image: ${optionBImage}\n`;
+    if (optionCImage) prompt += `C Image: ${optionCImage}\n`;
+    if (optionDImage) prompt += `D Image: ${optionDImage}\n`;
+    
+    prompt += "\n";
+  } else {
+    prompt += "TYPE: Fill-in-the-blanks (No options provided)\n\n";
+  }
+  
+  prompt += `SPECIAL NOTES:
+- If this is a fill-in-the-blanks question without options, provide the direct answer
+- If options are provided as images only, analyze based on available context
+- If both text and image options exist, consider all information
+- Use LaTeX for any mathematical expressions
+- Provide the most accurate answer possible`;
+
+  return prompt;
+}
+
+function parseDeepSeekResponse(responseText) {
+  const result = {
+    answer: '',
+    explanation: ''
+  };
+  
+  console.log("Raw API Response:", responseText);
+  
+  // Extract answer - handle both multiple choice and direct answers
+  const answerMatch = responseText.match(/ANSWER:\s*([A-D]|.*?)(?=\n|EXPLANATION:|$)/i);
+  if (answerMatch) {
+    result.answer = answerMatch[1].trim();
+  } else {
+    // Fallback: try to find the first line as answer
+    const lines = responseText.split('\n');
+    if (lines.length > 0) {
+      result.answer = lines[0].replace(/ANSWER:\s*/i, '').trim();
+    }
+  }
+  
+  // Extract explanation
+  const explanationMatch = responseText.match(/EXPLANATION:\s*([\s\S]*?)$/i);
+  if (explanationMatch) {
+    result.explanation = explanationMatch[1].trim();
+  } else {
+    // Fallback: use everything after ANSWER as explanation
+    const afterAnswer = responseText.replace(/ANSWER:\s*.*?(\n|$)/i, '').trim();
+    if (afterAnswer) {
+      result.explanation = afterAnswer;
+    } else {
+      result.explanation = "Explanation not provided in expected format.";
+    }
+  }
+  
+  return result;
+}
