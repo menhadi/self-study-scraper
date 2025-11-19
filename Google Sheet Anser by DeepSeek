@@ -1,5 +1,5 @@
 // Configuration - Replace with your actual API key
-const DEEPSEEK_API_KEY = 'sk-467f5288c9ef40a4ae6ccec5978019ea';
+const DEEPSEEK_API_KEY = '';
 const DEEPSEEK_API_URL = 'https://api.deepseek.com/v1/chat/completions';
 
 // Main function to process questions
