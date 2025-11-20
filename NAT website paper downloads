@@ -1,0 +1,818 @@
+import os
+import time
+import requests
+import PyPDF2
+import csv
+import concurrent.futures
+import json
+from io import BytesIO
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.support.ui import Select, WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException, NoSuchElementException
+
+# Configuration
+BASE_URL = "https://nta.ac.in/Downloads"
+DOWNLOAD_DIR = r"D:\Vector Academy\Contents\PYQ\NAT"
+os.makedirs(DOWNLOAD_DIR, exist_ok=True)
+
+# Resume tracking file
+RESUME_FILE = os.path.join(DOWNLOAD_DIR, "resume_state.json")
+
+# Performance settings
+MAX_WORKERS = 3  # Concurrent downloads
+REQUEST_TIMEOUT = 20  # Slightly reduced timeout
+
+def load_resume_state():
+    """Load resume state from file"""
+    resume_state = {
+        'current_exam': None,
+        'processed_exams': set(),
+        'processed_pages': {},
+        'last_successful_page': {}
+    }
+    
+    try:
+        if os.path.exists(RESUME_FILE):
+            with open(RESUME_FILE, 'r', encoding='utf-8') as f:
+                loaded_state = json.load(f)
+                resume_state.update(loaded_state)
+                # Convert sets back from lists
+                resume_state['processed_exams'] = set(resume_state.get('processed_exams', []))
+                print(f"📖 Loaded resume state: {len(resume_state['processed_exams'])} exams processed")
+    except Exception as e:
+        print(f"⚠ Could not load resume state: {e}")
+    
+    return resume_state
+
+def save_resume_state(resume_state):
+    """Save resume state to file"""
+    try:
+        # Convert sets to lists for JSON serialization
+        state_to_save = resume_state.copy()
+        state_to_save['processed_exams'] = list(state_to_save['processed_exams'])
+        
+        with open(RESUME_FILE, 'w', encoding='utf-8') as f:
+            json.dump(state_to_save, f, indent=2)
+    except Exception as e:
+        print(f"⚠ Could not save resume state: {e}")
+
+def validate_pdf(pdf_data):
+    """Validate PDF but always return True to ensure download continues"""
+    try:
+        # Basic PDF signature check
+        if not pdf_data.startswith(b'%PDF'):
+            print(f"      ⚠ Not a valid PDF file (missing PDF header)")
+            return "Invalid_Header"
+        
+        # Check file size
+        if len(pdf_data) < 100:
+            print(f"      ⚠ PDF file very small ({len(pdf_data)} bytes)")
+            return "Small_File"
+        
+        # Try to read with PyPDF2 but don't fail on errors
+        try:
+            pdf_file = BytesIO(pdf_data)
+            reader = PyPDF2.PdfReader(pdf_file)
+            num_pages = len(reader.pages)
+            print(f"      ✅ PDF has {num_pages} pages")
+            return f"Valid_{num_pages}pages"
+        except Exception as e:
+            print(f"      ⚠ PDF has readability issues: {str(e)}")
+            return f"Readability_Issue"
+            
+    except Exception as e:
+        print(f"      ⚠ PDF validation error: {str(e)}")
+        return f"Validation_Error"
+
+def download_pdf_fast(url, cookies, headers):
+    """Fast PDF download with single attempt"""
+    try:
+        # Ensure URL is absolute
+        if url.startswith('/'):
+            url = "https://nta.ac.in" + url
+        
+        response = requests.get(url, cookies=cookies, headers=headers, timeout=REQUEST_TIMEOUT)
+        response.raise_for_status()
+        
+        return response.content, "Download_Success"
+                
+    except requests.exceptions.RequestException as e:
+        return None, f"Download_Failed: {str(e)}"
+
+def download_multiple_pdfs(pdf_batch, cookies, headers):
+    """Download multiple PDFs concurrently"""
+    results = []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_pdf = {
+            executor.submit(download_pdf_fast, pdf['url'], cookies, headers): pdf 
+            for pdf in pdf_batch
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_pdf):
+            pdf_info = future_to_pdf[future]
+            try:
+                pdf_data, status = future.result()
+                results.append({
+                    **pdf_info,
+                    'pdf_data': pdf_data,
+                    'download_status': status
+                })
+            except Exception as e:
+                results.append({
+                    **pdf_info,
+                    'pdf_data': None,
+                    'download_status': f"Exception: {str(e)}"
+                })
+    
+    return results
+
+def get_all_pagination_links(driver):
+    """Get all pagination page links"""
+    pagination_links = []
+    try:
+        # Find pagination container
+        pagination_selectors = [
+            "ul.pagination",
+            "div.pagination",
+            "ul.dataTables_paginate",
+            ".pagination",
+            "//ul[contains(@class, 'pagination')]",
+            "//div[contains(@class, 'pagination')]"
+        ]
+        
+        pagination_container = None
+        for selector in pagination_selectors:
+            try:
+                if selector.startswith("//"):
+                    pagination_container = driver.find_element(By.XPATH, selector)
+                else:
+                    pagination_container = driver.find_element(By.CSS_SELECTOR, selector)
+                break
+            except NoSuchElementException:
+                continue
+        
+        if pagination_container:
+            # Get all page number links (excluding Previous/Next)
+            page_links = pagination_container.find_elements(By.TAG_NAME, "a")
+            for link in page_links:
+                href = link.get_attribute("href")
+                text = link.text.strip()
+                # Only include numeric page links and not Previous/Next
+                if text and text.isdigit():
+                    pagination_links.append((int(text), link))
+            
+            # Sort by page number
+            pagination_links.sort(key=lambda x: x[0])
+            
+    except Exception as e:
+        print(f"      ⚠ Could not extract pagination: {e}")
+    
+    return pagination_links
+
+def extract_all_pdf_links_from_page(driver):
+    """Extract ALL PDF links from the current page using the specific class"""
+    pdf_links = []
+    try:
+        # Find ALL download buttons with the specific class
+        download_buttons = driver.find_elements(By.CSS_SELECTOR, "a.btn.btn-success.btnDownload")
+        
+        print(f"      🔍 Found {len(download_buttons)} download buttons on page")
+        
+        for button_index, button in enumerate(download_buttons, 1):
+            try:
+                # Get the PDF URL from href attribute
+                pdf_url = button.get_attribute("href")
+                
+                # If href is relative, make it absolute
+                if pdf_url and pdf_url.startswith('/'):
+                    pdf_url = "https://nta.ac.in" + pdf_url
+                
+                if pdf_url and (pdf_url.endswith('.pdf') or 'download' in pdf_url.lower()):
+                    # Get the parent row to extract other data
+                    row = button.find_element(By.XPATH, "./ancestor::tr")
+                    row_data = [cell.text.strip() for cell in row.find_elements(By.TAG_NAME, "td")]
+                    
+                    # Extract button text
+                    button_text = button.text.strip()
+                    
+                    pdf_links.append({
+                        'url': pdf_url,
+                        'text': button_text,
+                        'row_data': row_data,
+                        'button_element': button
+                    })
+                    print(f"      ✅ PDF {button_index}: {pdf_url}")
+                    
+            except Exception as e:
+                print(f"      ⚠ Error processing button {button_index}: {e}")
+                continue
+                
+    except Exception as e:
+        print(f"      ❌ Error extracting PDF links from page: {e}")
+    
+    return pdf_links
+
+def write_to_csv(csv_writer, csv_file, data):
+    """Write data to CSV and flush immediately"""
+    csv_writer.writerow(data)
+    csv_file.flush()  # Flush the file object, not the writer
+
+def check_pdf_exists_in_csv(csv_filename, pdf_url):
+    """Check if PDF URL already exists in CSV"""
+    try:
+        if not os.path.exists(csv_filename):
+            return False
+            
+        with open(csv_filename, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('pdf_url') == pdf_url:
+                    return True
+    except Exception as e:
+        print(f"      ⚠ Error checking CSV for duplicates: {e}")
+    
+    return False
+
+def process_current_page_fast(driver, folder, cookies, exam, csv_writer, csv_file, csv_filename, current_page, resume_state):
+    """Process ALL PDFs on the current page with batch downloads"""
+    downloaded_count = 0
+    failed_downloads = []
+    
+    try:
+        # Extract ALL PDF links from the current page using the specific class
+        pdf_links = extract_all_pdf_links_from_page(driver)
+        
+        if not pdf_links:
+            print(f"      ⚠ No PDF links found on current page")
+            return 0, []
+        
+        print(f"      📊 Processing {len(pdf_links)} PDF links on current page")
+        
+        # Filter out already processed PDFs
+        pdfs_to_process = []
+        for pdf_info in pdf_links:
+            pdf_url = pdf_info['url']
+            
+            # Skip if already in CSV (resume functionality)
+            if check_pdf_exists_in_csv(csv_filename, pdf_url):
+                continue
+                
+            pdfs_to_process.append(pdf_info)
+        
+        if not pdfs_to_process:
+            print(f"      ⏭ All PDFs on page {current_page} already processed")
+            return 0, []
+        
+        print(f"      🔄 Downloading {len(pdfs_to_process)} new PDFs...")
+        
+        # Prepare headers for batch download
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+            'Referer': driver.current_url,
+            'Accept': 'application/pdf, */*'
+        }
+        
+        # Download PDFs in batches concurrently
+        batch_size = MAX_WORKERS * 2
+        all_results = []
+        
+        for i in range(0, len(pdfs_to_process), batch_size):
+            batch = pdfs_to_process[i:i + batch_size]
+            batch_results = download_multiple_pdfs(batch, cookies, headers)
+            all_results.extend(batch_results)
+            
+            print(f"      📦 Processed batch {i//batch_size + 1}/{(len(pdfs_to_process)-1)//batch_size + 1}")
+        
+        # Process results and save files
+        for result in all_results:
+            pdf_url = result['url']
+            link_text = result['text']
+            row_data = result['row_data']
+            pdf_data = result.get('pdf_data')
+            download_status = result['download_status']
+            
+            try:
+                # Extract filename from URL
+                if pdf_url.endswith('.pdf'):
+                    filename = pdf_url.split("/")[-1]
+                else:
+                    # Generate filename based on exam and index
+                    filename = f"{exam}_{current_page}_{len(failed_downloads) + downloaded_count + 1}.pdf"
+                
+                # Clean filename
+                filename = "".join(c for c in filename if c.isalnum() or c in ('.', '-', '_')).rstrip()
+                save_path = os.path.join(folder, filename)
+                
+                # Extract data from row
+                sno = row_data[0] if len(row_data) > 0 else f"{current_page}.{len(failed_downloads) + downloaded_count + 1}"
+                exam_name = row_data[1] if len(row_data) > 1 else exam
+                paper_name = row_data[2] if len(row_data) > 2 else ''
+                year = row_data[3] if len(row_data) > 3 else ''
+                exam_date = row_data[4] if len(row_data) > 4 else ''
+                shift = row_data[5] if len(row_data) > 5 else ''
+                
+                # Prepare CSV data
+                csv_data = {
+                    'sno': sno,
+                    'exam_name': exam_name,
+                    'paper_name': paper_name,
+                    'year': year,
+                    'exam_date': exam_date,
+                    'shift': shift,
+                    'filename': filename,
+                    'pdf_url': pdf_url,
+                    'download_status': 'Pending',
+                    'file_path': save_path,
+                    'validation_status': 'Not_Validated'
+                }
+                
+                if os.path.exists(save_path):
+                    print(f"      ✔ File exists: {filename}")
+                    csv_data['download_status'] = 'Already_Exists'
+                    # Validate existing file
+                    try:
+                        with open(save_path, "rb") as f:
+                            existing_data = f.read()
+                        validation_status = validate_pdf(existing_data)
+                        csv_data['validation_status'] = validation_status
+                    except Exception as e:
+                        csv_data['validation_status'] = f'Validation_Error: {str(e)}'
+                    
+                    write_to_csv(csv_writer, csv_file, csv_data)
+                    continue
+                
+                print(f"      ⬇ Downloading: {filename}")
+                print(f"      📎 URL: {pdf_url}")
+                
+                if pdf_data is not None:
+                    # Save file
+                    with open(save_path, "wb") as f:
+                        f.write(pdf_data)
+                    
+                    downloaded_count += 1
+                    csv_data['download_status'] = 'Downloaded'
+                    
+                    # Validate after download
+                    validation_status = validate_pdf(pdf_data)
+                    csv_data['validation_status'] = validation_status
+                    
+                    print(f"      ✅ Downloaded: {filename} | Validation: {validation_status}")
+                else:
+                    csv_data['download_status'] = download_status
+                    csv_data['validation_status'] = 'Not_Downloaded'
+                    failed_downloads.append(pdf_url)
+                    print(f"      ❌ Download failed: {filename} - {download_status}")
+                
+                # Write to CSV
+                write_to_csv(csv_writer, csv_file, csv_data)
+                    
+            except Exception as e:
+                print(f"      ❌ Error processing PDF: {e}")
+                failed_downloads.append(pdf_url)
+                # Write error to CSV
+                error_data = {
+                    'sno': f"{current_page}.{len(failed_downloads) + downloaded_count + 1}",
+                    'exam_name': exam,
+                    'paper_name': f'Error: {str(e)}',
+                    'year': '',
+                    'exam_date': '',
+                    'shift': '',
+                    'filename': f'error_{current_page}_{len(failed_downloads) + downloaded_count + 1}.pdf',
+                    'pdf_url': pdf_url,
+                    'download_status': f'Error: {str(e)}',
+                    'file_path': '',
+                    'validation_status': 'N/A'
+                }
+                write_to_csv(csv_writer, csv_file, error_data)
+                continue
+    
+    except Exception as e:
+        print(f"      ❌ Error processing current page: {e}")
+    
+    print(f"      📈 Downloaded {downloaded_count} new files, {len(failed_downloads)} failed on page {current_page}")
+    return downloaded_count, failed_downloads
+
+def save_failed_downloads(failed_downloads, exam):
+    """Save failed downloads to a separate file for manual download"""
+    if failed_downloads:
+        failed_file = os.path.join(DOWNLOAD_DIR, f"failed_downloads_{exam}.txt")
+        with open(failed_file, 'w', encoding='utf-8') as f:
+            for url in failed_downloads:
+                f.write(f"{url}\n")
+        print(f"      💾 Saved {len(failed_downloads)} failed URLs to: {failed_file}")
+
+def initialize_csv():
+    """Initialize CSV file for resume"""
+    csv_filename = os.path.join(DOWNLOAD_DIR, "nta_pdfs_index.csv")
+    file_exists = os.path.exists(csv_filename)
+    
+    # Use append mode for resume functionality
+    csv_file = open(csv_filename, 'a', newline='', encoding='utf-8')
+    fieldnames = ['sno', 'exam_name', 'paper_name', 'year', 'exam_date', 'shift', 
+                 'filename', 'pdf_url', 'download_status', 'file_path', 'validation_status']
+    csv_writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+    
+    # Write header only if file is new
+    if not file_exists:
+        csv_writer.writeheader()
+        csv_file.flush()
+        print(f"📊 Created new CSV file: {csv_filename}")
+    else:
+        print(f"📊 Resuming with existing CSV file: {csv_filename}")
+    
+    return csv_writer, csv_file, csv_filename
+
+# Setup Chrome options (same as your working version)
+chrome_options = Options()
+chrome_options.add_argument("--no-sandbox")
+chrome_options.add_argument("--disable-dev-shm-usage")
+chrome_options.add_argument("--disable-gpu")
+chrome_options.add_argument("--window-size=1920,1080")
+
+# Set download directory preference
+prefs = {
+    "download.default_directory": os.path.abspath(DOWNLOAD_DIR),
+    "download.prompt_for_download": False,
+    "download.directory_upgrade": True,
+    "plugins.always_open_pdf_externally": True
+}
+chrome_options.add_experimental_option("prefs", prefs)
+
+try:
+    # Load resume state
+    resume_state = load_resume_state()
+    
+    # Initialize CSV (in append mode for resuming)
+    csv_writer, csv_file, csv_filename = initialize_csv()
+    
+    # Initialize driver (same as your working version)
+    driver = webdriver.Chrome(
+        service=Service(ChromeDriverManager().install()),
+        options=chrome_options
+    )
+    driver.get(BASE_URL)
+    
+    print("🚀 Browser launched successfully")
+    
+    # Wait for page to load completely
+    WebDriverWait(driver, 30).until(
+        EC.presence_of_element_located((By.TAG_NAME, "body"))
+    )
+    
+    # ------------------------------
+    # 1️⃣ SCROLL AND FIND ACCORDION
+    # ------------------------------
+    driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+    time.sleep(2)
+    
+    # Try multiple possible selectors for the accordion
+    accordion_selectors = [
+        "//h4[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'more information')]",
+        "//h4[contains(translate(., 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz'), 'download')]",
+        "//h4[contains(text(),'more Information')]",
+        "//h4[contains(text(),'Download')]",
+        "//a[contains(@class, 'accordion')]",
+        "//div[contains(@class, 'accordion')]//h4",
+        "//*[contains(text(), 'more Information')]",
+        "//*[contains(text(), 'Download')]"
+    ]
+    
+    accordion = None
+    for selector in accordion_selectors:
+        try:
+            accordion = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, selector))
+            )
+            print(f"✅ Found accordion with selector: {selector}")
+            break
+        except TimeoutException:
+            continue
+    
+    if accordion:
+        driver.execute_script("arguments[0].scrollIntoView(true);", accordion)
+        driver.execute_script("arguments[0].click();", accordion)
+        print("✅ Accordion clicked")
+        time.sleep(3)
+    else:
+        print("❌ Could not find accordion, trying to continue...")
+    
+    # ------------------------------
+    # 2️⃣ FIND DROPDOWNS
+    # ------------------------------
+    print("🔍 Looking for dropdown elements...")
+    
+    # Wait for dropdowns to be present with multiple possible selectors
+    year_selectors = [
+        "//label[contains(text(),'Year')]/following::select[1]",
+        "//select[contains(@name, 'year')]",
+        "//select[contains(@id, 'year')]",
+        "//select[preceding-sibling::label[contains(text(),'Year')]]"
+    ]
+    
+    exam_selectors = [
+        "//label[contains(text(),'Exam')]/following::select[1]",
+        "//select[contains(@name, 'exam')]",
+        "//select[contains(@id, 'exam')]",
+        "//select[preceding-sibling::label[contains(text(),'Exam')]]"
+    ]
+    
+    search_selectors = [
+        "//input[contains(@value,'Search')]",
+        "//input[contains(@type,'submit')]",
+        "//button[contains(text(),'Search')]",
+        "//input[contains(@class,'btn')]"
+    ]
+    
+    year_dropdown_el = None
+    exam_dropdown_el = None
+    search_button_el = None
+    
+    # Find year dropdown
+    for selector in year_selectors:
+        try:
+            year_dropdown_el = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, selector))
+            )
+            print(f"✅ Found year dropdown with selector: {selector}")
+            break
+        except TimeoutException:
+            continue
+    
+    # Find exam dropdown
+    for selector in exam_selectors:
+        try:
+            exam_dropdown_el = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.XPATH, selector))
+            )
+            print(f"✅ Found exam dropdown with selector: {selector}")
+            break
+        except TimeoutException:
+            continue
+    
+    # Find search button
+    for selector in search_selectors:
+        try:
+            search_button_el = WebDriverWait(driver, 10).until(
+                EC.element_to_be_clickable((By.XPATH, selector))
+            )
+            print(f"✅ Found search button with selector: {selector}")
+            break
+        except TimeoutException:
+            continue
+    
+    if not all([year_dropdown_el, exam_dropdown_el, search_button_el]):
+        print("❌ Could not find all required elements")
+        print("Current page source saved for debugging")
+        with open("debug_page.html", "w", encoding="utf-8") as f:
+            f.write(driver.page_source)
+        driver.quit()
+        csv_file.close()
+        exit()
+    
+    year_dropdown = Select(year_dropdown_el)
+    exam_dropdown = Select(exam_dropdown_el)
+    
+    # Get available options - FILTER OUT PLACEHOLDER OPTIONS
+    years = [o.text.strip() for o in year_dropdown.options 
+             if o.text.strip() and o.text.strip() not in ["Select", "--select--", "Any", ""]]
+    
+    exams = [o.text.strip() for o in exam_dropdown.options 
+             if o.text.strip() and o.text.strip() not in ["Select", "--Select--", "Any", ""]]
+    
+    print(f"📅 Available years: {years}")
+    print(f"📝 Available exams: {exams}")
+    
+    if not years or not exams:
+        print("❌ No valid years or exams found in dropdowns")
+        driver.quit()
+        csv_file.close()
+        exit()
+    
+    # Get cookies for requests
+    cookies = {c['name']: c['value'] for c in driver.get_cookies()}
+    
+    # ------------------------------
+    # 3️⃣ SET YEAR TO "Any" AND ITERATE ONLY THROUGH EXAMS (WITH RESUME)
+    # ------------------------------
+    total_downloaded = 0
+    all_failed_downloads = []
+    
+    # Set Year dropdown to "Any" (or first option that represents all years)
+    try:
+        # First try to find "Any" option
+        any_year_found = False
+        for option_text in ["Any", "All", "Select All"]:
+            try:
+                year_dropdown.select_by_visible_text(option_text)
+                any_year_found = True
+                print(f"✅ Set Year to: {option_text}")
+                break
+            except:
+                continue
+        
+        # If "Any" not found, use the first available year option
+        if not any_year_found and years:
+            year_dropdown.select_by_index(1)  # Skip first option if it's placeholder
+            print(f"✅ Set Year to first available option: {year_dropdown.first_selected_option.text}")
+        
+        time.sleep(2)
+    except Exception as e:
+        print(f"❌ Error setting year to 'Any': {e}")
+        # Continue anyway
+    
+    # Now iterate only through exams WITH RESUME FUNCTIONALITY
+    for exam_index, exam in enumerate(exams):
+        safe_exam = "".join(c for c in exam if c.isalnum() or c in (' ', '-', '_')).rstrip()
+        
+        # Skip if this exam was already processed (resume functionality)
+        if safe_exam in resume_state['processed_exams']:
+            print(f"\n⏭ Skipping already processed exam: {exam} ({exam_index + 1}/{len(exams)})")
+            continue
+        
+        print(f"\n{'='*50}")
+        print(f"📝 Processing Exam: {exam} ({exam_index + 1}/{len(exams)})")
+        print(f"{'='*50}")
+        
+        # Update resume state
+        resume_state['current_exam'] = safe_exam
+        save_resume_state(resume_state)
+        
+        try:
+            exam_dropdown.select_by_visible_text(exam)
+            time.sleep(2)
+            
+            # Click search button
+            search_button_el.click()
+            time.sleep(4)
+            
+            # Wait for results table - with better detection
+            try:
+                # Wait for either results or "no results" message
+                WebDriverWait(driver, 10).until(
+                    EC.any_of(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "table tbody tr")),
+                        EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'No record') or contains(text(), 'no record') or contains(text(), 'No data')]"))
+                    )
+                )
+                
+                # Check if there's a "no records" message
+                no_records_elements = driver.find_elements(By.XPATH, "//*[contains(text(), 'No record') or contains(text(), 'no record') or contains(text(), 'No data')]")
+                if no_records_elements:
+                    print(f"   ⚠ No records found for Exam: {exam}")
+                    # Mark as processed even if no records
+                    resume_state['processed_exams'].add(safe_exam)
+                    save_resume_state(resume_state)
+                    continue
+                
+            except TimeoutException:
+                print(f"   ⚠ Timeout waiting for results for Exam: {exam}")
+                continue
+            
+            # Create folder structure for this exam
+            folder = os.path.join(DOWNLOAD_DIR, "All_Years", safe_exam)
+            os.makedirs(folder, exist_ok=True)
+            
+            # Process all pages for this exam (which includes all years) WITH RESUME
+            page_downloaded_total = 0
+            current_page = 1
+            exam_failed_downloads = []
+            
+            # Get processed pages for this exam from resume state
+            processed_pages = set(resume_state.get('processed_pages', {}).get(safe_exam, []))
+            
+            while True:
+                print(f"\n   📄 Processing Page {current_page}")
+                
+                # Skip if this page was already processed (resume functionality)
+                if current_page in processed_pages:
+                    print(f"   ⏭ Skipping already processed page {current_page}")
+                    # Find next unprocessed page
+                    pagination_links = get_all_pagination_links(driver)
+                    next_page = None
+                    for page_num, _ in pagination_links:
+                        if page_num not in processed_pages:
+                            next_page = page_num
+                            break
+                    
+                    if next_page:
+                        # Navigate to next unprocessed page
+                        for page_num, page_link in pagination_links:
+                            if page_num == next_page:
+                                driver.execute_script("arguments[0].scrollIntoView(true);", page_link)
+                                driver.execute_script("arguments[0].click();", page_link)
+                                time.sleep(3)
+                                current_page = next_page
+                                print(f"   🔄 Navigated to next unprocessed page {current_page}")
+                                break
+                    else:
+                        print(f"   ✅ All pages processed for Exam: {exam}")
+                        break
+                    continue
+                
+                # Process current page with FAST concurrent downloads
+                downloaded_this_page, failed_this_page = process_current_page_fast(
+                    driver, folder, cookies, safe_exam, csv_writer, csv_file, 
+                    csv_filename, current_page, resume_state
+                )
+                
+                page_downloaded_total += downloaded_this_page
+                exam_failed_downloads.extend(failed_this_page)
+                
+                # Update resume state with processed page
+                processed_pages.add(current_page)
+                if 'processed_pages' not in resume_state:
+                    resume_state['processed_pages'] = {}
+                resume_state['processed_pages'][safe_exam] = list(processed_pages)
+                save_resume_state(resume_state)
+                
+                # Get pagination links
+                pagination_links = get_all_pagination_links(driver)
+                
+                if not pagination_links:
+                    print(f"   ℹ No pagination found, assuming single page")
+                    break
+                
+                # Find next page to process
+                next_page = None
+                for page_num, page_link in pagination_links:
+                    if page_num not in processed_pages:
+                        next_page = page_num
+                        break
+                
+                if next_page is None:
+                    print(f"   ✅ All pages processed for Exam: {exam}")
+                    break
+                
+                # Click on next page
+                try:
+                    for page_num, page_link in pagination_links:
+                        if page_num == next_page:
+                            driver.execute_script("arguments[0].scrollIntoView(true);", page_link)
+                            driver.execute_script("arguments[0].click();", page_link)
+                            time.sleep(3)  # Wait for page to load
+                            current_page = next_page
+                            print(f"   🔄 Navigated to page {current_page}")
+                            break
+                except Exception as e:
+                    print(f"   ❌ Error navigating to page {next_page}: {e}")
+                    break
+            
+            if page_downloaded_total > 0:
+                total_downloaded += page_downloaded_total
+                print(f"   📥 Successfully downloaded {page_downloaded_total} files from {len(processed_pages)} pages for Exam: {exam}")
+            else:
+                print(f"   ⚠ No new files downloaded for Exam: {exam}")
+            
+            # Save failed downloads for this exam
+            save_failed_downloads(exam_failed_downloads, safe_exam)
+            all_failed_downloads.extend(exam_failed_downloads)
+            
+            # Mark exam as completed in resume state
+            resume_state['processed_exams'].add(safe_exam)
+            if safe_exam in resume_state.get('processed_pages', {}):
+                del resume_state['processed_pages'][safe_exam]  # Clean up
+            save_resume_state(resume_state)
+                    
+        except Exception as e:
+            print(f"   ❌ Error processing exam {exam}: {e}")
+            continue
+
+    print(f"\n🎉 ALL DONE! Total files downloaded: {total_downloaded}")
+    
+    # Save all failed downloads
+    if all_failed_downloads:
+        failed_file = os.path.join(DOWNLOAD_DIR, "all_failed_downloads.txt")
+        with open(failed_file, 'w', encoding='utf-8') as f:
+            for url in all_failed_downloads:
+                f.write(f"{url}\n")
+        print(f"💾 All failed URLs saved to: {failed_file}")
+    
+    # Clean up resume state file when completely done
+    if os.path.exists(RESUME_FILE):
+        os.remove(RESUME_FILE)
+        print("🧹 Cleaned up resume state file")
+
+except Exception as e:
+    print(f"❌ Critical error: {e}")
+    import traceback
+    traceback.print_exc()
+
+finally:
+    # Ensure driver quits and CSV file is closed even if there's an error
+    try:
+        driver.quit()
+        print("🔚 Browser closed")
+    except:
+        pass
+    
+    try:
+        csv_file.close()
+        print("💾 CSV file closed")
+        print(f"📊 Final CSV file: {csv_filename}")
+    except:
+        pass
