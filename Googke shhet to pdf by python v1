@@ -1,0 +1,799 @@
+import gspread
+from google.oauth2.service_account import Credentials
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, Image
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from google.auth.transport.requests import Request
+import os
+import logging
+import json
+import pandas as pd
+from datetime import datetime
+import re
+from reportlab.platypus.flowables import Spacer, Image
+from reportlab.lib.utils import ImageReader
+from reportlab.pdfgen import canvas
+from reportlab.lib.pagesizes import letter
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Google Sheets and Drive setup
+SCOPE = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+# Column names in Google Sheets (Updated to match your structure)
+COLUMN_FOLDER = 'Folder'
+COLUMN_SUB_FOLDER = 'Sub Folder'
+COLUMN_FILE_NAME = 'File Name'
+COLUMN_QUESTION_NO = 'Question No'
+COLUMN_QUESTION_TEXT = 'Question Text'
+COLUMN_INSTRUCTIONS = 'Instructions'
+COLUMN_OPTION_A = 'Option A'
+COLUMN_OPTION_B = 'Option B'
+COLUMN_OPTION_C = 'Option C'
+COLUMN_OPTION_D = 'Option D'
+COLUMN_QUESTION_IMAGE_URL = 'Question Image URL'
+COLUMN_OPTION_A_IMAGE_URL = 'Option A Image URL'
+COLUMN_OPTION_B_IMAGE_URL = 'Option B Image URL'
+COLUMN_OPTION_C_IMAGE_URL = 'Option C Image URL'
+COLUMN_OPTION_D_IMAGE_URL = 'Option D Image URL'
+COLUMN_CORRECT_OPTION = 'Correct Option'
+COLUMN_EXPLANATION = 'Explanation'
+COLUMN_CONTENT = 'Content'
+COLUMN_PDF_URLS = 'PDF urls'
+
+class PDFGenerator:
+    def __init__(self, credentials_file):
+        self.credentials_file = credentials_file
+        self.sheets_client = None
+        self.drive_service = None
+        self.setup_clients()
+        
+    def setup_clients(self):
+        """Initialize Google Sheets and Drive clients"""
+        try:
+            creds = Credentials.from_service_account_file(self.credentials_file, scopes=SCOPE)
+            self.sheets_client = gspread.authorize(creds)
+            self.drive_service = build('drive', 'v3', credentials=creds)
+            logging.info("Google Sheets and Drive clients initialized")
+        except Exception as e:
+            logging.error(f"Failed to initialize clients: {e}")
+            raise
+
+    def load_data_from_sheets(self, spreadsheet_id, worksheet_name):
+        """Load data from Google Sheets"""
+        try:
+            spreadsheet = self.sheets_client.open_by_key(spreadsheet_id)
+            worksheet = spreadsheet.worksheet(worksheet_name)
+            data = worksheet.get_all_records()
+            logging.info(f"Loaded {len(data)} rows from Google Sheets")
+            return data
+        except Exception as e:
+            logging.error(f"Failed to load data from Google Sheets: {e}")
+            raise
+
+    def create_folder_structure(self, base_path, folder, sub_folder):
+        """Create folder structure for PDFs"""
+        folder_path = os.path.join(base_path, folder, sub_folder)
+        os.makedirs(folder_path, exist_ok=True)
+        return folder_path
+
+    def parse_latex_simple(self, text):
+        """Simple LaTeX to plain text conversion - REMOVE HTML TAGS"""
+        if not text:
+            return text
+            
+        # First remove HTML tags
+        text = re.sub(r'<[^>]+>', '', str(text))
+            
+        # Remove LaTeX commands but keep content
+        replacements = [
+            (r'\\textbf{([^}]*)}', r'\1'),  # Remove bold tags
+            (r'\\textit{([^}]*)}', r'\1'),  # Remove italic tags
+            (r'\\underline{([^}]*)}', r'\1'),  # Remove underline tags
+            (r'\$([^$]*)\$', r'\1'),  # Inline math
+            (r'\\frac{([^}]*)}{([^}]*)}', r'\1/\2'),  # Fractions
+            (r'\\sqrt{([^}]*)}', r'√(\1)'),  # Square root
+            (r'\\alpha', 'α'),  # Greek letters
+            (r'\\beta', 'β'),
+            (r'\\gamma', 'γ'),
+            (r'\\delta', 'δ'),
+            (r'\\epsilon', 'ε'),
+            (r'\\[a-zA-Z]+', ''),  # Remove other LaTeX commands
+        ]
+        
+        result = text
+        for pattern, replacement in replacements:
+            result = re.sub(pattern, replacement, result)
+            
+        return result
+
+    def add_header_footer(self, canvas, doc, paper_name=None):
+        """Add header and footer to all pages - 80% width (no margins)"""
+        canvas.saveState()
+        
+        # Calculate 80% width
+        page_width = doc.pagesize[0]
+        header_footer_width = page_width * 0.8
+        start_x = (page_width - header_footer_width) / 2
+        
+        # Header line - 80% width centered
+        canvas.setStrokeColor(colors.black)
+        canvas.setLineWidth(0.5)
+        canvas.line(start_x, doc.pagesize[1] - 40, start_x + header_footer_width, doc.pagesize[1] - 40)
+        
+        # Add paper name in header on right side
+        if paper_name:
+            canvas.setFont('Times-Roman', 10)
+            canvas.setFillColor(colors.black)
+            canvas.drawRightString(page_width - 36, doc.pagesize[1] - 30, paper_name)
+        
+        # Footer line - 80% width centered
+        canvas.setStrokeColor(colors.black)
+        canvas.setLineWidth(0.5)
+        canvas.line(start_x, 40, start_x + header_footer_width, 40)
+        
+        # Page number only (centered at bottom)
+        canvas.setFont('Times-Roman', 10)
+        canvas.setFillColor(colors.black)
+        canvas.drawCentredString(doc.pagesize[0] / 2, 25, str(canvas.getPageNumber()))
+        
+        canvas.restoreState()
+
+    def should_use_single_column(self, option_a, option_b, option_c, option_d, doc_width):
+        """Check if options should be displayed in single column to avoid overlap"""
+        # Estimate text width - if any option is longer than 40% of available width, use single column
+        max_option_length = max(len(str(option_a)), len(str(option_b)), len(str(option_c)), len(str(option_d)))
+        available_width_per_option = (doc_width / 2) - 20  # Account for padding
+        
+        # If any option is longer than 40% of available space, use single column
+        estimated_char_width = 6  # Approximate width per character in points
+        estimated_text_width = max_option_length * estimated_char_width
+        
+        return estimated_text_width > (available_width_per_option * 0.4)
+
+    def create_complete_pdf(self, questions, output_path, paper_name):
+        """Create complete PDF with questions, options, answers and explanations"""
+        try:
+            doc = SimpleDocTemplate(
+                output_path,
+                pagesize=letter,
+                rightMargin=72,
+                leftMargin=72,
+                topMargin=72,
+                bottomMargin=72
+            )
+            
+            styles = getSampleStyleSheet()
+            
+            # Custom styles with Times Roman font and font size 12
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontName='Times-Roman',
+                fontSize=16,
+                spaceAfter=20,
+                alignment=1,
+                textColor=colors.black
+            )
+            
+            question_number_style = ParagraphStyle(
+                'QuestionNumberStyle',
+                parent=styles['Normal'],
+                fontName='Times-Bold',
+                fontSize=12,
+                spaceAfter=0,
+                leading=14,
+                textColor=colors.black,
+                leftIndent=0
+            )
+            
+            question_text_style = ParagraphStyle(
+                'QuestionTextStyle',
+                parent=styles['Normal'],
+                fontName='Times-Bold',  # ALL QUESTION TEXT IN BOLD
+                fontSize=12,
+                leftIndent=0,
+                spaceAfter=12,
+                leading=14,
+                textColor=colors.black
+            )
+            
+            option_style = ParagraphStyle(
+                'OptionStyle',
+                parent=styles['Normal'],
+                fontName='Times-Roman',
+                fontSize=12,
+                leftIndent=35,  # Same as before
+                spaceAfter=3,
+                leading=14,
+                textColor=colors.black
+            )
+            
+            correct_answer_style = ParagraphStyle(
+                'CorrectAnswerStyle',
+                parent=styles['Normal'],
+                fontName='Times-Bold',
+                fontSize=12,
+                textColor=colors.black,
+                spaceAfter=8,
+                leading=14,
+                leftIndent=0  # CHANGED: Remove left margin for answers
+            )
+            
+            explanation_label_style = ParagraphStyle(
+                'ExplanationLabelStyle',
+                parent=styles['Normal'],
+                fontName='Times-Bold',  # ONLY "Explanation:" in BOLD
+                fontSize=12,
+                textColor=colors.black,
+                spaceAfter=0,
+                leading=14,
+                leftIndent=0  # CHANGED: Remove left margin for explanation label
+            )
+            
+            explanation_text_style = ParagraphStyle(
+                'ExplanationTextStyle',
+                parent=styles['Normal'],
+                fontName='Times-Roman',  # Explanation text in normal font
+                fontSize=12,
+                textColor=colors.black,
+                spaceAfter=15,
+                leading=14,
+                leftIndent=0  # CHANGED: Remove left margin for explanation text
+            )
+            
+            story = []
+            
+            # Add title only (REMOVED file name from title - only show paper name)
+            title = Paragraph(f"{paper_name}", title_style)
+            story.append(title)
+            story.append(Spacer(1, 30))
+            
+            for i, question in enumerate(questions, 1):
+                # Parse LaTeX in question text
+                question_text = self.parse_latex_simple(question['question_text'])
+                
+                # Question number and text - PROPER SPACING like Q.9
+                q_number = Paragraph(f"Q.{i}", question_number_style)
+                q_text = Paragraph(f"{question_text}", question_text_style)
+                
+                # Create table to keep number and text on same line with proper spacing
+                question_table = Table([[q_number, q_text]], colWidths=[35, doc.width - 35])
+                question_table.setStyle(TableStyle([
+                    ('VALIGN', (0, 0), (-1, 0), 'TOP'),
+                    ('LEFTPADDING', (0, 0), (-1, 0), 0),
+                    ('RIGHTPADDING', (0, 0), (-1, 0), 0),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 0),
+                ]))
+                
+                story.append(question_table)
+                story.append(Spacer(1, 8))  # Small space after question
+                
+                # Add instructions if present
+                if question.get('instructions'):
+                    instr_text = self.parse_latex_simple(question['instructions'])
+                    instr_style = ParagraphStyle(
+                        'InstructionStyle',
+                        parent=styles['Normal'],
+                        fontName='Times-Roman',
+                        fontSize=12,
+                        leftIndent=35,  # Same as options
+                        spaceAfter=6,
+                        leading=14,
+                        textColor=colors.black
+                    )
+                    instr = Paragraph(f"Note: {instr_text}", instr_style)
+                    story.append(instr)
+                    story.append(Spacer(1, 6))
+                
+                # Parse LaTeX in options
+                option_a = self.parse_latex_simple(question['option_a'])
+                option_b = self.parse_latex_simple(question['option_b'])
+                option_c = self.parse_latex_simple(question['option_c'])
+                option_d = self.parse_latex_simple(question['option_d'])
+                
+                # Check if we should use single column (if any option > 40% width)
+                use_single_column = self.should_use_single_column(option_a, option_b, option_c, option_d, doc.width)
+                
+                if use_single_column:
+                    # Single column layout - each option on its own line
+                    options_data = [
+                        [Paragraph(f"(A) {option_a}", option_style)],
+                        [Paragraph(f"(B) {option_b}", option_style)],
+                        [Paragraph(f"(C) {option_c}", option_style)],
+                        [Paragraph(f"(D) {option_d}", option_style)]
+                    ]
+                    col_widths = [doc.width]
+                else:
+                    # Two column layout - A&B in first row, C&D in second row
+                    options_data = [
+                        [Paragraph(f"(A) {option_a}", option_style), Paragraph(f"(B) {option_b}", option_style)],
+                        [Paragraph(f"(C) {option_c}", option_style), Paragraph(f"(D) {option_d}", option_style)]
+                    ]
+                    col_widths = [doc.width/2 - 5, doc.width/2 - 5]
+                
+                options_table = Table(options_data, colWidths=col_widths)
+                options_table.setStyle(TableStyle([
+                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+                ]))
+                
+                story.append(options_table)
+                story.append(Spacer(1, 10))
+                
+                # Correct answer with NO LEFT MARGIN (aligned with question text)
+                correct_option = question['correct_option']
+                correct_answer = f"Correct Answer: {correct_option}"
+                story.append(Paragraph(correct_answer, correct_answer_style))
+                
+                # Explanation with NO LEFT MARGIN (aligned with question text) - ONLY "Explanation:" in bold
+                if question.get('explanation'):
+                    expl_text = self.parse_latex_simple(question['explanation'])
+                    # Add "Explanation:" in bold and rest in normal
+                    story.append(Paragraph("Explanation:", explanation_label_style))
+                    story.append(Paragraph(expl_text, explanation_text_style))
+                
+                story.append(Spacer(1, 15))
+                
+                # Add page break after every 5 questions
+                if i % 5 == 0:
+                    story.append(PageBreak())
+            
+            # Build PDF with header and footer - NO WATERMARK, pass paper_name to header
+            doc.build(story, 
+                     onFirstPage=lambda canvas, doc: self.add_header_footer(canvas, doc, paper_name),
+                     onLaterPages=lambda canvas, doc: self.add_header_footer(canvas, doc, paper_name))
+            logging.info(f"Complete PDF created successfully: {output_path}")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to create complete PDF: {e}")
+            return False
+
+    def create_questions_only_pdf(self, questions, output_path, paper_name):
+        """Create PDF with only questions and options"""
+        try:
+            doc = SimpleDocTemplate(
+                output_path,
+                pagesize=letter,
+                rightMargin=72,
+                leftMargin=72,
+                topMargin=72,
+                bottomMargin=72
+            )
+            
+            styles = getSampleStyleSheet()
+            
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontName='Times-Roman',
+                fontSize=16,
+                spaceAfter=20,
+                alignment=1,
+                textColor=colors.black
+            )
+            
+            question_number_style = ParagraphStyle(
+                'QuestionNumberStyle',
+                parent=styles['Normal'],
+                fontName='Times-Bold',
+                fontSize=12,
+                spaceAfter=0,
+                leading=14,
+                textColor=colors.black,
+                leftIndent=0
+            )
+            
+            question_text_style = ParagraphStyle(
+                'QuestionTextStyle',
+                parent=styles['Normal'],
+                fontName='Times-Bold',  # ALL QUESTION TEXT IN BOLD
+                fontSize=12,
+                leftIndent=0,
+                spaceAfter=12,
+                leading=14,
+                textColor=colors.black
+            )
+            
+            option_style = ParagraphStyle(
+                'OptionStyle',
+                parent=styles['Normal'],
+                fontName='Times-Roman',
+                fontSize=12,
+                leftIndent=35,  # Same as before
+                spaceAfter=3,
+                leading=14,
+                textColor=colors.black
+            )
+            
+            story = []
+            
+            # Add title only (REMOVED file name from title - only show paper name)
+            title = Paragraph(f"{paper_name}", title_style)
+            story.append(title)
+            story.append(Spacer(1, 30))
+            
+            for i, question in enumerate(questions, 1):
+                # Parse LaTeX in question text
+                question_text = self.parse_latex_simple(question['question_text'])
+                
+                # Question number and text - PROPER SPACING like Q.9
+                q_number = Paragraph(f"Q.{i}", question_number_style)
+                q_text = Paragraph(f"{question_text}", question_text_style)
+                
+                # Create table to keep number and text on same line with proper spacing
+                question_table = Table([[q_number, q_text]], colWidths=[35, doc.width - 35])
+                question_table.setStyle(TableStyle([
+                    ('VALIGN', (0, 0), (-1, 0), 'TOP'),
+                    ('LEFTPADDING', (0, 0), (-1, 0), 0),
+                    ('RIGHTPADDING', (0, 0), (-1, 0), 0),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 0),
+                ]))
+                
+                story.append(question_table)
+                story.append(Spacer(1, 8))  # Small space after question
+                
+                # Add instructions if present
+                if question.get('instructions'):
+                    instr_text = self.parse_latex_simple(question['instructions'])
+                    instr_style = ParagraphStyle(
+                        'InstructionStyle',
+                        parent=styles['Normal'],
+                        fontName='Times-Roman',
+                        fontSize=12,
+                        leftIndent=35,  # Same as options
+                        spaceAfter=6,
+                        leading=14,
+                        textColor=colors.black
+                    )
+                    instr = Paragraph(f"Note: {instr_text}", instr_style)
+                    story.append(instr)
+                    story.append(Spacer(1, 6))
+                
+                # Parse LaTeX in options
+                option_a = self.parse_latex_simple(question['option_a'])
+                option_b = self.parse_latex_simple(question['option_b'])
+                option_c = self.parse_latex_simple(question['option_c'])
+                option_d = self.parse_latex_simple(question['option_d'])
+                
+                # Check if we should use single column (if any option > 40% width)
+                use_single_column = self.should_use_single_column(option_a, option_b, option_c, option_d, doc.width)
+                
+                if use_single_column:
+                    # Single column layout - each option on its own line
+                    options_data = [
+                        [Paragraph(f"(A) {option_a}", option_style)],
+                        [Paragraph(f"(B) {option_b}", option_style)],
+                        [Paragraph(f"(C) {option_c}", option_style)],
+                        [Paragraph(f"(D) {option_d}", option_style)]
+                    ]
+                    col_widths = [doc.width]
+                else:
+                    # Two column layout - A&B in first row, C&D in second row
+                    options_data = [
+                        [Paragraph(f"(A) {option_a}", option_style), Paragraph(f"(B) {option_b}", option_style)],
+                        [Paragraph(f"(C) {option_c}", option_style), Paragraph(f"(D) {option_d}", option_style)]
+                    ]
+                    col_widths = [doc.width/2 - 5, doc.width/2 - 5]
+                
+                options_table = Table(options_data, colWidths=col_widths)
+                options_table.setStyle(TableStyle([
+                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+                ]))
+                
+                story.append(options_table)
+                story.append(Spacer(1, 15))
+                
+                # Add page break after every 8 questions
+                if i % 8 == 0:
+                    story.append(PageBreak())
+            
+            # Build PDF with header and footer, pass paper_name to header
+            doc.build(story, 
+                     onFirstPage=lambda canvas, doc: self.add_header_footer(canvas, doc, paper_name),
+                     onLaterPages=lambda canvas, doc: self.add_header_footer(canvas, doc, paper_name))
+            logging.info(f"Questions-only PDF created successfully: {output_path}")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to create questions-only PDF: {e}")
+            return False
+
+    def create_answers_only_pdf(self, questions, output_path, paper_name):
+        """Create PDF with only correct answers in optimized 4-column format"""
+        try:
+            doc = SimpleDocTemplate(
+                output_path,
+                pagesize=letter,
+                rightMargin=72,
+                leftMargin=72,
+                topMargin=72,
+                bottomMargin=72
+            )
+            
+            styles = getSampleStyleSheet()
+            
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontName='Times-Roman',
+                fontSize=16,
+                spaceAfter=20,
+                alignment=1,
+                textColor=colors.black
+            )
+            
+            story = []
+            
+            # Add title only (REMOVED file name from title - only show paper name)
+            title = Paragraph(f"{paper_name}", title_style)
+            story.append(title)
+            story.append(Spacer(1, 8))
+            story.append(Paragraph("Correct Answers", styles['Heading2']))
+            story.append(Spacer(1, 25))
+            
+            # Group questions into chunks of 100
+            chunk_size = 100
+            question_chunks = [questions[i:i + chunk_size] for i in range(0, len(questions), chunk_size)]
+            
+            for chunk_index, chunk in enumerate(question_chunks):
+                if chunk_index > 0:
+                    story.append(PageBreak())
+                
+                # Create table data for 4 columns with 25 rows each
+                table_data = []
+                
+                # Add header row
+                header_row = ['Q.No', 'Answer', 'Q.No', 'Answer', 'Q.No', 'Answer', 'Q.No', 'Answer']
+                table_data.append(header_row)
+                
+                # Add 25 rows
+                for row_num in range(25):
+                    row = []
+                    for col in range(4):
+                        question_index = row_num + (col * 25)
+                        if question_index < len(chunk):
+                            question = chunk[question_index]
+                            actual_q_no = chunk_index * chunk_size + question_index + 1
+                            row.extend([str(actual_q_no), question['correct_option']])
+                        else:
+                            row.extend(['', ''])
+                    
+                    table_data.append(row)
+                
+                # Calculate table width to match text margins
+                page_width = letter[0]
+                available_width = page_width - 72 - 72  # 72px left margin + 72px right margin
+                
+                col_width = available_width / 8
+                col_widths = [col_width] * 8
+                
+                table = Table(table_data, colWidths=col_widths)
+                table.setStyle(TableStyle([
+                    # Header style
+                    ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+                    ('ALIGN', (0, 0), (-1, -1), 'CENTER'),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Times-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, 0), 10),
+                    ('BOTTOMPADDING', (0, 0), (-1, 0), 8),
+                    
+                    # Data rows style
+                    ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+                    ('FONTNAME', (0, 1), (-1, -1), 'Times-Roman'),
+                    ('FONTSIZE', (0, 1), (-1, -1), 9),
+                    ('GRID', (0, 0), (-1, -1), 0.5, colors.black),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.whitesmoke]),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 6),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+                ]))
+                
+                story.append(table)
+                story.append(Spacer(1, 15))
+            
+            # Build PDF with header and footer, pass paper_name to header
+            doc.build(story, 
+                     onFirstPage=lambda canvas, doc: self.add_header_footer(canvas, doc, paper_name),
+                     onLaterPages=lambda canvas, doc: self.add_header_footer(canvas, doc, paper_name))
+            logging.info(f"Answers-only PDF created successfully: {output_path}")
+            return True
+            
+        except Exception as e:
+            logging.error(f"Failed to create answers-only PDF: {e}")
+            return False
+
+    def process_questions(self, data):
+        """Process questions and group by paper"""
+        papers = {}
+        
+        for row in data:
+            try:
+                # Extract paper information
+                folder = row.get(COLUMN_FOLDER, 'Default_Folder')
+                sub_folder = row.get(COLUMN_SUB_FOLDER, 'General')
+                file_name = row.get(COLUMN_FILE_NAME, 'Default_Paper')
+                
+                paper_key = f"{folder}_{sub_folder}_{file_name}"
+                
+                if paper_key not in papers:
+                    papers[paper_key] = {
+                        'folder': folder,
+                        'sub_folder': sub_folder,
+                        'file_name': file_name,
+                        'questions': []
+                    }
+                
+                # Create question dictionary
+                question = {
+                    'question_no': row.get(COLUMN_QUESTION_NO, ''),
+                    'question_text': row.get(COLUMN_QUESTION_TEXT, ''),
+                    'instructions': row.get(COLUMN_INSTRUCTIONS, ''),
+                    'option_a': row.get(COLUMN_OPTION_A, ''),
+                    'option_b': row.get(COLUMN_OPTION_B, ''),
+                    'option_c': row.get(COLUMN_OPTION_C, ''),
+                    'option_d': row.get(COLUMN_OPTION_D, ''),
+                    'correct_option': row.get(COLUMN_CORRECT_OPTION, ''),
+                    'explanation': row.get(COLUMN_EXPLANATION, ''),
+                    'content': row.get(COLUMN_CONTENT, ''),
+                    'question_image_url': row.get(COLUMN_QUESTION_IMAGE_URL, ''),
+                    'option_a_image_url': row.get(COLUMN_OPTION_A_IMAGE_URL, ''),
+                    'option_b_image_url': row.get(COLUMN_OPTION_B_IMAGE_URL, ''),
+                    'option_c_image_url': row.get(COLUMN_OPTION_C_IMAGE_URL, ''),
+                    'option_d_image_url': row.get(COLUMN_OPTION_D_IMAGE_URL, '')
+                }
+                
+                papers[paper_key]['questions'].append(question)
+                
+            except Exception as e:
+                logging.warning(f"Error processing row: {e}")
+                continue
+        
+        return papers
+
+def main():
+    # Configuration
+    CREDENTIALS_FILE = "service-account.json"
+    SPREADSHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+    WORKSHEET_NAME = "Sheet3"
+    OUTPUT_DIR = "Generated_PDFs"
+    
+    # Create output directory
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+    
+    try:
+        # Initialize PDF generator
+        pdf_gen = PDFGenerator(CREDENTIALS_FILE)
+        
+        # Load data from Google Sheets
+        data = pdf_gen.load_data_from_sheets(SPREADSHEET_ID, WORKSHEET_NAME)
+        
+        # Process questions
+        papers = pdf_gen.process_questions(data)
+        logging.info(f"Found {len(papers)} papers to process")
+        
+        # Generate PDFs
+        results = []
+        
+        for paper_key, paper_info in papers.items():
+            try:
+                paper_name = paper_info['file_name']
+                questions = paper_info['questions']
+                folder = paper_info['folder']
+                sub_folder = paper_info['sub_folder']
+                
+                logging.info(f"Processing: {paper_name} ({len(questions)} questions)")
+                
+                # Create local folder structure
+                local_folder_path = pdf_gen.create_folder_structure(OUTPUT_DIR, folder, sub_folder)
+                
+                # Create PDF filenames for three types
+                safe_name = "".join(c for c in paper_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+                
+                pdf_files = {
+                    'complete': os.path.join(local_folder_path, f"{safe_name}_Complete_Solutions.pdf"),
+                    'questions_only': os.path.join(local_folder_path, f"{safe_name}_Questions.pdf"),
+                    'answers_only': os.path.join(local_folder_path, f"{safe_name}_Correct_Answers.pdf")
+                }
+                
+                # Generate all three PDF types
+                pdf_results = {}
+                
+                # 1. Complete PDF (NO WATERMARK)
+                if pdf_gen.create_complete_pdf(questions, pdf_files['complete'], paper_name):
+                    pdf_results['complete'] = pdf_files['complete']
+                    logging.info(f"✓ Complete PDF created: {pdf_files['complete']}")
+                else:
+                    pdf_results['complete'] = None
+                    logging.error(f"✗ Failed to create complete PDF")
+                
+                # 2. Questions only PDF
+                if pdf_gen.create_questions_only_pdf(questions, pdf_files['questions_only'], paper_name):
+                    pdf_results['questions_only'] = pdf_files['questions_only']
+                    logging.info(f"✓ Questions-only PDF created: {pdf_files['questions_only']}")
+                else:
+                    pdf_results['questions_only'] = None
+                    logging.error(f"✗ Failed to create questions-only PDF")
+                
+                # 3. Answers only PDF
+                if pdf_gen.create_answers_only_pdf(questions, pdf_files['answers_only'], paper_name):
+                    pdf_results['answers_only'] = pdf_files['answers_only']
+                    logging.info(f"✓ Answers-only PDF created: {pdf_files['answers_only']}")
+                else:
+                    pdf_results['answers_only'] = None
+                    logging.error(f"✗ Failed to create answers-only PDF")
+                
+                # Store results
+                result = {
+                    'paper_name': paper_name,
+                    'folder': folder,
+                    'sub_folder': sub_folder,
+                    'questions_count': len(questions),
+                    'complete_pdf': pdf_results['complete'],
+                    'questions_pdf': pdf_results['questions_only'],
+                    'answers_pdf': pdf_results['answers_only'],
+                    'status': 'Success'
+                }
+                results.append(result)
+                
+                logging.info(f"Successfully processed: {paper_name}")
+                    
+            except Exception as e:
+                logging.error(f"Failed to process paper {paper_key}: {e}")
+                result = {
+                    'paper_name': paper_key,
+                    'folder': '',
+                    'sub_folder': '',
+                    'questions_count': 0,
+                    'complete_pdf': '',
+                    'questions_pdf': '',
+                    'answers_pdf': '',
+                    'status': f'Failed - {str(e)}'
+                }
+                results.append(result)
+        
+        # Save processing report
+        report_df = pd.DataFrame(results)
+        report_path = os.path.join(OUTPUT_DIR, "Processing_Report.csv")
+        report_df.to_csv(report_path, index=False)
+        logging.info(f"Results saved to: {report_path}")
+        
+        # Print summary
+        successful = len([r for r in results if r['status'] == 'Success'])
+        total = len(results)
+        
+        print("\n" + "="*60)
+        print("PDF GENERATION COMPLETE!")
+        print("="*60)
+        print(f"Successfully processed: {successful}/{total} papers")
+        print(f"Generated 3 PDF types for each paper:")
+        print("  • Complete Solutions (with explanations)")
+        print("  • Questions only (for practice)")
+        print("  • Correct Answers (100 questions per page)")
+        print(f"\nPDFs saved to: {OUTPUT_DIR}")
+        print("All done!")
+        
+    except Exception as e:
+        logging.error(f"Main process failed: {e}")
+        raise
+
+if __name__ == "__main__":
+    main()
