@@ -1,0 +1,235 @@
+import os
+import shutil
+import re
+
+BASE_DIR = r"C:\Users\menha\Downloads\test"
+BACKUP_DIR = r"C:\Users\menha\Downloads\test_backup"
+
+
+# ============================================================
+#  PATTERNS TO DELETE ANYWHERE (TOLERANT)
+# ============================================================
+PATTERNS = [
+    r"AG\s*-\s*Copyright\s*©\s*GATE\s*2021",
+    r"AE\s*-\s*Copyright\s*©\s*GATE\s*2021",
+    r"Page\s*\d+\s*of\s*\d+",
+    r"=+\s*Page\s*\d+\s*=+",
+
+    # GATE headers (tolerant)
+    r"GATE\s*Graduate\s*Aptitude\s*Test\s*in\s*Engineering\s*2021",
+    r"Graduate\s*Aptitude\s*Test\s*in\s*Engineering\s*2021",
+    r"GATE\s*2021",
+
+    # Branch headers
+    r"Agricultural\s*Engineering\s*\(AG\)",
+    r"Aerospace\s*Engineering\s*\(AE\)",
+
+    r"AE\s*\d+\/\d+",
+    r"=+\s*Pages?\s*\d+\s*-\s*\d+\s*=+",
+
+    # S/121 Food patterns
+    r"S\/121\s*Food\/06\-AE\-1\s*B",
+    r"S\/\d+\s*Food\/\d+\-AE\-\d+\s*[A-Z]?",
+
+    # Bold headers
+    r"\*\*GATE\*\*",
+    r"\*\*Graduate.*?Engineering\s*2021\*\*",
+    r"\*\*Aerospace\s*Engineering\s*\(AE\)\*\*",
+
+    # AI rewrite contamination (tolerant)
+    r"Of\s*course.*?readability\.?",
+]
+
+REGEXES = [re.compile(p, re.IGNORECASE) for p in PATTERNS]
+
+
+# ============================================================
+#  REMOVE STAR-ONLY LINES FIRST
+# ============================================================
+def remove_star_only_lines(content):
+    return re.sub(r"^\s*\*+\s*$", "", content, flags=re.MULTILINE)
+
+
+# ============================================================
+#  REMOVE ** BOLD MARKERS FIRST
+# ============================================================
+def remove_bold(content):
+    return content.replace("**", "")
+
+
+# ============================================================
+#  REMOVE GATE HEADER/FOOTER PATTERNS
+# ============================================================
+def remove_patterns(content):
+    for rx in REGEXES:
+        content = rx.sub("", content)
+    return content
+
+
+# ============================================================
+#  REMOVE TEXT AFTER END OF QUESTION PAPER
+# ============================================================
+def cut_after_end_marker(content):
+    marker = re.compile(
+        r"^\s*\*{0,5}END OF THE QUESTION PAPER\*{0,5}\s*$",
+        re.IGNORECASE | re.MULTILINE
+    )
+    m = marker.search(content)
+    if m:
+        return content[:m.start()], True
+    return content, False
+
+
+# ============================================================
+#  TRIM BEFORE FIRST MATCHING RANGE PATTERN + PLAIN Q.1
+# ============================================================
+def remove_text_before_first_q1(content):
+    """
+    Trim BEFORE the earliest occurrence of ANY of these patterns:
+
+      Q.1-Q.20 carry one mark each.
+      Q.1 – Q.20 carry one mark each.
+      Q.1 - Q.20 carry one mark each.
+      Q.1 - Q.25 carry one mark each.
+
+    (Flexible for ANY whitespace, ANY dash type.)
+
+    AND trim only when a PLAIN Q.1 exists somewhere below.
+    """
+
+    # Accept any Unicode dash
+    dash = r"[-–—−‒]"
+
+    # Accept ANY whitespace (normal, NBSP, zero-width)
+    ws = r"[\s\u00A0\u200B]*"
+
+    # Carry phrase (tolerant)
+    carry = r"carry" + ws + r"one" + ws + r"mark" + ws + r"each\.?"
+
+    # EXACT RANGE PATTERNS ALLOWED (with tolerant spacing)
+    exact_range_patterns = [
+        rf"Q\.?{ws}1{ws}{dash}{ws}Q\.?{ws}20{ws}{carry}",
+        rf"Q\.?{ws}1{ws}{dash}{ws}Q\.?{ws}25{ws}{carry}",
+    ]
+
+    range_matches = []
+    for pat in exact_range_patterns:
+        rx = re.compile(pat, re.IGNORECASE)
+        m = rx.search(content)
+        if m:
+            range_matches.append(m)
+
+    # must find at least one of the four patterns
+    if not range_matches:
+        return content, False
+
+    # plain Q.1 (NOT followed by dash or number)
+    plain_q1 = re.compile(
+        rf"\bQ\.?{ws}1\b(?!{ws}{dash}|{ws}\d)",
+        re.IGNORECASE
+    )
+
+    m_plain = plain_q1.search(content)
+    if not m_plain:
+        return content, False
+
+    # earliest index
+    range_index = min(m.start() for m in range_matches)
+    cut_index = min(range_index, m_plain.start())
+
+    return content[cut_index:], True
+
+
+# ============================================================
+#  MAIN CLEAN FUNCTION
+# ============================================================
+def clean_text_files():
+    print("[INFO] Cleaning started...")
+    scanned = 0
+    modified = 0
+
+    for root, dirs, files in os.walk(BASE_DIR):
+        for file in files:
+            if not file.lower().endswith(".txt"):
+                continue
+
+            scanned += 1
+            path = os.path.join(root, file)
+
+            with open(path, "r", encoding="utf-8", errors="ignore") as f:
+                original = f.read()
+
+            content = original
+
+            # PRE-CLEAN FIRST
+            content = remove_star_only_lines(content)
+            content = remove_bold(content)
+
+            # REMOVE ALL GATE HEADERS/FOOTERS
+            content = remove_patterns(content)
+
+            # REMOVE END-OF-PAPER CONTENT
+            content, removed_end = cut_after_end_marker(content)
+
+            # REMOVE TEXT BEFORE OUR EXACT RANGE MATCHES
+            content, trimmed = remove_text_before_first_q1(content)
+
+            # CLEAN AGAIN
+            content = remove_star_only_lines(content)
+            content = re.sub(r"\n\s*\n+", "\n\n", content)
+
+            if content != original:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                modified += 1
+
+                print("[CLEANED]", path,
+                      "(Trimmed)" if trimmed else "",
+                      "(END removed)" if removed_end else "")
+
+    print(f"\n[DONE] Total scanned: {scanned}, Modified: {modified}")
+
+
+# ============================================================
+#  BACKUP / RESTORE MENU
+# ============================================================
+def backup():
+    if os.path.exists(BACKUP_DIR):
+        print("[INFO] Backup already exists")
+        return
+    shutil.copytree(BASE_DIR, BACKUP_DIR)
+    print("[OK] Backup created")
+
+def restore():
+    if not os.path.exists(BACKUP_DIR):
+        print("[ERROR] No backup found")
+        return
+    if os.path.exists(BASE_DIR):
+        shutil.rmtree(BASE_DIR)
+    shutil.copytree(BACKUP_DIR, BASE_DIR)
+    print("[OK] Restore completed")
+
+
+# ============================================================
+#  CLI MENU
+# ============================================================
+if __name__ == "__main__":
+    print("1 = Backup")
+    print("2 = Clean")
+    print("3 = Restore")
+    print("4 = Backup + Clean")
+
+    choice = input("Enter 1/2/3/4: ").strip()
+
+    if choice == "1":
+        backup()
+    elif choice == "2":
+        clean_text_files()
+    elif choice == "3":
+        if input("Confirm restore (yes/no): ").lower() == "yes":
+            restore()
+    elif choice == "4":
+        backup()
+        clean_text_files()
+    else:
+        print("Invalid choice")
