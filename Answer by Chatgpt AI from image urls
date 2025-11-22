@@ -2,12 +2,15 @@ import requests
 import base64
 import json
 import re
+from PIL import Image
+from io import BytesIO
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from typing import Dict, List, Tuple
 import time
+import concurrent.futures
 
-class OpenAIImageAnalyzer:
+class MultiQuestionExtractor:
     def __init__(self, api_key: str):
         self.api_key = api_key
         self.base_url = "https://api.openai.com/v1/chat/completions"
@@ -16,47 +19,79 @@ class OpenAIImageAnalyzer:
             "Authorization": f"Bearer {api_key}"
         }
     
-    def encode_image_to_base64(self, image_url: str) -> str:
-        """Encode image from URL to base64"""
+    def optimize_image(self, image_url, target_width=768):
+        """Optimize image for better text readability"""
         try:
-            print(f"Downloading image from: {image_url}")
             response = requests.get(image_url, timeout=30)
-            response.raise_for_status()
+            img = Image.open(BytesIO(response.content))
             
-            content_type = response.headers.get('content-type', '').lower()
-            if not content_type.startswith('image/'):
-                print(f"Warning: URL doesn't point to an image. Content-Type: {content_type}")
+            width, height = img.size
+            if width > target_width:
+                ratio = target_width / float(width)
+                new_height = int(float(height) * ratio)
+                img = img.resize((target_width, new_height), Image.Resampling.LANCZOS)
             
-            base64_image = base64.b64encode(response.content).decode('utf-8')
-            print("Image successfully encoded to base64")
-            return base64_image
+            if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
+                
+            output = BytesIO()
+            img.save(output, format='JPEG', quality=90, optimize=True)
+            return base64.b64encode(output.getvalue()).decode('utf-8')
             
-        except requests.exceptions.RequestException as e:
-            print(f"Error downloading image: {e}")
-            return None
         except Exception as e:
-            print(f"Error encoding image: {e}")
+            print(f"Image optimization failed: {e}")
             return None
     
-    def analyze_image_and_question(self, image_url: str, question_text: str = "") -> Dict:
-        """Analyze image and question using OpenAI GPT-4 Vision API"""
+    def extract_all_questions_from_image(self, image_url: str, file_name: str) -> List[Dict]:
+        """Extract ALL questions from a single image containing multiple questions"""
         
-        base64_image = self.encode_image_to_base64(image_url)
+        base64_image = self.optimize_image(image_url)
         if not base64_image:
-            return {"error": "Failed to download or encode image"}
+            return [{"error": "Image processing failed", "file_name": file_name}]
         
-        # Improved prompt with better JSON formatting instructions
-        prompt = """Analyze this educational image containing a question and provide:
-1. The correct answer (option letter A/B/C/D for MCQ, or text for fill-in-blanks)
-2. A brief explanation
+        prompt = """ANALYZE THIS EDUCATIONAL QUESTION PAPER IMAGE:
 
-Return ONLY valid JSON in this exact format:
-{
-    "correct_answer": "A",
-    "explanation": "This is correct because..."
-}
+EXTRACTION RULES:
+1. Extract EACH question separately
+2. IGNORE headers, footers, page numbers, instructions like "Q.1 - Q.20 carry one mark each"
+3. Extract ONLY the actual questions and their options
+4. For MATHEMATICAL EQUATIONS and CHEMICAL FORMULAS, convert to UNICODE TEXT format (NOT LaTeX)
+5. DETECT if there are any DIAGRAMS, IMAGES, or VISUAL ELEMENTS in:
+   - The question itself
+   - Any of the options (A, B, C, D)
+6. For each question, extract:
+   - Full question text
+   - All options (A, B, C, D)
+   - Question number
+   - Whether question contains image/diagram (true/false)
+   - Which options contain images/diagrams (list of option letters)
 
-Do not include any other text, explanations, or markdown formatting."""
+IMAGE DETECTION EXAMPLES:
+- If question has a circuit diagram: "has_question_image": true
+- If option B has a graph: "options_with_images": ["B"]
+- If multiple options have images: "options_with_images": ["A", "C"]
+- If no images: "has_question_image": false, "options_with_images": []
+
+MATHEMATICAL CONVERSION EXAMPLES:
+- LaTeX: \( f(\theta) = \begin{bmatrix} \cos\theta & \sin\theta \\ -\sin\theta & \cos\theta \end{bmatrix} \)
+- Unicode: f(θ) = [[cos θ, sin θ], [-sin θ, cos θ]]
+
+OUTPUT FORMAT: Return ONLY valid JSON array:
+[
+  {
+    "question_number": "Q.1",
+    "question_text": "full question text with Unicode math/chemistry",
+    "option_a": "option A text with Unicode",
+    "option_b": "option B text with Unicode", 
+    "option_c": "option C text with Unicode",
+    "option_d": "option D text with Unicode",
+    "has_question_image": true/false,
+    "options_with_images": ["A", "C"] // or empty array
+  }
+]
+
+EXCLUDE: Page headers, footers, instructions, "carry one mark each", page numbers
+USE UNICODE: For all mathematical symbols and chemical formulas"""
         
         payload = {
             "model": "gpt-4o",
@@ -64,135 +99,227 @@ Do not include any other text, explanations, or markdown formatting."""
                 {
                     "role": "user",
                     "content": [
-                        {
-                            "type": "text",
-                            "text": prompt + (f"\nQuestion context: {question_text}" if question_text else "")
-                        },
+                        {"type": "text", "text": prompt},
                         {
                             "type": "image_url",
                             "image_url": {
-                                "url": f"data:image/jpeg;base64,{base64_image}"
+                                "url": f"data:image/jpeg;base64,{base64_image}",
+                                "detail": "high"
                             }
                         }
                     ]
                 }
             ],
-            "max_tokens": 500,
+            "max_tokens": 4000,
             "temperature": 0.1
         }
         
         try:
-            print("Sending request to OpenAI Vision API...")
-            response = requests.post(
-                self.base_url, 
-                headers=self.headers, 
-                json=payload,
-                timeout=60
-            )
+            print(f"Extracting questions from: {file_name}")
+            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=60)
             
-            print(f"API Response Status: {response.status_code}")
-            
-            if response.status_code != 200:
-                error_detail = response.text
-                print(f"API Error {response.status_code}: {error_detail}")
-                return {"error": f"API: HTTP {response.status_code}"}
-            
-            result = response.json()
-            
-            if 'choices' not in result or not result['choices']:
-                return {"error": "API: No response choices found"}
-            
-            answer_content = result['choices'][0]['message']['content'].strip()
-            print("Raw API response received:")
-            print(answer_content)
-            
-            # Improved JSON parsing with multiple fallback methods
-            parsed_result = self._parse_json_response(answer_content)
-            return parsed_result
+            if response.status_code == 200:
+                result = response.json()
+                content = result['choices'][0]['message']['content'].strip()
+                print("Raw extraction completed")
                 
-        except requests.exceptions.Timeout:
-            return {"error": "API: Request timeout"}
+                questions = self._parse_questions_json(content)
+                
+                # Add file name to each question and ensure image fields exist
+                for question in questions:
+                    question["file_name"] = file_name
+                    # Ensure image detection fields exist
+                    if "has_question_image" not in question:
+                        question["has_question_image"] = False
+                    if "options_with_images" not in question:
+                        question["options_with_images"] = []
+                
+                print(f"✅ Extracted {len(questions)} questions from {file_name}")
+                return questions
+            else:
+                return [{"error": f"API Error: {response.status_code}", "file_name": file_name}]
+                
         except Exception as e:
-            return {"error": f"API: Unexpected error - {str(e)}"}
+            return [{"error": f"Extraction failed: {str(e)}", "file_name": file_name}]
     
-    def _parse_json_response(self, text: str) -> Dict:
-        """Parse JSON response with multiple fallback methods"""
-        text = text.strip()
+    def process_image_batch(self, image_batch: List[Tuple[str, str]]) -> List[Dict]:
+        """Process a batch of images concurrently"""
+        results = []
         
-        # Method 1: Direct JSON parsing
-        try:
-            return json.loads(text)
-        except json.JSONDecodeError:
-            print("Method 1: Direct JSON parsing failed")
-            pass
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            # Submit all tasks
+            future_to_image = {
+                executor.submit(self.extract_all_questions_from_image, url, name): (name, url) 
+                for name, url in image_batch
+            }
+            
+            # Collect results as they complete
+            for future in concurrent.futures.as_completed(future_to_image):
+                name, url = future_to_image[future]
+                try:
+                    questions = future.result()
+                    results.extend(questions)
+                    print(f"✅ Completed batch item: {name}")
+                except Exception as e:
+                    error_result = [{"error": f"Batch processing failed: {str(e)}", "file_name": name}]
+                    results.extend(error_result)
+                    print(f"❌ Failed batch item: {name}")
         
-        # Method 2: Extract JSON from code blocks
-        json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
-        if json_match:
-            try:
-                return json.loads(json_match.group(1))
-            except json.JSONDecodeError:
-                print("Method 2: JSON from code blocks failed")
-                pass
+        return results
+    
+    def get_correct_answers_batch(self, questions: List[Dict]) -> List[Dict]:
+        """Get correct answers for a batch of questions"""
+        results = []
         
-        # Method 3: Find JSON object pattern
-        json_pattern = r'\{[^{}]*"[^"]*"[^{}]*\}'
-        matches = re.finditer(json_pattern, text)
-        for match in matches:
-            try:
-                return json.loads(match.group())
-            except json.JSONDecodeError:
-                continue
+        # Process questions in smaller batches to avoid rate limits
+        batch_size = 5
+        for i in range(0, len(questions), batch_size):
+            batch = questions[i:i + batch_size]
+            print(f"🔄 Analyzing answer batch {i//batch_size + 1}/{(len(questions)-1)//batch_size + 1}")
+            
+            for question in batch:
+                if "error" in question:
+                    results.append(question)
+                    continue
+                
+                answer_result = self._analyze_single_question(question)
+                # Combine question data with answer
+                combined = {**question, **answer_result}
+                results.append(combined)
+                
+                # Smaller delay for batch processing
+                time.sleep(1)
         
-        # Method 4: Manual parsing from text
-        print("Method 4: Attempting manual parsing from text")
-        result = {
-            "correct_answer": "",
-            "explanation": text  # Fallback: use entire text as explanation
+        return results
+    
+    def _analyze_single_question(self, question: Dict) -> Dict:
+        """Analyze a single question for correct answer"""
+        
+        # Include image information in the prompt for context
+        image_info = ""
+        if question.get("has_question_image"):
+            image_info = " [Note: Question contains diagram/image]"
+        if question.get("options_with_images"):
+            image_info += f" [Options with images: {', '.join(question['options_with_images'])}]"
+        
+        prompt = f"""Question: {question.get('question_text', '')}{image_info}
+Options:
+A: {question.get('option_a', '')}
+B: {question.get('option_b', '')} 
+C: {question.get('option_c', '')}
+D: {question.get('option_d', '')}
+
+Determine the correct option and provide brief explanation.
+Return ONLY JSON:
+{{
+    "correct_answer": "A/B/C/D",
+    "explanation": "brief explanation"
+}}"""
+        
+        payload = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 300,
+            "temperature": 0.1
         }
         
-        # Try to extract answer from text
-        text_lower = text.lower()
-        
-        # Look for MCQ options
-        mcq_patterns = [
-            r'correct.*?[abcd]',
-            r'answer.*?[abcd]', 
-            r'option.*?[abcd]',
-            r'[abcd].*?correct',
-            r'[ⓐⓑⓒⓓ]'
-        ]
-        
-        for pattern in mcq_patterns:
-            matches = re.search(pattern, text_lower)
-            if matches:
-                # Extract the option letter
-                option_match = re.search(r'[abcd]', matches.group())
-                if option_match:
-                    result["correct_answer"] = option_match.group().upper()
-                    break
-        
-        # If no MCQ answer found, look for fill-in-blank patterns
-        if not result["correct_answer"]:
-            fill_patterns = [
-                r'answer:?\s*"([^"]+)"',
-                r'correct:?\s*"([^"]+)"',
-                r'is:\s*([^\n,.]+)',
-            ]
+        try:
+            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=30)
+            if response.status_code == 200:
+                result = response.json()
+                content = result['choices'][0]['message']['content'].strip()
+                return self._parse_json_response(content)
+            else:
+                return {"correct_answer": "Error", "explanation": f"API: {response.status_code}"}
+        except Exception as e:
+            return {"correct_answer": "Error", "explanation": f"Analysis failed: {str(e)}"}
+    
+    def _parse_questions_json(self, text: str) -> List[Dict]:
+        """Parse the questions JSON array"""
+        try:
+            # Clean the text
+            clean_text = re.sub(r'```json|```', '', text).strip()
+            questions = json.loads(clean_text)
             
-            for pattern in fill_patterns:
-                matches = re.search(pattern, text_lower)
-                if matches:
-                    result["correct_answer"] = matches.group(1).strip()
-                    break
+            # Validate it's a list
+            if isinstance(questions, list):
+                return questions
+            else:
+                return [questions]  # Wrap single question in list
+                
+        except json.JSONDecodeError as e:
+            print(f"JSON parsing failed: {e}")
+            return self._manual_question_extraction(text)
+    
+    def _manual_question_extraction(self, text: str) -> List[Dict]:
+        """Fallback manual extraction"""
+        print("Using fallback manual extraction")
+        questions = []
+        lines = text.split('\n')
         
-        return result
+        current_question = None
+        current_option = None
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Detect question number
+            q_match = re.match(r'^(Q\.\s*\d+|[Qq]uestion\s*\d+)', line)
+            if q_match:
+                # Save previous question if exists
+                if current_question and current_question.get('question_text'):
+                    questions.append(current_question)
+                
+                # Start new question
+                current_question = {
+                    "question_number": q_match.group(0),
+                    "question_text": line[len(q_match.group(0)):].strip(),
+                    "option_a": "", "option_b": "", "option_c": "", "option_d": "",
+                    "has_question_image": False,
+                    "options_with_images": []
+                }
+                current_option = None
+                continue
+            
+            # Detect options
+            option_match = re.match(r'^\(([A-D])\)\s*(.+)', line)
+            if not option_match:
+                option_match = re.match(r'^([A-D])\.\s*(.+)', line)
+            if not option_match:
+                option_match = re.match(r'^([A-D])\s*(.+)', line)
+            
+            if option_match and current_question:
+                option_key = f"option_{option_match.group(1).lower()}"
+                current_question[option_key] = option_match.group(2).strip()
+                current_option = option_key
+            elif current_option and current_question:
+                # Continue current option
+                current_question[current_option] += " " + line
+            elif current_question and not any(current_question[opt] for opt in ['option_a', 'option_b', 'option_c', 'option_d']):
+                # This is still question text
+                current_question["question_text"] += " " + line
+        
+        # Add the last question
+        if current_question and current_question.get('question_text'):
+            questions.append(current_question)
+        
+        return questions
+    
+    def _parse_json_response(self, text: str) -> Dict:
+        """Parse single JSON response"""
+        try:
+            clean_text = re.sub(r'```json|```', '', text).strip()
+            return json.loads(clean_text)
+        except:
+            return {"correct_answer": "", "explanation": text}
 
 class GoogleSheetProcessor:
     def __init__(self, credentials_file: str, sheet_id: str, api_key: str, sheet_tab: str = "Sheet4"):
         self.sheet_id = sheet_id
         self.sheet_tab = sheet_tab
-        self.analyzer = OpenAIImageAnalyzer(api_key)
+        self.extractor = MultiQuestionExtractor(api_key)
         self.service = self._authenticate_google_sheets(credentials_file)
     
     def _authenticate_google_sheets(self, credentials_file: str):
@@ -208,9 +335,9 @@ class GoogleSheetProcessor:
             raise
     
     def read_sheet_data(self, sheet_range: str = None) -> List[List]:
-        """Read data from Google Sheets"""
+        """Read image URLs and file names from Google Sheets"""
         if sheet_range is None:
-            sheet_range = f"{self.sheet_tab}!A:D"  # Read A to D columns
+            sheet_range = f"{self.sheet_tab}!A:B"
             
         try:
             sheet = self.service.spreadsheets()
@@ -244,124 +371,181 @@ class GoogleSheetProcessor:
             print(f"Error updating sheet: {e}")
             raise
     
-    def process_images(self):
-        """Main function to process all images in the sheet"""
-        # Read data from A to D columns (we'll write to C and D)
-        data = self.read_sheet_data(f"{self.sheet_tab}!A:D")
+    def clear_previous_data(self, range: str):
+        """Clear previous data from specified range"""
+        try:
+            sheet = self.service.spreadsheets()
+            result = sheet.values().clear(
+                spreadsheetId=self.sheet_id,
+                range=range
+            ).execute()
+            print(f"Cleared previous data from {range}")
+            return result
+        except Exception as e:
+            print(f"Error clearing data: {e}")
+    
+    def process_all_images(self, batch_size: int = 3):
+        """Process all images in batches and extract multiple questions from each"""
+        data = self.read_sheet_data(f"{self.sheet_tab}!A:B")
         
         if not data or len(data) < 2:
             print("No data found or insufficient columns")
             return
         
-        updates = []
-        processed_count = 0
+        all_questions = []
+        total_images = 0
         
-        for i, row in enumerate(data[1:], start=2):  # Start from row 2 (skip header)
-            # Ensure row has at least 2 columns
+        # Clear previous results (columns C through N)
+        self.clear_previous_data(f"{self.sheet_tab}!C:N")
+        
+        # Prepare image batches
+        image_batches = []
+        current_batch = []
+        
+        for i, row in enumerate(data[1:], start=2):
             while len(row) < 2:
-                row.append("")  # Add empty strings for missing columns
+                row.append("")
             
-            image_url = row[1]  # Column B
-            question_text = row[0] if len(row) > 0 else ""  # Column A
+            file_name = row[0] if len(row) > 0 else f"Image_{i}"
+            image_url = row[1]
             
             if not image_url or not image_url.startswith('http'):
-                updates.append(["", ""])  # Empty for C and D columns
+                print(f"Skipping row {i}: No valid URL")
                 continue
             
-            print(f"\n--- Processing row {i} ---")
-            print(f"Image URL: {image_url}")
-            print(f"Question: {question_text}")
+            current_batch.append((file_name, image_url))
             
-            # Analyze image
-            result = self.analyzer.analyze_image_and_question(image_url, question_text)
-            
-            # Prepare update for columns C and D
-            if "error" not in result:
-                correct_answer = result.get("correct_answer", "Not found")
-                explanation = result.get("explanation", "No explanation provided")
-                
-                # Clean up the answer
-                if correct_answer and correct_answer != "Not found":
-                    processed_count += 1
-                
-                updates.append([correct_answer, explanation])
-                print(f"✅ Correct Answer: {correct_answer}")
-                print(f"📝 Explanation: {explanation}")
-            else:
-                error_msg = result["error"]
-                updates.append([f"Error: {error_msg}", "See error details"])
-                print(f"❌ Error: {error_msg}")
-            
-            time.sleep(2)  # Rate limiting
+            # When batch is full, process it
+            if len(current_batch) >= batch_size:
+                image_batches.append(current_batch)
+                current_batch = []
         
-        # Update columns C and D starting from row 2
+        # Add remaining images as last batch
+        if current_batch:
+            image_batches.append(current_batch)
+        
+        print(f"\n📦 Processing {len(image_batches)} batches with {batch_size} images each")
+        
+        # Process each batch
+        for batch_num, image_batch in enumerate(image_batches, 1):
+            print(f"\n{'='*70}")
+            print(f"🔄 PROCESSING BATCH {batch_num}/{len(image_batches)}")
+            print(f"{'='*70}")
+            
+            # Process batch concurrently
+            batch_questions = self.extractor.process_image_batch(image_batch)
+            
+            # Filter out errors and get correct answers
+            valid_questions = [q for q in batch_questions if "error" not in q]
+            if valid_questions:
+                print(f"🔄 Getting correct answers for {len(valid_questions)} questions...")
+                complete_questions = self.extractor.get_correct_answers_batch(valid_questions)
+                all_questions.extend(complete_questions)
+                total_images += len(image_batch)
+            
+            # Add error questions as well
+            error_questions = [q for q in batch_questions if "error" in q]
+            all_questions.extend(error_questions)
+            
+            print(f"✅ Batch {batch_num} completed: {len(valid_questions)} questions extracted")
+            
+            # Rate limiting between batches
+            if batch_num < len(image_batches):
+                print("⏳ Waiting before next batch...")
+                time.sleep(5)
+        
+        # Prepare updates for Google Sheets
+        updates = []
+        for question in all_questions:
+            if "error" in question:
+                updates.append([
+                    question.get("file_name", ""),         # Column C: File Name
+                    question.get("source_row", ""),        # Column D: Source Row
+                    f"Error: {question['error']}",         # Column E: Error
+                    "", "", "", "", "", "", "", "", ""     # Empty columns for consistency
+                ])
+            else:
+                # Format image information
+                has_question_image = "Yes" if question.get("has_question_image") else "No"
+                options_with_images = ", ".join(question.get("options_with_images", [])) or "None"
+                
+                updates.append([
+                    question.get("file_name", ""),         # Column C: File Name
+                    question.get("source_row", ""),        # Column D: Source Row  
+                    question.get("question_number", ""),   # Column E: Question Number
+                    question.get("question_text", ""),     # Column F: Question Text
+                    question.get("option_a", ""),          # Column G: Option A
+                    question.get("option_b", ""),          # Column H: Option B
+                    question.get("option_c", ""),          # Column I: Option C
+                    question.get("option_d", ""),          # Column J: Option D
+                    has_question_image,                    # Column K: Question Has Image
+                    options_with_images,                   # Column L: Options With Images
+                    question.get("correct_answer", ""),    # Column M: Correct Answer
+                    question.get("explanation", "")        # Column N: Explanation
+                ])
+        
+        # Write all questions to sheet
         if updates:
-            update_range = f"{self.sheet_tab}!C2:D{len(updates)+1}"
+            # Write header row
+            header = [
+                "File Name", "Source Row", "Q Number", "Question Text", 
+                "Option A", "Option B", "Option C", "Option D", 
+                "Question Has Image", "Options With Images",
+                "Correct Answer", "Explanation"
+            ]
+            updates.insert(0, header)
+            
+            update_range = f"{self.sheet_tab}!C2:N{len(updates)+1}"
             self.update_sheet(updates, update_range)
-            print(f"\n🎉 Successfully processed {processed_count} images out of {len(updates)} rows")
-            print(f"📊 Results written to columns C (Answers) and D (Explanations)")
+            
+            print(f"\n🎉 PROCESSING COMPLETED!")
+            print(f"📊 Total Images Processed: {total_images}")
+            print(f"📝 Total Questions Extracted: {len([q for q in all_questions if 'error' not in q])}")
+            print(f"💾 Results saved to columns C-N")
+            print(f"📋 Column Structure:")
+            print(f"   C: File Name")
+            print(f"   D: Source Row") 
+            print(f"   E: Question Number")
+            print(f"   F: Question Text (Unicode Math/Chemistry)")
+            print(f"   G: Option A (Unicode)")
+            print(f"   H: Option B (Unicode)")
+            print(f"   I: Option C (Unicode)")
+            print(f"   J: Option D (Unicode)")
+            print(f"   K: Question Has Image (Yes/No)")
+            print(f"   L: Options With Images (A,B,C or None)")
+            print(f"   M: Correct Answer")
+            print(f"   N: Explanation")
         else:
-            print("No updates to process")
-
-def test_openai_connection(api_key: str):
-    """Test OpenAI API connection"""
-    print("Testing OpenAI API connection...")
-    
-    test_payload = {
-        "model": "gpt-3.5-turbo",
-        "messages": [{"role": "user", "content": "Respond with only: 'API is working'"}],
-        "max_tokens": 10
-    }
-    
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {api_key}"
-    }
-    
-    try:
-        response = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=test_payload,
-            timeout=30
-        )
-        print(f"OpenAI Test Status: {response.status_code}")
-        if response.status_code == 200:
-            result = response.json()
-            print(f"OpenAI Test Response: {result['choices'][0]['message']['content']}")
-            print("✅ OpenAI API connection is working!")
-            return True
-        else:
-            print(f"❌ OpenAI API test failed: {response.text}")
-            return False
-    except Exception as e:
-        print(f"❌ OpenAI API test error: {e}")
-        return False
+            print("❌ No questions were extracted")
 
 def main():
-    # Configuration - REPLACE WITH YOUR OPENAI API KEY
-    OPENAI_API_KEY = "your_openai_api_key_here"  # Get from https://platform.openai.com/api-keys
+    # Configuration
+    OPENAI_API_KEY = "your_openai_api_key_here"
     
     if not OPENAI_API_KEY or OPENAI_API_KEY == "your_openai_api_key_here":
-        print("❌ Please set your OpenAI API key in the script")
-        print("Get one from: https://platform.openai.com/api-keys")
+        print("❌ Please set your OpenAI API key")
         return
     
     SHEET_TAB = "Sheet4"
     GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
-    CREDENTIALS_FILE = "service-account.json"  # Your Google service account file
+    CREDENTIALS_FILE = "service-account.json"
     
-    # Test API connection first
-    if not test_openai_connection(OPENAI_API_KEY):
-        print("❌ OpenAI API test failed. Please check your API key.")
-        return
+    # 🎯 CONFIGURATION: Change batch size here
+    BATCH_SIZE = 3  # Process 3 images at a time
     
     try:
-        print("\n" + "="*60)
-        print("Starting Google Sheets processing with OpenAI Vision API")
-        print("="*60)
+        print("\n" + "="*80)
+        print("ADVANCED MULTI-QUESTION EXTRACTION WITH BATCH PROCESSING")
+        print(f"Batch Size: {BATCH_SIZE} images per batch")
+        print("Features:")
+        print("✓ Batch processing for faster execution")
+        print("✓ Detects images in questions and options")
+        print("✓ Converts math equations to Unicode")
+        print("✓ Includes file name in each row")
+        print("="*80)
+        
         processor = GoogleSheetProcessor(CREDENTIALS_FILE, GOOGLE_SHEET_ID, OPENAI_API_KEY, SHEET_TAB)
-        processor.process_images()
+        processor.process_all_images(batch_size=BATCH_SIZE)
     except Exception as e:
         print(f"❌ Processing failed: {e}")
 
