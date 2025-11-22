@@ -1,0 +1,509 @@
+import requests
+import base64
+import json
+import re
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from typing import Dict, List, Tuple
+import time
+
+class OpenAIImageAnalyzer:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.openai.com/v1/chat/completions"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+    
+    def encode_image_to_base64(self, image_url: str) -> str:
+        """Encode image from URL to base64"""
+        try:
+            print(f"Downloading image from: {image_url}")
+            response = requests.get(image_url, timeout=30)
+            response.raise_for_status()
+            
+            content_type = response.headers.get('content-type', '').lower()
+            if not content_type.startswith('image/'):
+                print(f"Warning: URL doesn't point to an image. Content-Type: {content_type}")
+            
+            base64_image = base64.b64encode(response.content).decode('utf-8')
+            print("Image successfully encoded to base64")
+            return base64_image
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Error downloading image: {e}")
+            return None
+        except Exception as e:
+            print(f"Error encoding image: {e}")
+            return None
+    
+    def extract_question_and_options(self, image_url: str) -> Dict:
+        """Extract question text and options from image"""
+        base64_image = self.encode_image_to_base64(image_url)
+        if not base64_image:
+            return {"error": "Failed to download or encode image"}
+        
+        prompt = """Extract ALL text from this educational question image exactly as it appears.
+        Return ONLY valid JSON with this exact structure:
+        {
+            "question_text": "Full question text here",
+            "option_a": "Option A text",
+            "option_b": "Option B text", 
+            "option_c": "Option C text",
+            "option_d": "Option D text",
+            "question_type": "MCQ or FILL_IN_BLANK"
+        }
+        
+        If it's fill-in-the-blanks, put the entire question in "question_text" and leave options empty.
+        Extract ALL visible text exactly as shown. Do not add any explanations."""
+        
+        payload = {
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 1000,
+            "temperature": 0.1
+        }
+        
+        try:
+            print("Extracting question and options from image...")
+            response = requests.post(
+                self.base_url, 
+                headers=self.headers, 
+                json=payload,
+                timeout=60
+            )
+            
+            if response.status_code != 200:
+                return {"error": f"Extraction failed: HTTP {response.status_code}"}
+            
+            result = response.json()
+            answer_content = result['choices'][0]['message']['content'].strip()
+            print("Raw extraction response received")
+            
+            return self._parse_json_response(answer_content)
+                
+        except Exception as e:
+            return {"error": f"Extraction error: {str(e)}"}
+    
+    def get_correct_answer(self, question_data: Dict) -> Dict:
+        """Get correct answer and explanation for the extracted question"""
+        
+        if question_data.get("question_type") == "FILL_IN_BLANK":
+            prompt = f"""This is a fill-in-the-blanks question:
+            Question: {question_data.get('question_text', '')}
+            
+            Provide the correct answer to fill in the blank(s) and a brief explanation.
+            
+            Return ONLY valid JSON without any code blocks or additional text:
+            {{
+                "correct_answer": "the correct fill-in answer",
+                "explanation": "brief explanation why this is correct"
+            }}"""
+        else:
+            prompt = f"""This is a multiple-choice question:
+            Question: {question_data.get('question_text', '')}
+            Options:
+            A: {question_data.get('option_a', '')}
+            B: {question_data.get('option_b', '')}
+            C: {question_data.get('option_c', '')}
+            D: {question_data.get('option_d', '')}
+            
+            Analyze and provide the correct option (A, B, C, or D) with a brief explanation.
+            
+            Return ONLY valid JSON without any code blocks or additional text:
+            {{
+                "correct_answer": "A/B/C/D",
+                "explanation": "brief explanation why this option is correct"
+            }}"""
+        
+        payload = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 500,
+            "temperature": 0.1
+        }
+        
+        try:
+            print("Getting correct answer and explanation...")
+            response = requests.post(
+                self.base_url, 
+                headers=self.headers, 
+                json=payload,
+                timeout=60
+            )
+            
+            if response.status_code != 200:
+                return {"error": f"Answer analysis failed: HTTP {response.status_code}"}
+            
+            result = response.json()
+            answer_content = result['choices'][0]['message']['content'].strip()
+            print(f"Raw answer response: {answer_content}")
+            
+            return self._parse_json_response(answer_content)
+                
+        except Exception as e:
+            return {"error": f"Answer analysis error: {str(e)}"}
+    
+    def _parse_json_response(self, text: str) -> Dict:
+        """Parse JSON response with multiple fallback methods"""
+        text = text.strip()
+        print(f"Parsing JSON from: {text[:200]}...")
+        
+        # Method 1: Try direct JSON parsing
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError as e:
+            print(f"Method 1 failed: {e}")
+            pass
+        
+        # Method 2: Extract JSON from code blocks (```json ... ```)
+        json_match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', text, re.DOTALL)
+        if json_match:
+            try:
+                json_str = json_match.group(1)
+                # Clean up escaped quotes
+                json_str = json_str.replace('\\"', '"').replace('""', '"')
+                return json.loads(json_str)
+            except json.JSONDecodeError as e:
+                print(f"Method 2 failed: {e}")
+                pass
+        
+        # Method 3: Find any JSON-like structure
+        json_pattern = r'\{[^{}]*(?:(?:\{[^{}]*\}[^{}]*)*)\}'
+        matches = re.finditer(json_pattern, text, re.DOTALL)
+        for match in matches:
+            try:
+                json_str = match.group()
+                # Clean the JSON string
+                json_str = re.sub(r'[\x00-\x1f\x7f-\x9f]', '', json_str)
+                json_str = json_str.replace('\\"', '"').replace('""', '"')
+                return json.loads(json_str)
+            except json.JSONDecodeError:
+                continue
+        
+        # Method 4: Manual extraction for answer analysis
+        if "correct_answer" in text.lower() or "explanation" in text.lower():
+            return self._manual_answer_extraction(text)
+        
+        # Method 5: Manual extraction for question data
+        return self._manual_question_extraction(text)
+    
+    def _manual_answer_extraction(self, text: str) -> Dict:
+        """Manually extract answer and explanation from text"""
+        result = {
+            "correct_answer": "",
+            "explanation": ""
+        }
+        
+        text_lower = text.lower()
+        
+        # Look for correct answer patterns
+        answer_patterns = [
+            r'"correct_answer"\s*:\s*"([^"]+)"',
+            r"correct_answer\s*:\s*'([^']+)'",
+            r'correct[^"]*"([^"]+)"',
+            r'answer\s*[:\-]\s*([abcd])',
+            r'correct\s*option\s*[:\-]\s*([abcd])',
+            r'[\(\[]\s*([abcd])\s*[\)\]]',
+        ]
+        
+        for pattern in answer_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                result["correct_answer"] = match.group(1).upper()
+                break
+        
+        # If no pattern match, look for option letters in context
+        if not result["correct_answer"]:
+            for option in ["a", "b", "c", "d"]:
+                if f" {option})" in text_lower or f"option {option}" in text_lower:
+                    # Check if this option is indicated as correct
+                    if any(word in text_lower for word in ["correct", "right", "answer", "true"]):
+                        result["correct_answer"] = option.upper()
+                        break
+        
+        # Extract explanation
+        explanation_patterns = [
+            r'"explanation"\s*:\s*"([^"]+)"',
+            r"explanation\s*:\s*'([^']+)'",
+            r'explanation[^"]*"([^"]+)"',
+            r'because[^\.]+\.',
+            r'explanation[^\.]+\.',
+        ]
+        
+        for pattern in explanation_patterns:
+            match = re.search(pattern, text_lower)
+            if match:
+                result["explanation"] = match.group(1).strip()
+                break
+        
+        # If no explanation found, use the text after removing answer info
+        if not result["explanation"]:
+            # Remove answer-related text and use the rest as explanation
+            clean_text = re.sub(r'.*(correct|answer|option).*?[abcd]', '', text_lower, flags=re.IGNORECASE)
+            if clean_text.strip():
+                result["explanation"] = clean_text.strip()[:500]  # Limit length
+        
+        return result
+    
+    def _manual_question_extraction(self, text: str) -> Dict:
+        """Manually extract question and options from text"""
+        result = {
+            "question_text": "",
+            "option_a": "",
+            "option_b": "",
+            "option_c": "",
+            "option_d": "",
+            "question_type": "UNKNOWN"
+        }
+        
+        lines = text.split('\n')
+        question_lines = []
+        current_option = None
+        
+        for line in lines:
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Check for option patterns
+            option_patterns = [
+                (r'^[Aa][\.\):\-]\s*(.+)', 'option_a'),
+                (r'^[Bb][\.\):\-]\s*(.+)', 'option_b'),
+                (r'^[Cc][\.\):\-]\s*(.+)', 'option_c'),
+                (r'^[Dd][\.\):\-]\s*(.+)', 'option_d'),
+                (r'^\([Aa]\)\s*(.+)', 'option_a'),
+                (r'^\([Bb]\)\s*(.+)', 'option_b'),
+                (r'^\([Cc]\)\s*(.+)', 'option_c'),
+                (r'^\([Dd]\)\s*(.+)', 'option_d'),
+            ]
+            
+            option_found = False
+            for pattern, option_key in option_patterns:
+                match = re.match(pattern, line, re.IGNORECASE)
+                if match:
+                    result[option_key] = match.group(1).strip()
+                    current_option = option_key
+                    option_found = True
+                    break
+            
+            if not option_found:
+                if current_option:
+                    # Continue adding to the current option
+                    result[current_option] += " " + line
+                else:
+                    # This is part of the question
+                    question_lines.append(line)
+        
+        result["question_text"] = " ".join(question_lines)
+        
+        # Determine question type
+        if any(result[opt] for opt in ['option_a', 'option_b', 'option_c', 'option_d']):
+            result["question_type"] = "MCQ"
+        elif any(word in result["question_text"].lower() for word in ['blank', 'fill', 'missing', '______']):
+            result["question_type"] = "FILL_IN_BLANK"
+        
+        return result
+
+class GoogleSheetProcessor:
+    def __init__(self, credentials_file: str, sheet_id: str, api_key: str, sheet_tab: str = "Sheet4"):
+        self.sheet_id = sheet_id
+        self.sheet_tab = sheet_tab
+        self.analyzer = OpenAIImageAnalyzer(api_key)
+        self.service = self._authenticate_google_sheets(credentials_file)
+    
+    def _authenticate_google_sheets(self, credentials_file: str):
+        """Authenticate with Google Sheets API"""
+        try:
+            SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+            creds = service_account.Credentials.from_service_account_file(
+                credentials_file, scopes=SCOPES)
+            
+            return build('sheets', 'v4', credentials=creds)
+        except Exception as e:
+            print(f"Google Sheets authentication failed: {e}")
+            raise
+    
+    def read_sheet_data(self, sheet_range: str = None) -> List[List]:
+        """Read data from Google Sheets"""
+        if sheet_range is None:
+            sheet_range = f"{self.sheet_tab}!A:B"
+            
+        try:
+            sheet = self.service.spreadsheets()
+            result = sheet.values().get(
+                spreadsheetId=self.sheet_id,
+                range=sheet_range
+            ).execute()
+            
+            values = result.get('values', [])
+            print(f"Read {len(values)} rows from sheet")
+            return values
+        except Exception as e:
+            print(f"Error reading sheet data: {e}")
+            return []
+    
+    def update_sheet(self, updates: List[List], range: str):
+        """Update Google Sheets with results"""
+        try:
+            body = {'values': updates}
+            sheet = self.service.spreadsheets()
+            result = sheet.values().update(
+                spreadsheetId=self.sheet_id,
+                range=range,
+                valueInputOption='RAW',
+                body=body
+            ).execute()
+            
+            print(f"Updated {len(updates)} rows in range {range}")
+            return result
+        except Exception as e:
+            print(f"Error updating sheet: {e}")
+            raise
+    
+    def process_images(self):
+        """Main function to process all images in the sheet"""
+        data = self.read_sheet_data(f"{self.sheet_tab}!A:B")
+        
+        if not data or len(data) < 2:
+            print("No data found or insufficient columns")
+            return
+        
+        updates = []
+        processed_count = 0
+        
+        for i, row in enumerate(data[1:], start=2):
+            while len(row) < 2:
+                row.append("")
+            
+            question_number = row[0] if len(row) > 0 else ""
+            image_url = row[1]
+            
+            if not image_url or not image_url.startswith('http'):
+                updates.append(["", "", "", "", "", "", ""])
+                continue
+            
+            print(f"\n{'='*60}")
+            print(f"Processing row {i}: Question {question_number}")
+            print(f"{'='*60}")
+            
+            # Step 1: Extract question and options
+            print("🔄 Step 1: Extracting question text and options...")
+            extraction_result = self.analyzer.extract_question_and_options(image_url)
+            
+            if "error" in extraction_result:
+                print(f"❌ Extraction failed: {extraction_result['error']}")
+                updates.append(["", "", "", "", "", f"Error: {extraction_result['error']}", ""])
+                continue
+            
+            # Step 2: Get correct answer and explanation
+            print("🔄 Step 2: Analyzing for correct answer...")
+            answer_result = self.analyzer.get_correct_answer(extraction_result)
+            
+            # Prepare the update row
+            update_row = [
+                extraction_result.get("question_text", ""),        # Column C
+                extraction_result.get("option_a", ""),            # Column D
+                extraction_result.get("option_b", ""),            # Column E
+                extraction_result.get("option_c", ""),            # Column F
+                extraction_result.get("option_d", ""),            # Column G
+                answer_result.get("correct_answer", ""),          # Column H
+                answer_result.get("explanation", "")              # Column I
+            ]
+            
+            updates.append(update_row)
+            processed_count += 1
+            
+            print("✅ Extraction Results:")
+            print(f"   Question: {extraction_result.get('question_text', '')[:100]}...")
+            print(f"   Options: A={extraction_result.get('option_a', '')[:30]}...")
+            print(f"   Correct Answer: {answer_result.get('correct_answer', '')}")
+            print(f"   Explanation: {answer_result.get('explanation', '')[:100]}...")
+            
+            time.sleep(3)
+        
+        if updates:
+            update_range = f"{self.sheet_tab}!C2:I{len(updates)+1}"
+            self.update_sheet(updates, update_range)
+            print(f"\n🎉 SUCCESSFULLY PROCESSED {processed_count} IMAGES!")
+            print(f"📊 Columns: C=Question, D=Option A, E=Option B, F=Option C, G=Option D, H=Correct Answer, I=Explanation")
+        else:
+            print("No updates to process")
+
+def test_openai_connection(api_key: str):
+    """Test OpenAI API connection"""
+    print("Testing OpenAI API connection...")
+    
+    test_payload = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "Respond with only: 'API is working'"}],
+        "max_tokens": 10
+    }
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=test_payload,
+            timeout=30
+        )
+        print(f"OpenAI Test Status: {response.status_code}")
+        if response.status_code == 200:
+            result = response.json()
+            print(f"OpenAI Test Response: {result['choices'][0]['message']['content']}")
+            print("✅ OpenAI API connection is working!")
+            return True
+        else:
+            print(f"❌ OpenAI API test failed: {response.text}")
+            return False
+    except Exception as e:
+        print(f"❌ OpenAI API test error: {e}")
+        return False
+
+def main():
+    OPENAI_API_KEY = "your_openai_api_key_here"
+    
+    if not OPENAI_API_KEY or OPENAI_API_KEY == "your_openai_api_key_here":
+        print("❌ Please set your OpenAI API key")
+        return
+    
+    SHEET_TAB = "Sheet4"
+    GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+    CREDENTIALS_FILE = "service-account.json"
+    
+    if not test_openai_connection(OPENAI_API_KEY):
+        return
+    
+    try:
+        print("\n" + "="*70)
+        print("STARTING COMPREHENSIVE QUESTION PROCESSING")
+        print("="*70)
+        processor = GoogleSheetProcessor(CREDENTIALS_FILE, GOOGLE_SHEET_ID, OPENAI_API_KEY, SHEET_TAB)
+        processor.process_images()
+    except Exception as e:
+        print(f"❌ Processing failed: {e}")
+
+if __name__ == "__main__":
+    main()
