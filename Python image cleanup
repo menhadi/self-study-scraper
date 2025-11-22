@@ -1,67 +1,79 @@
 import cv2
 import os
+import csv
 import numpy as np
 
 # ------------ CONFIG ------------
-INPUT_FOLDER = r"C:\Users\menha\Downloads\Paper_20250207174805"
-OUTPUT_FOLDER = r"C:\Users\menha\Downloads\Paper_20250207174805_pretty"
+BASE_INPUT = r"C:\Users\menha\Downloads\Paper_20250207174805"
+BASE_OUTPUT = r"C:\Users\menha\Downloads\Paper_20250207174805_output"
+CSV_LOG = r"C:\Users\menha\Downloads\enhanced_images_log.csv"
 # ---------------------------------
 
-os.makedirs(OUTPUT_FOLDER, exist_ok=True)
 
-def enhance_pretty(img):
-    # Convert to grayscale
+def enhance_fast_thin(img):
     gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
-    # Light contrast improvement
-    gray = cv2.normalize(gray, None, 0, 255, cv2.NORM_MINMAX)
+    # Fast upscale 2x
+    up = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_LINEAR)
 
-    # 2× upscale for smoother characters
-    up = cv2.resize(gray, None, fx=2, fy=2, interpolation=cv2.INTER_CUBIC)
+    # Light blur (fast)
+    blur = cv2.GaussianBlur(up, (3, 3), 0)
 
-    # Light denoise for smoothness
-    smooth = cv2.bilateralFilter(up, d=7, sigmaColor=75, sigmaSpace=75)
-
-    # Adaptive threshold for clean dark letters
-    clean = cv2.adaptiveThreshold(
-        smooth,
-        255,
-        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-        cv2.THRESH_BINARY,
-        41,
-        5
+    # Fast threshold for crisp thin text
+    _, binary = cv2.threshold(
+        blur, 0, 255,
+        cv2.THRESH_BINARY + cv2.THRESH_OTSU
     )
 
-    # Soft bolding (1-pixel)
-    kernel = np.ones((1, 1), np.uint8)
-    bold = cv2.dilate(clean, kernel, iterations=1)
+    # Light sharpening (thin text)
+    kernel = np.array([[0, -1, 0],
+                       [-1, 5, -1],
+                       [0, -1, 0]])
+    sharp = cv2.filter2D(binary, -1, kernel)
 
-    # Slight smoothing for "attractive printed look"
-    pretty = cv2.GaussianBlur(bold, (1, 1), 0)
-
-    # Convert back to color
-    final = cv2.cvtColor(pretty, cv2.COLOR_GRAY2BGR)
-
-    return final
+    return cv2.cvtColor(sharp, cv2.COLOR_GRAY2BGR)
 
 
-print("\nEnhancing image for clean & attractive text…\n")
+# ------------------ CSV SETUP ------------------
+csv_file = open(CSV_LOG, "w", newline="", encoding="utf-8")
+csv_writer = csv.writer(csv_file)
+csv_writer.writerow(["Original Image", "Enhanced Image"])
+# ------------------------------------------------
 
-for file in os.listdir(INPUT_FOLDER):
-    if not file.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".webp")):
-        continue
 
-    in_path = os.path.join(INPUT_FOLDER, file)
-    out_path = os.path.join(OUTPUT_FOLDER, file)
+print("\n🚀 Enhancing images recursively...\n")
 
-    try:
-        img = cv2.imread(in_path)
-        enhanced = enhance_pretty(img)
-        cv2.imwrite(out_path, enhanced)
-        print(f"✓ Enhanced: {file}")
+for root, dirs, files in os.walk(BASE_INPUT):
+    for file in files:
+        if not file.lower().endswith((".png", ".jpg", ".jpeg", ".bmp", ".webp")):
+            continue
 
-    except Exception as e:
-        print(f"✗ Error: {file} — {e}")
+        # Full input path
+        in_path = os.path.join(root, file)
 
-print("\nDone! Attractive images saved in:")
-print(OUTPUT_FOLDER)
+        # Replicate folder structure in output
+        relative_path = os.path.relpath(root, BASE_INPUT)
+        out_folder = os.path.join(BASE_OUTPUT, relative_path)
+        os.makedirs(out_folder, exist_ok=True)
+
+        out_path = os.path.join(out_folder, file)
+
+        # Read + enhance
+        try:
+            img = cv2.imread(in_path)
+            result = enhance_fast_thin(img)
+            cv2.imwrite(out_path, result)
+
+            print(f"✓ Enhanced: {in_path}")
+
+            # Log to CSV
+            csv_writer.writerow([in_path, out_path])
+
+        except Exception as e:
+            print(f"✗ Error with {in_path}: {e}")
+
+csv_file.close()
+
+print("\n🎉 DONE!")
+print("Enhanced images saved at:", BASE_OUTPUT)
+print("CSV log generated:", CSV_LOG)
