@@ -1,0 +1,369 @@
+import requests
+import base64
+import json
+import re
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from typing import Dict, List, Tuple
+import time
+
+class OpenAIImageAnalyzer:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.openai.com/v1/chat/completions"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+    
+    def encode_image_to_base64(self, image_url: str) -> str:
+        """Encode image from URL to base64"""
+        try:
+            print(f"Downloading image from: {image_url}")
+            response = requests.get(image_url, timeout=30)
+            response.raise_for_status()
+            
+            content_type = response.headers.get('content-type', '').lower()
+            if not content_type.startswith('image/'):
+                print(f"Warning: URL doesn't point to an image. Content-Type: {content_type}")
+            
+            base64_image = base64.b64encode(response.content).decode('utf-8')
+            print("Image successfully encoded to base64")
+            return base64_image
+            
+        except requests.exceptions.RequestException as e:
+            print(f"Error downloading image: {e}")
+            return None
+        except Exception as e:
+            print(f"Error encoding image: {e}")
+            return None
+    
+    def analyze_image_and_question(self, image_url: str, question_text: str = "") -> Dict:
+        """Analyze image and question using OpenAI GPT-4 Vision API"""
+        
+        base64_image = self.encode_image_to_base64(image_url)
+        if not base64_image:
+            return {"error": "Failed to download or encode image"}
+        
+        # Improved prompt with better JSON formatting instructions
+        prompt = """Analyze this educational image containing a question and provide:
+1. The correct answer (option letter A/B/C/D for MCQ, or text for fill-in-blanks)
+2. A brief explanation
+
+Return ONLY valid JSON in this exact format:
+{
+    "correct_answer": "A",
+    "explanation": "This is correct because..."
+}
+
+Do not include any other text, explanations, or markdown formatting."""
+        
+        payload = {
+            "model": "gpt-4o",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": prompt + (f"\nQuestion context: {question_text}" if question_text else "")
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 500,
+            "temperature": 0.1
+        }
+        
+        try:
+            print("Sending request to OpenAI Vision API...")
+            response = requests.post(
+                self.base_url, 
+                headers=self.headers, 
+                json=payload,
+                timeout=60
+            )
+            
+            print(f"API Response Status: {response.status_code}")
+            
+            if response.status_code != 200:
+                error_detail = response.text
+                print(f"API Error {response.status_code}: {error_detail}")
+                return {"error": f"API: HTTP {response.status_code}"}
+            
+            result = response.json()
+            
+            if 'choices' not in result or not result['choices']:
+                return {"error": "API: No response choices found"}
+            
+            answer_content = result['choices'][0]['message']['content'].strip()
+            print("Raw API response received:")
+            print(answer_content)
+            
+            # Improved JSON parsing with multiple fallback methods
+            parsed_result = self._parse_json_response(answer_content)
+            return parsed_result
+                
+        except requests.exceptions.Timeout:
+            return {"error": "API: Request timeout"}
+        except Exception as e:
+            return {"error": f"API: Unexpected error - {str(e)}"}
+    
+    def _parse_json_response(self, text: str) -> Dict:
+        """Parse JSON response with multiple fallback methods"""
+        text = text.strip()
+        
+        # Method 1: Direct JSON parsing
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            print("Method 1: Direct JSON parsing failed")
+            pass
+        
+        # Method 2: Extract JSON from code blocks
+        json_match = re.search(r'```(?:json)?\s*(.*?)\s*```', text, re.DOTALL)
+        if json_match:
+            try:
+                return json.loads(json_match.group(1))
+            except json.JSONDecodeError:
+                print("Method 2: JSON from code blocks failed")
+                pass
+        
+        # Method 3: Find JSON object pattern
+        json_pattern = r'\{[^{}]*"[^"]*"[^{}]*\}'
+        matches = re.finditer(json_pattern, text)
+        for match in matches:
+            try:
+                return json.loads(match.group())
+            except json.JSONDecodeError:
+                continue
+        
+        # Method 4: Manual parsing from text
+        print("Method 4: Attempting manual parsing from text")
+        result = {
+            "correct_answer": "",
+            "explanation": text  # Fallback: use entire text as explanation
+        }
+        
+        # Try to extract answer from text
+        text_lower = text.lower()
+        
+        # Look for MCQ options
+        mcq_patterns = [
+            r'correct.*?[abcd]',
+            r'answer.*?[abcd]', 
+            r'option.*?[abcd]',
+            r'[abcd].*?correct',
+            r'[ⓐⓑⓒⓓ]'
+        ]
+        
+        for pattern in mcq_patterns:
+            matches = re.search(pattern, text_lower)
+            if matches:
+                # Extract the option letter
+                option_match = re.search(r'[abcd]', matches.group())
+                if option_match:
+                    result["correct_answer"] = option_match.group().upper()
+                    break
+        
+        # If no MCQ answer found, look for fill-in-blank patterns
+        if not result["correct_answer"]:
+            fill_patterns = [
+                r'answer:?\s*"([^"]+)"',
+                r'correct:?\s*"([^"]+)"',
+                r'is:\s*([^\n,.]+)',
+            ]
+            
+            for pattern in fill_patterns:
+                matches = re.search(pattern, text_lower)
+                if matches:
+                    result["correct_answer"] = matches.group(1).strip()
+                    break
+        
+        return result
+
+class GoogleSheetProcessor:
+    def __init__(self, credentials_file: str, sheet_id: str, api_key: str, sheet_tab: str = "Sheet4"):
+        self.sheet_id = sheet_id
+        self.sheet_tab = sheet_tab
+        self.analyzer = OpenAIImageAnalyzer(api_key)
+        self.service = self._authenticate_google_sheets(credentials_file)
+    
+    def _authenticate_google_sheets(self, credentials_file: str):
+        """Authenticate with Google Sheets API"""
+        try:
+            SCOPES = ['https://www.googleapis.com/auth/spreadsheets']
+            creds = service_account.Credentials.from_service_account_file(
+                credentials_file, scopes=SCOPES)
+            
+            return build('sheets', 'v4', credentials=creds)
+        except Exception as e:
+            print(f"Google Sheets authentication failed: {e}")
+            raise
+    
+    def read_sheet_data(self, sheet_range: str = None) -> List[List]:
+        """Read data from Google Sheets"""
+        if sheet_range is None:
+            sheet_range = f"{self.sheet_tab}!A:D"  # Read A to D columns
+            
+        try:
+            sheet = self.service.spreadsheets()
+            result = sheet.values().get(
+                spreadsheetId=self.sheet_id,
+                range=sheet_range
+            ).execute()
+            
+            values = result.get('values', [])
+            print(f"Read {len(values)} rows from sheet")
+            return values
+        except Exception as e:
+            print(f"Error reading sheet data: {e}")
+            return []
+    
+    def update_sheet(self, updates: List[List], range: str):
+        """Update Google Sheets with results"""
+        try:
+            body = {'values': updates}
+            sheet = self.service.spreadsheets()
+            result = sheet.values().update(
+                spreadsheetId=self.sheet_id,
+                range=range,
+                valueInputOption='RAW',
+                body=body
+            ).execute()
+            
+            print(f"Updated {len(updates)} rows in range {range}")
+            return result
+        except Exception as e:
+            print(f"Error updating sheet: {e}")
+            raise
+    
+    def process_images(self):
+        """Main function to process all images in the sheet"""
+        # Read data from A to D columns (we'll write to C and D)
+        data = self.read_sheet_data(f"{self.sheet_tab}!A:D")
+        
+        if not data or len(data) < 2:
+            print("No data found or insufficient columns")
+            return
+        
+        updates = []
+        processed_count = 0
+        
+        for i, row in enumerate(data[1:], start=2):  # Start from row 2 (skip header)
+            # Ensure row has at least 2 columns
+            while len(row) < 2:
+                row.append("")  # Add empty strings for missing columns
+            
+            image_url = row[1]  # Column B
+            question_text = row[0] if len(row) > 0 else ""  # Column A
+            
+            if not image_url or not image_url.startswith('http'):
+                updates.append(["", ""])  # Empty for C and D columns
+                continue
+            
+            print(f"\n--- Processing row {i} ---")
+            print(f"Image URL: {image_url}")
+            print(f"Question: {question_text}")
+            
+            # Analyze image
+            result = self.analyzer.analyze_image_and_question(image_url, question_text)
+            
+            # Prepare update for columns C and D
+            if "error" not in result:
+                correct_answer = result.get("correct_answer", "Not found")
+                explanation = result.get("explanation", "No explanation provided")
+                
+                # Clean up the answer
+                if correct_answer and correct_answer != "Not found":
+                    processed_count += 1
+                
+                updates.append([correct_answer, explanation])
+                print(f"✅ Correct Answer: {correct_answer}")
+                print(f"📝 Explanation: {explanation}")
+            else:
+                error_msg = result["error"]
+                updates.append([f"Error: {error_msg}", "See error details"])
+                print(f"❌ Error: {error_msg}")
+            
+            time.sleep(2)  # Rate limiting
+        
+        # Update columns C and D starting from row 2
+        if updates:
+            update_range = f"{self.sheet_tab}!C2:D{len(updates)+1}"
+            self.update_sheet(updates, update_range)
+            print(f"\n🎉 Successfully processed {processed_count} images out of {len(updates)} rows")
+            print(f"📊 Results written to columns C (Answers) and D (Explanations)")
+        else:
+            print("No updates to process")
+
+def test_openai_connection(api_key: str):
+    """Test OpenAI API connection"""
+    print("Testing OpenAI API connection...")
+    
+    test_payload = {
+        "model": "gpt-3.5-turbo",
+        "messages": [{"role": "user", "content": "Respond with only: 'API is working'"}],
+        "max_tokens": 10
+    }
+    
+    headers = {
+        "Content-Type": "application/json",
+        "Authorization": f"Bearer {api_key}"
+    }
+    
+    try:
+        response = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers=headers,
+            json=test_payload,
+            timeout=30
+        )
+        print(f"OpenAI Test Status: {response.status_code}")
+        if response.status_code == 200:
+            result = response.json()
+            print(f"OpenAI Test Response: {result['choices'][0]['message']['content']}")
+            print("✅ OpenAI API connection is working!")
+            return True
+        else:
+            print(f"❌ OpenAI API test failed: {response.text}")
+            return False
+    except Exception as e:
+        print(f"❌ OpenAI API test error: {e}")
+        return False
+
+def main():
+    # Configuration - REPLACE WITH YOUR OPENAI API KEY
+    OPENAI_API_KEY = "your_openai_api_key_here"  # Get from https://platform.openai.com/api-keys
+    
+    if not OPENAI_API_KEY or OPENAI_API_KEY == "your_openai_api_key_here":
+        print("❌ Please set your OpenAI API key in the script")
+        print("Get one from: https://platform.openai.com/api-keys")
+        return
+    
+    SHEET_TAB = "Sheet4"
+    GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+    CREDENTIALS_FILE = "service-account.json"  # Your Google service account file
+    
+    # Test API connection first
+    if not test_openai_connection(OPENAI_API_KEY):
+        print("❌ OpenAI API test failed. Please check your API key.")
+        return
+    
+    try:
+        print("\n" + "="*60)
+        print("Starting Google Sheets processing with OpenAI Vision API")
+        print("="*60)
+        processor = GoogleSheetProcessor(CREDENTIALS_FILE, GOOGLE_SHEET_ID, OPENAI_API_KEY, SHEET_TAB)
+        processor.process_images()
+    except Exception as e:
+        print(f"❌ Processing failed: {e}")
+
+if __name__ == "__main__":
+    main()
