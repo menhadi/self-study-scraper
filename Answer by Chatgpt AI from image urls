@@ -53,45 +53,44 @@ class MultiQuestionExtractor:
 
 EXTRACTION RULES:
 1. Extract EACH question separately
-2. IGNORE headers, footers, page numbers, instructions like "Q.1 - Q.20 carry one mark each"
-3. Extract ONLY the actual questions and their options
+2. DETERMINE QUESTION TYPE: "MCQ" or "FILL_IN_BLANK"
+3. EXTRACT any INSTRUCTIONS that appear
 4. For MATHEMATICAL EQUATIONS and CHEMICAL FORMULAS, convert to UNICODE TEXT format (NOT LaTeX)
-5. DETECT if there are any DIAGRAMS, IMAGES, or VISUAL ELEMENTS in:
-   - The question itself
-   - Any of the options (A, B, C, D)
-6. For each question, extract:
-   - Full question text
-   - All options (A, B, C, D)
-   - Question number
-   - Whether question contains image/diagram (true/false)
-   - Which options contain images/diagrams (list of option letters)
+5. DETECT if there are any DIAGRAMS, IMAGES, or VISUAL ELEMENTS
 
-IMAGE DETECTION EXAMPLES:
-- If question has a circuit diagram: "has_question_image": true
-- If option B has a graph: "options_with_images": ["B"]
-- If multiple options have images: "options_with_images": ["A", "C"]
-- If no images: "has_question_image": false, "options_with_images": []
-
-MATHEMATICAL CONVERSION EXAMPLES:
-- LaTeX: \( f(\theta) = \begin{bmatrix} \cos\theta & \sin\theta \\ -\sin\theta & \cos\theta \end{bmatrix} \)
-- Unicode: f(θ) = [[cos θ, sin θ], [-sin θ, cos θ]]
+CRITICAL: Return ONLY a SINGLE JSON ARRAY. Do NOT return multiple JSON objects.
 
 OUTPUT FORMAT: Return ONLY valid JSON array:
 [
   {
+    "question_type": "MCQ",
     "question_number": "Q.1",
-    "question_text": "full question text with Unicode math/chemistry",
-    "option_a": "option A text with Unicode",
-    "option_b": "option B text with Unicode", 
-    "option_c": "option C text with Unicode",
-    "option_d": "option D text with Unicode",
-    "has_question_image": true/false,
-    "options_with_images": ["A", "C"] // or empty array
+    "question_text": "question text",
+    "option_a": "A text",
+    "option_b": "B text",
+    "option_c": "C text", 
+    "option_d": "D text",
+    "has_question_image": false,
+    "options_with_images": [],
+    "has_instruction_image": false,
+    "instructions": ""
+  },
+  {
+    "question_type": "FILL_IN_BLANK",
+    "question_number": "Q.2", 
+    "question_text": "question text",
+    "option_a": "",
+    "option_b": "",
+    "option_c": "",
+    "option_d": "",
+    "has_question_image": false,
+    "options_with_images": [],
+    "has_instruction_image": false,
+    "instructions": ""
   }
 ]
 
-EXCLUDE: Page headers, footers, instructions, "carry one mark each", page numbers
-USE UNICODE: For all mathematical symbols and chemical formulas"""
+IMPORTANT: Return ONLY the JSON array, no other text."""
         
         payload = {
             "model": "gpt-4o",
@@ -123,15 +122,28 @@ USE UNICODE: For all mathematical symbols and chemical formulas"""
                 content = result['choices'][0]['message']['content'].strip()
                 print("Raw extraction completed")
                 
-                questions = self._parse_questions_json(content)
+                # Improved JSON parsing
+                questions = self._parse_questions_json_improved(content)
                 
-                # Add file name to each question and ensure image fields exist
+                if not questions:
+                    print("❌ No questions extracted, using enhanced fallback")
+                    return self._enhanced_fallback_extraction(content, file_name)
+                
+                # Add file name to each question and ensure all fields exist
                 for question in questions:
                     question["file_name"] = file_name
-                    # Ensure image detection fields exist
-                    if "has_question_image" not in question:
-                        question["has_question_image"] = False
-                    if "options_with_images" not in question:
+                    # Ensure all fields exist with defaults
+                    question.setdefault("question_type", "UNKNOWN")
+                    question.setdefault("has_question_image", False)
+                    question.setdefault("options_with_images", [])
+                    question.setdefault("has_instruction_image", False)
+                    question.setdefault("instructions", "")
+                    # For fill-in-blank questions, ensure options are empty
+                    if question.get("question_type") == "FILL_IN_BLANK":
+                        question["option_a"] = question.get("option_a", "")
+                        question["option_b"] = question.get("option_b", "")
+                        question["option_c"] = question.get("option_c", "")
+                        question["option_d"] = question.get("option_d", "")
                         question["options_with_images"] = []
                 
                 print(f"✅ Extracted {len(questions)} questions from {file_name}")
@@ -141,6 +153,143 @@ USE UNICODE: For all mathematical symbols and chemical formulas"""
                 
         except Exception as e:
             return [{"error": f"Extraction failed: {str(e)}", "file_name": file_name}]
+    
+    def _parse_questions_json_improved(self, text: str) -> List[Dict]:
+        """Improved JSON parsing with multiple fallback methods"""
+        text = text.strip()
+        print(f"Attempting to parse JSON from response (first 500 chars): {text[:500]}...")
+        
+        # Method 1: Try direct JSON array parsing
+        try:
+            data = json.loads(text)
+            if isinstance(data, list):
+                print("✅ Method 1: Direct JSON array parsing successful")
+                return data
+        except json.JSONDecodeError as e:
+            print(f"Method 1 failed: {e}")
+        
+        # Method 2: Try to extract JSON array from code blocks
+        try:
+            json_match = re.search(r'```(?:json)?\s*(\[.*\])\s*```', text, re.DOTALL)
+            if json_match:
+                data = json.loads(json_match.group(1))
+                if isinstance(data, list):
+                    print("✅ Method 2: JSON from code blocks successful")
+                    return data
+        except (json.JSONDecodeError, AttributeError) as e:
+            print(f"Method 2 failed: {e}")
+        
+        # Method 3: Try to find and combine multiple JSON objects
+        try:
+            # Find all JSON objects in the text
+            json_objects = []
+            pattern = r'\{[^{}]*?(?:\{[^{}]*?}[^{}]*?)*\}'
+            matches = re.finditer(pattern, text, re.DOTALL)
+            
+            for match in matches:
+                try:
+                    obj = json.loads(match.group())
+                    if isinstance(obj, dict) and 'question_number' in obj:
+                        json_objects.append(obj)
+                except json.JSONDecodeError:
+                    continue
+            
+            if json_objects:
+                print(f"✅ Method 3: Found {len(json_objects)} JSON objects")
+                return json_objects
+        except Exception as e:
+            print(f"Method 3 failed: {e}")
+        
+        # Method 4: Try wrapping in array if multiple objects detected
+        try:
+            if 'question_number' in text and text.count('{') > 1:
+                # Try to fix by wrapping individual objects in array
+                fixed_text = '[' + re.sub(r'}\s*{', '},{', text) + ']'
+                data = json.loads(fixed_text)
+                if isinstance(data, list):
+                    print("✅ Method 4: Array wrapping successful")
+                    return data
+        except json.JSONDecodeError as e:
+            print(f"Method 4 failed: {e}")
+        
+        print("❌ All JSON parsing methods failed")
+        return []
+    
+    def _enhanced_fallback_extraction(self, text: str, file_name: str) -> List[Dict]:
+        """Enhanced fallback extraction when JSON parsing fails"""
+        print("Using enhanced fallback extraction...")
+        
+        questions = []
+        lines = text.split('\n')
+        
+        current_question = None
+        current_option = None
+        current_instructions = ""
+        question_count = 0
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Enhanced question number detection
+            q_match = re.match(r'^(Q\.?\s*\d+|[Qq]uestion\s*\d+|\d+\.)\s*', line)
+            if q_match:
+                # Save previous question
+                if current_question and current_question.get('question_text'):
+                    questions.append(current_question)
+                    question_count += 1
+                
+                # Start new question
+                question_number = q_match.group(0).strip()
+                question_text = line[len(q_match.group(0)):].strip()
+                
+                current_question = {
+                    "question_type": "MCQ",  # Default
+                    "question_number": question_number,
+                    "question_text": question_text,
+                    "option_a": "", "option_b": "", "option_c": "", "option_d": "",
+                    "has_question_image": False,
+                    "options_with_images": [],
+                    "has_instruction_image": False,
+                    "instructions": current_instructions.strip() if current_instructions else "",
+                    "file_name": file_name
+                }
+                current_option = None
+                continue
+            
+            # Enhanced option detection
+            option_match = re.match(r'^([A-D])[\.\)]\s*(.+)', line, re.IGNORECASE)
+            if option_match and current_question:
+                option_letter = option_match.group(1).upper()
+                option_text = option_match.group(2).strip()
+                option_key = f"option_{option_letter.lower()}"
+                
+                current_question[option_key] = option_text
+                current_option = option_key
+                current_question["question_type"] = "MCQ"
+                continue
+            
+            # Continue current option or question text
+            if current_option and current_question:
+                current_question[current_option] += " " + line
+            elif current_question:
+                # Check if this might be fill-in-blank pattern
+                if any(word in line.lower() for word in ['blank', 'fill in', '______', 'missing']):
+                    current_question["question_type"] = "FILL_IN_BLANK"
+                else:
+                    current_question["question_text"] += " " + line
+        
+        # Add the last question
+        if current_question and current_question.get('question_text'):
+            # Final type determination
+            if not any(current_question[opt] for opt in ['option_a', 'option_b', 'option_c', 'option_d']):
+                current_question["question_type"] = "FILL_IN_BLANK"
+            questions.append(current_question)
+            question_count += 1
+        
+        print(f"✅ Enhanced fallback extracted {question_count} questions")
+        return questions
     
     def process_image_batch(self, image_batch: List[Tuple[str, str]]) -> List[Dict]:
         """Process a batch of images concurrently"""
@@ -195,26 +344,43 @@ USE UNICODE: For all mathematical symbols and chemical formulas"""
     def _analyze_single_question(self, question: Dict) -> Dict:
         """Analyze a single question for correct answer"""
         
-        # Include image information in the prompt for context
-        image_info = ""
-        if question.get("has_question_image"):
-            image_info = " [Note: Question contains diagram/image]"
-        if question.get("options_with_images"):
-            image_info += f" [Options with images: {', '.join(question['options_with_images'])}]"
+        question_type = question.get("question_type", "MCQ")
         
-        prompt = f"""Question: {question.get('question_text', '')}{image_info}
-Options:
-A: {question.get('option_a', '')}
-B: {question.get('option_b', '')} 
-C: {question.get('option_c', '')}
-D: {question.get('option_d', '')}
+        if question_type == "FILL_IN_BLANK":
+            prompt = f"""This is a FILL-IN-THE-BLANK question:
+            Question: {question.get('question_text', '')}
+            
+            Provide the CORRECT ANSWER to fill in the blank(s) and a brief explanation.
+            
+            Return ONLY JSON:
+            {{
+                "correct_answer": "the actual answer to fill in the blank",
+                "explanation": "brief explanation why this is the correct answer"
+            }}"""
+        else:
+            context_info = ""
+            if question.get("has_question_image"):
+                context_info = " [Note: Question contains diagram/image]"
+            if question.get("options_with_images"):
+                context_info += f" [Options with images: {', '.join(question['options_with_images'])}]"
+            if question.get("instructions"):
+                context_info += f" [Instructions: {question['instructions']}]"
+            
+            prompt = f"""This is a MULTIPLE CHOICE QUESTION (MCQ):
+            Question: {question.get('question_text', '')}{context_info}
+            Options:
+            A: {question.get('option_a', '')}
+            B: {question.get('option_b', '')} 
+            C: {question.get('option_c', '')}
+            D: {question.get('option_d', '')}
 
-Determine the correct option and provide brief explanation.
-Return ONLY JSON:
-{{
-    "correct_answer": "A/B/C/D",
-    "explanation": "brief explanation"
-}}"""
+            Determine the CORRECT OPTION (A, B, C, or D) and provide brief explanation.
+            
+            Return ONLY JSON:
+            {{
+                "correct_answer": "A/B/C/D",
+                "explanation": "brief explanation why this option is correct"
+            }}"""
         
         payload = {
             "model": "gpt-4o",
@@ -228,84 +394,50 @@ Return ONLY JSON:
             if response.status_code == 200:
                 result = response.json()
                 content = result['choices'][0]['message']['content'].strip()
-                return self._parse_json_response(content)
+                parsed_result = self._parse_json_response(content)
+                
+                # For fill-in-blank, ensure we have the actual answer, not an option letter
+                if question_type == "FILL_IN_BLANK" and parsed_result.get("correct_answer") in ["A", "B", "C", "D"]:
+                    return self._get_fill_in_blank_answer(question)
+                
+                return parsed_result
             else:
                 return {"correct_answer": "Error", "explanation": f"API: {response.status_code}"}
         except Exception as e:
             return {"correct_answer": "Error", "explanation": f"Analysis failed: {str(e)}"}
     
-    def _parse_questions_json(self, text: str) -> List[Dict]:
-        """Parse the questions JSON array"""
+    def _get_fill_in_blank_answer(self, question: Dict) -> Dict:
+        """Specialized function to get fill-in-blank answer"""
+        prompt = f"""This is specifically a FILL-IN-THE-BLANK question (NOT multiple choice).
+        
+        Question: {question.get('question_text', '')}
+        
+        What is the ACTUAL ANSWER that should fill in the blank(s)? 
+        Provide the exact word, phrase, number, or expression.
+        
+        Return ONLY JSON:
+        {{
+            "correct_answer": "the actual fill-in answer",
+            "explanation": "why this is the correct answer"
+        }}"""
+        
+        payload = {
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 200,
+            "temperature": 0.1
+        }
+        
         try:
-            # Clean the text
-            clean_text = re.sub(r'```json|```', '', text).strip()
-            questions = json.loads(clean_text)
-            
-            # Validate it's a list
-            if isinstance(questions, list):
-                return questions
+            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=30)
+            if response.status_code == 200:
+                result = response.json()
+                content = result['choices'][0]['message']['content'].strip()
+                return self._parse_json_response(content)
             else:
-                return [questions]  # Wrap single question in list
-                
-        except json.JSONDecodeError as e:
-            print(f"JSON parsing failed: {e}")
-            return self._manual_question_extraction(text)
-    
-    def _manual_question_extraction(self, text: str) -> List[Dict]:
-        """Fallback manual extraction"""
-        print("Using fallback manual extraction")
-        questions = []
-        lines = text.split('\n')
-        
-        current_question = None
-        current_option = None
-        
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            
-            # Detect question number
-            q_match = re.match(r'^(Q\.\s*\d+|[Qq]uestion\s*\d+)', line)
-            if q_match:
-                # Save previous question if exists
-                if current_question and current_question.get('question_text'):
-                    questions.append(current_question)
-                
-                # Start new question
-                current_question = {
-                    "question_number": q_match.group(0),
-                    "question_text": line[len(q_match.group(0)):].strip(),
-                    "option_a": "", "option_b": "", "option_c": "", "option_d": "",
-                    "has_question_image": False,
-                    "options_with_images": []
-                }
-                current_option = None
-                continue
-            
-            # Detect options
-            option_match = re.match(r'^\(([A-D])\)\s*(.+)', line)
-            if not option_match:
-                option_match = re.match(r'^([A-D])\.\s*(.+)', line)
-            if not option_match:
-                option_match = re.match(r'^([A-D])\s*(.+)', line)
-            
-            if option_match and current_question:
-                option_key = f"option_{option_match.group(1).lower()}"
-                current_question[option_key] = option_match.group(2).strip()
-                current_option = option_key
-            elif current_option and current_question:
-                # Continue current option
-                current_question[current_option] += " " + line
-            elif current_question and not any(current_question[opt] for opt in ['option_a', 'option_b', 'option_c', 'option_d']):
-                # This is still question text
-                current_question["question_text"] += " " + line
-        
-        # Add the last question
-        if current_question and current_question.get('question_text'):
-            questions.append(current_question)
-        
-        return questions
+                return {"correct_answer": "Error", "explanation": "Failed to get fill-in answer"}
+        except Exception as e:
+            return {"correct_answer": "Error", "explanation": f"Fill-in analysis failed: {str(e)}"}
     
     def _parse_json_response(self, text: str) -> Dict:
         """Parse single JSON response"""
@@ -314,6 +446,9 @@ Return ONLY JSON:
             return json.loads(clean_text)
         except:
             return {"correct_answer": "", "explanation": text}
+
+# The rest of the GoogleSheetProcessor class remains the same as previous version
+# [Include the complete GoogleSheetProcessor class from the previous response here]
 
 class GoogleSheetProcessor:
     def __init__(self, credentials_file: str, sheet_id: str, api_key: str, sheet_tab: str = "Sheet4"):
@@ -395,8 +530,8 @@ class GoogleSheetProcessor:
         all_questions = []
         total_images = 0
         
-        # Clear previous results (columns C through N)
-        self.clear_previous_data(f"{self.sheet_tab}!C:N")
+        # Clear previous results (columns C through Q)
+        self.clear_previous_data(f"{self.sheet_tab}!C:Q")
         
         # Prepare image batches
         image_batches = []
@@ -462,59 +597,59 @@ class GoogleSheetProcessor:
                     question.get("file_name", ""),         # Column C: File Name
                     question.get("source_row", ""),        # Column D: Source Row
                     f"Error: {question['error']}",         # Column E: Error
-                    "", "", "", "", "", "", "", "", ""     # Empty columns for consistency
+                    "", "", "", "", "", "", "", "", "", "", "" # Empty columns for consistency
                 ])
             else:
                 # Format image information
                 has_question_image = "Yes" if question.get("has_question_image") else "No"
                 options_with_images = ", ".join(question.get("options_with_images", [])) or "None"
+                has_instruction_image = "Yes" if question.get("has_instruction_image") else "No"
+                instructions = question.get("instructions", "") or ""
+                question_type = question.get("question_type", "UNKNOWN")
                 
                 updates.append([
                     question.get("file_name", ""),         # Column C: File Name
                     question.get("source_row", ""),        # Column D: Source Row  
-                    question.get("question_number", ""),   # Column E: Question Number
-                    question.get("question_text", ""),     # Column F: Question Text
-                    question.get("option_a", ""),          # Column G: Option A
-                    question.get("option_b", ""),          # Column H: Option B
-                    question.get("option_c", ""),          # Column I: Option C
-                    question.get("option_d", ""),          # Column J: Option D
-                    has_question_image,                    # Column K: Question Has Image
-                    options_with_images,                   # Column L: Options With Images
-                    question.get("correct_answer", ""),    # Column M: Correct Answer
-                    question.get("explanation", "")        # Column N: Explanation
+                    question_type,                         # Column E: Question Type
+                    question.get("question_number", ""),   # Column F: Question Number
+                    question.get("question_text", ""),     # Column G: Question Text
+                    question.get("option_a", ""),          # Column H: Option A
+                    question.get("option_b", ""),          # Column I: Option B
+                    question.get("option_c", ""),          # Column J: Option C
+                    question.get("option_d", ""),          # Column K: Option D
+                    has_question_image,                    # Column L: Question Has Image
+                    options_with_images,                   # Column M: Options With Images
+                    has_instruction_image,                 # Column N: Instructions Have Image
+                    instructions,                          # Column O: Instructions
+                    question.get("correct_answer", ""),    # Column P: Correct Answer
+                    question.get("explanation", "")        # Column Q: Explanation
                 ])
         
         # Write all questions to sheet
         if updates:
             # Write header row
             header = [
-                "File Name", "Source Row", "Q Number", "Question Text", 
+                "File Name", "Source Row", "Question Type", "Q Number", "Question Text", 
                 "Option A", "Option B", "Option C", "Option D", 
-                "Question Has Image", "Options With Images",
+                "Question Has Image", "Options With Images", 
+                "Instructions Have Image", "Instructions",
                 "Correct Answer", "Explanation"
             ]
             updates.insert(0, header)
             
-            update_range = f"{self.sheet_tab}!C2:N{len(updates)+1}"
+            update_range = f"{self.sheet_tab}!C2:Q{len(updates)+1}"
             self.update_sheet(updates, update_range)
             
             print(f"\n🎉 PROCESSING COMPLETED!")
             print(f"📊 Total Images Processed: {total_images}")
             print(f"📝 Total Questions Extracted: {len([q for q in all_questions if 'error' not in q])}")
-            print(f"💾 Results saved to columns C-N")
-            print(f"📋 Column Structure:")
-            print(f"   C: File Name")
-            print(f"   D: Source Row") 
-            print(f"   E: Question Number")
-            print(f"   F: Question Text (Unicode Math/Chemistry)")
-            print(f"   G: Option A (Unicode)")
-            print(f"   H: Option B (Unicode)")
-            print(f"   I: Option C (Unicode)")
-            print(f"   J: Option D (Unicode)")
-            print(f"   K: Question Has Image (Yes/No)")
-            print(f"   L: Options With Images (A,B,C or None)")
-            print(f"   M: Correct Answer")
-            print(f"   N: Explanation")
+            
+            # Count question types
+            mcq_count = len([q for q in all_questions if q.get("question_type") == "MCQ" and "error" not in q])
+            fill_count = len([q for q in all_questions if q.get("question_type") == "FILL_IN_BLANK" and "error" not in q])
+            
+            print(f"📋 Question Types: {mcq_count} MCQ, {fill_count} Fill-in-Blank")
+            print(f"💾 Results saved to columns C-Q")
         else:
             print("❌ No questions were extracted")
 
@@ -535,13 +670,12 @@ def main():
     
     try:
         print("\n" + "="*80)
-        print("ADVANCED MULTI-QUESTION EXTRACTION WITH BATCH PROCESSING")
+        print("IMPROVED MULTI-QUESTION EXTRACTION WITH ROBUST JSON PARSING")
         print(f"Batch Size: {BATCH_SIZE} images per batch")
         print("Features:")
-        print("✓ Batch processing for faster execution")
-        print("✓ Detects images in questions and options")
-        print("✓ Converts math equations to Unicode")
-        print("✓ Includes file name in each row")
+        print("✓ Enhanced JSON parsing with multiple fallback methods")
+        print("✓ Improved question type detection (MCQ/Fill-in-Blank)")
+        print("✓ Better error handling and fallback extraction")
         print("="*80)
         
         processor = GoogleSheetProcessor(CREDENTIALS_FILE, GOOGLE_SHEET_ID, OPENAI_API_KEY, SHEET_TAB)
