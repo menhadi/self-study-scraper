@@ -1,0 +1,737 @@
+import pandas as pd
+import os
+import shutil
+import logging
+from datetime import datetime
+import json
+import glob
+import re
+
+def setup_logging():
+    """Setup logging to track operations"""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=[
+            logging.FileHandler('file_renaming.log'),
+            logging.StreamHandler()
+        ]
+    )
+
+def scan_all_subfolders_recursive(base_folder):
+    """Scan all subfolders recursively in the base directory"""
+    print("📁 Scanning folder structure recursively...")
+    all_subfolders = []
+    
+    for root, dirs, files in os.walk(base_folder):
+        # Get relative path from base folder
+        rel_path = os.path.relpath(root, base_folder)
+        
+        # Skip the base folder itself
+        if rel_path == '.':
+            continue
+            
+        # Count PDF files in this folder
+        pdf_files = [f for f in files if f.lower().endswith('.pdf')]
+        
+        if pdf_files:  # Only include folders that have PDFs
+            all_subfolders.append({
+                'name': rel_path.replace('\\', '/'),  # Use forward slashes for consistency
+                'full_path': root,
+                'pdf_count': len(pdf_files),
+                'pdf_files': pdf_files
+            })
+    
+    # Sort by PDF count (descending)
+    all_subfolders.sort(key=lambda x: x['pdf_count'], reverse=True)
+    
+    print(f"Found {len(all_subfolders)} folders with PDF files:")
+    for folder in all_subfolders[:20]:  # Show first 20
+        print(f"  📁 {folder['name']} ({folder['pdf_count']} PDF files)")
+    
+    if len(all_subfolders) > 20:
+        print(f"  ... and {len(all_subfolders) - 20} more folders")
+    
+    return all_subfolders
+
+def find_data_file_in_base_folder(base_folder):
+    """Find available data files in the BASE folder only"""
+    possible_files = []
+    
+    # Look for files in the BASE folder only
+    possible_files.extend(glob.glob(os.path.join(base_folder, "*.xlsx")))
+    possible_files.extend(glob.glob(os.path.join(base_folder, "*.xls")))
+    possible_files.extend(glob.glob(os.path.join(base_folder, "*.csv")))
+    possible_files.extend(glob.glob(os.path.join(base_folder, "*nta_pdfs*")))
+    
+    print(f"\n📊 Searching for data files in: {base_folder}")
+    print("-" * 60)
+    
+    if not possible_files:
+        print("No data files found in the base folder!")
+        print("Please make sure your CSV/Excel file is in the NTA folder.")
+        return None
+    
+    for i, file in enumerate(possible_files, 1):
+        file_size = os.path.getsize(file) if os.path.exists(file) else 0
+        file_name = os.path.basename(file)
+        print(f"{i}. {file_name} ({file_size} bytes)")
+    
+    print("-" * 60)
+    choice = input("Enter the number of your file: ").strip()
+    
+    try:
+        if choice.isdigit():
+            selected_file = possible_files[int(choice) - 1]
+            print(f"Selected: {os.path.basename(selected_file)}")
+            return selected_file
+        else:
+            print("Please enter a valid number!")
+            return None
+    except (IndexError, ValueError):
+        print("Invalid choice!")
+        return None
+
+def read_data_file(file_path):
+    """Read data file whether it's Excel or CSV"""
+    try:
+        if file_path.endswith('.xlsx') or file_path.endswith('.xls'):
+            return pd.read_excel(file_path)
+        elif file_path.endswith('.csv'):
+            return pd.read_csv(file_path)
+        else:
+            # Try both methods for unknown file types
+            try:
+                return pd.read_excel(file_path)
+            except:
+                return pd.read_csv(file_path)
+    except Exception as e:
+        print(f"Error reading file {file_path}: {e}")
+        return None
+
+def clean_subfolder_name(subfolder_name):
+    """Clean subfolder names by removing .0 from numbers"""
+    if isinstance(subfolder_name, str):
+        # Remove .0 from year numbers like "2025.0" -> "2025"
+        cleaned = re.sub(r'(\d+)\.0$', r'\1', subfolder_name)
+        return cleaned
+    elif isinstance(subfolder_name, (int, float)):
+        # Convert numbers to string without decimal
+        return str(int(subfolder_name))
+    else:
+        return str(subfolder_name)
+
+def find_best_pdf_match(expected_pdf_name, actual_pdf_files):
+    """
+    Find the best matching PDF file from a list of actual PDF files
+    Uses multiple matching strategies
+    """
+    expected_name_clean = expected_pdf_name.lower().replace('.pdf', '').strip()
+    
+    best_match = None
+    best_score = 0
+    
+    for actual_pdf in actual_pdf_files:
+        actual_name_clean = actual_pdf.lower().replace('.pdf', '').strip()
+        
+        score = 0
+        
+        # Strategy 1: Exact match (without extension)
+        if actual_name_clean == expected_name_clean:
+            return actual_pdf  # Perfect match
+        
+        # Strategy 2: Contains expected name
+        if expected_name_clean in actual_name_clean:
+            score = len(expected_name_clean) / len(actual_name_clean)
+        
+        # Strategy 3: Expected name contains actual name
+        elif actual_name_clean in expected_name_clean:
+            score = len(actual_name_clean) / len(expected_name_clean)
+        
+        # Strategy 4: Partial match with numbers (common in PDF names)
+        expected_numbers = re.findall(r'\d+', expected_name_clean)
+        actual_numbers = re.findall(r'\d+', actual_name_clean)
+        
+        if expected_numbers and actual_numbers:
+            common_numbers = set(expected_numbers) & set(actual_numbers)
+            if common_numbers:
+                score = max(score, len(common_numbers) / max(len(expected_numbers), len(actual_numbers)))
+        
+        # Update best match if this score is higher
+        if score > best_score:
+            best_score = score
+            best_match = actual_pdf
+    
+    # Only return if we have a reasonably good match
+    if best_score > 0.3:  # 30% match threshold
+        return best_match
+    
+    return None
+
+def analyze_data_vs_structure(df, subfolders):
+    """Analyze how well the data matches the folder structure"""
+    print("\n🔍 Analyzing data vs folder structure...")
+    
+    # Get unique folders from column B
+    data_folders = [str(f).strip() for f in df['B'].unique()]
+    print(f"Folders in data (Column B): {len(data_folders)}")
+    
+    # Get folder names from actual structure
+    actual_folder_names = [folder['name'] for folder in subfolders]
+    print(f"Folders found with PDFs: {len(actual_folder_names)}")
+    
+    # Check matches using different strategies
+    matching_folders = []
+    missing_folders = []
+    
+    for data_folder in data_folders:
+        found = False
+        
+        # Strategy 1: Exact match
+        if data_folder in actual_folder_names:
+            matching_folders.append((data_folder, data_folder, 'EXACT'))
+            found = True
+            continue
+            
+        # Strategy 2: Case-insensitive match
+        data_folder_lower = data_folder.lower()
+        for actual_folder in actual_folder_names:
+            if actual_folder.lower() == data_folder_lower:
+                matching_folders.append((data_folder, actual_folder, 'CASE_INSENSITIVE'))
+                found = True
+                break
+        if found:
+            continue
+            
+        # Strategy 3: Partial match (data folder is part of actual folder name)
+        for actual_folder in actual_folder_names:
+            if data_folder_lower in actual_folder.lower():
+                matching_folders.append((data_folder, actual_folder, 'PARTIAL'))
+                found = True
+                break
+        if found:
+            continue
+            
+        # Strategy 4: Partial match (actual folder is part of data folder name)
+        for actual_folder in actual_folder_names:
+            if actual_folder.lower() in data_folder_lower:
+                matching_folders.append((data_folder, actual_folder, 'REVERSE_PARTIAL'))
+                found = True
+                break
+                
+        if not found:
+            missing_folders.append(data_folder)
+    
+    print(f"✅ Matching folders: {len(matching_folders)}")
+    print(f"❌ Missing folders: {len(missing_folders)}")
+    
+    if matching_folders:
+        print("\nFolder matching results:")
+        match_types = {}
+        for data_folder, actual_folder, match_type in matching_folders:
+            match_types[match_type] = match_types.get(match_type, 0) + 1
+        
+        for match_type, count in match_types.items():
+            print(f"  {match_type}: {count}")
+    
+    if missing_folders:
+        print(f"\nFirst 10 missing folders (from data):")
+        for i, folder in enumerate(missing_folders[:10]):
+            print(f"  {i+1}. {folder}")
+        if len(missing_folders) > 10:
+            print(f"  ... and {len(missing_folders) - 10} more")
+    
+    return matching_folders, missing_folders
+
+def create_folder_mapping(matching_folders):
+    """Create a mapping from data folder names to actual folder names"""
+    folder_mapping = {}
+    for data_folder, actual_folder, match_type in matching_folders:
+        folder_mapping[data_folder] = actual_folder
+    return folder_mapping
+
+def create_file_mapping(df, subfolders, folder_mapping):
+    """Create mapping from expected PDF names to actual PDF files"""
+    print("\n🔍 Creating file mapping...")
+    
+    file_mapping = {}
+    unmatched_files = []
+    
+    # Create a lookup dictionary for folders
+    folder_lookup = {}
+    for folder in subfolders:
+        folder_lookup[folder['name']] = folder
+    
+    for index, row in df.iterrows():
+        data_folder = str(row['B']).strip()
+        expected_pdf = str(row['G']).strip()
+        
+        # Skip if folder doesn't exist in mapping
+        if data_folder not in folder_mapping:
+            unmatched_files.append((index, data_folder, expected_pdf, "Folder not found"))
+            continue
+        
+        actual_folder_name = folder_mapping[data_folder]
+        
+        # Skip if actual folder not found in scanned folders
+        if actual_folder_name not in folder_lookup:
+            unmatched_files.append((index, data_folder, expected_pdf, "Actual folder not found"))
+            continue
+        
+        # Get PDF files from the actual folder
+        actual_pdf_files = folder_lookup[actual_folder_name]['pdf_files']
+        
+        # Find best matching PDF
+        matched_pdf = find_best_pdf_match(expected_pdf, actual_pdf_files)
+        
+        if matched_pdf:
+            # Create a string key that can be serialized to JSON
+            mapping_key = f"{data_folder}|||{expected_pdf}"
+            file_mapping[mapping_key] = matched_pdf
+        else:
+            unmatched_files.append((index, data_folder, expected_pdf, "No PDF match found"))
+    
+    print(f"✅ Files matched: {len(file_mapping)}")
+    print(f"❌ Files unmatched: {len(unmatched_files)}")
+    
+    if len(file_mapping) > 0:
+        print("\nFirst 10 file matches:")
+        for i, (mapping_key, actual_pdf) in enumerate(list(file_mapping.items())[:10]):
+            data_folder, expected_pdf = mapping_key.split('|||')
+            print(f"  {i+1}. Expected: '{expected_pdf}'")
+            print(f"     Actual:  '{actual_pdf}'")
+            print(f"     Folder:  '{data_folder}'")
+            print()
+    
+    return file_mapping, unmatched_files
+
+def get_actual_filename(file_mapping, data_folder, expected_filename):
+    """Get actual filename from file mapping"""
+    mapping_key = f"{data_folder}|||{expected_filename}"
+    return file_mapping.get(mapping_key, expected_filename)
+
+def preview_changes(data_file, base_folder):
+    """
+    Preview what changes will be made without actually executing them
+    """
+    print("\n👀 Generating preview...")
+    
+    df = read_data_file(data_file)
+    if df is None:
+        return None, None, None
+    
+    # Scan folders recursively
+    subfolders = scan_all_subfolders_recursive(base_folder)
+    matching_folders, missing_folders = analyze_data_vs_structure(df, subfolders)
+    
+    if not matching_folders:
+        print("❌ No matching folders found! Cannot proceed.")
+        return None, None, None
+    
+    # Create folder mapping
+    folder_mapping = create_folder_mapping(matching_folders)
+    
+    # Create file mapping
+    file_mapping, unmatched_files = create_file_mapping(df, subfolders, folder_mapping)
+    
+    preview_data = []
+    
+    for index, row in df.iterrows():
+        try:
+            expected_filename = str(row['G']).strip()
+            new_filename = str(row['C']).strip()
+            subfolder_name = clean_subfolder_name(str(row['D']).strip())
+            name_folder = str(row['B']).strip()
+            
+            # Map data folder name to actual folder name
+            actual_folder = folder_mapping.get(name_folder, name_folder)
+            
+            # Map expected filename to actual filename
+            actual_filename = get_actual_filename(file_mapping, name_folder, expected_filename)
+            
+            # Construct paths using actual folder and filename
+            current_file_path = os.path.join(base_folder, actual_folder, actual_filename)
+            target_folder = os.path.join(base_folder, actual_folder, subfolder_name)
+            new_file_path = os.path.join(target_folder, new_filename + '.pdf')  # Add .pdf extension
+            
+            file_exists = os.path.exists(current_file_path)
+            target_exists = os.path.exists(new_file_path)
+            folder_exists = os.path.exists(os.path.join(base_folder, actual_folder))
+            
+            # Determine if this file was matched
+            mapping_key = f"{name_folder}|||{expected_filename}"
+            file_matched = mapping_key in file_mapping
+            
+            # Determine action and issues
+            if not folder_exists:
+                action = 'SKIP'
+                issues = 'Folder missing'
+            elif not file_exists:
+                action = 'SKIP'
+                issues = 'Source file missing'
+            elif target_exists:
+                action = 'SKIP'
+                issues = 'Target exists'
+            else:
+                action = 'MOVE'
+                issues = 'None'
+            
+            preview_data.append({
+                'row_index': index,
+                'data_folder': name_folder,
+                'actual_folder': actual_folder,
+                'expected_file': expected_filename,
+                'actual_file': actual_filename,
+                'new_file': new_filename,
+                'subfolder': subfolder_name,
+                'folder_exists': folder_exists,
+                'file_exists': file_exists,
+                'target_exists': target_exists,
+                'file_matched': file_matched,
+                'action': action,
+                'issues': issues,
+                'full_source_path': current_file_path,
+                'full_target_path': new_file_path
+            })
+            
+        except Exception as e:
+            preview_data.append({
+                'row_index': index,
+                'data_folder': 'ERROR',
+                'actual_folder': 'ERROR',
+                'expected_file': 'ERROR',
+                'actual_file': 'ERROR',
+                'new_file': 'ERROR',
+                'subfolder': 'ERROR',
+                'folder_exists': False,
+                'file_exists': False,
+                'target_exists': False,
+                'file_matched': False,
+                'action': 'SKIP',
+                'issues': f'Error: {str(e)}',
+                'full_source_path': 'ERROR',
+                'full_target_path': 'ERROR'
+            })
+    
+    # Save preview report to current directory
+    preview_df = pd.DataFrame(preview_data)
+    preview_path = "changes_preview.csv"
+    preview_df.to_csv(preview_path, index=False)
+    
+    # Print summary
+    total_operations = len(preview_df)
+    successful_ops = len(preview_df[preview_df['action'] == 'MOVE'])
+    skipped_ops = len(preview_df[preview_df['action'] == 'SKIP'])
+    file_matched_count = len(preview_df[preview_df['file_matched'] == True])
+    
+    print(f"\n📊 PREVIEW SUMMARY:")
+    print(f"   Total operations: {total_operations}")
+    print(f"   ✅ Ready to move: {successful_ops}")
+    print(f"   ❌ Skipped: {skipped_ops}")
+    print(f"   🔍 Files auto-matched: {file_matched_count}")
+    print(f"   Preview saved to: {preview_path}")
+    
+    # Show examples of what will happen
+    if successful_ops > 0:
+        print(f"\n🎯 Example changes that will be made:")
+        examples = preview_df[preview_df['action'] == 'MOVE'].head(5)
+        for _, example in examples.iterrows():
+            print(f"   FROM: {example['actual_folder']}/{example['actual_file']}")
+            print(f"     TO: {example['actual_folder']}/{example['subfolder']}/{example['new_file']}.pdf")
+            if example['expected_file'] != example['actual_file']:
+                print(f"     Note: Expected '{example['expected_file']}' → Found '{example['actual_file']}'")
+            if example['data_folder'] != example['actual_folder']:
+                print(f"     Note: Data folder '{example['data_folder']}' → Actual '{example['actual_folder']}'")
+            print()
+    
+    return preview_df, folder_mapping, file_mapping
+
+def rename_and_reorganize_files(data_file, base_folder, folder_mapping, file_mapping):
+    """
+    Rename and reorganize files based on data file
+    """
+    print("\n🚀 Starting file reorganization...")
+    setup_logging()
+    
+    try:
+        # Read data file
+        df = read_data_file(data_file)
+        if df is None:
+            return False
+        
+        # Track all changes for rollback and reporting
+        changes_log = []
+        successful_operations = []
+        
+        # Process each row
+        for index, row in df.iterrows():
+            try:
+                expected_filename = str(row['G']).strip()
+                new_filename = str(row['C']).strip()
+                subfolder_name = clean_subfolder_name(str(row['D']).strip())
+                name_folder = str(row['B']).strip()
+                
+                # Map data folder name to actual folder name
+                actual_folder = folder_mapping.get(name_folder, name_folder)
+                
+                # Map expected filename to actual filename
+                actual_filename = get_actual_filename(file_mapping, name_folder, expected_filename)
+                
+                # Construct paths using actual folder and filename
+                current_file_path = os.path.join(base_folder, actual_folder, actual_filename)
+                target_folder = os.path.join(base_folder, actual_folder, subfolder_name)
+                new_file_path = os.path.join(target_folder, new_filename + '.pdf')  # Add .pdf extension
+                
+                # Check if source folder exists
+                if not os.path.exists(os.path.join(base_folder, actual_folder)):
+                    changes_log.append({
+                        'row_index': index,
+                        'status': 'FAILED - Source folder not found',
+                        'data_folder': name_folder,
+                        'actual_folder': actual_folder,
+                        'file': expected_filename
+                    })
+                    continue
+                
+                # Check if source file exists
+                if not os.path.exists(current_file_path):
+                    changes_log.append({
+                        'row_index': index,
+                        'status': 'FAILED - Source file not found',
+                        'data_folder': name_folder,
+                        'actual_folder': actual_folder,
+                        'expected_file': expected_filename,
+                        'actual_file': actual_filename
+                    })
+                    continue
+                
+                # Check if target already exists
+                if os.path.exists(new_file_path):
+                    changes_log.append({
+                        'row_index': index,
+                        'status': 'FAILED - Target file already exists',
+                        'data_folder': name_folder,
+                        'actual_folder': actual_folder,
+                        'file': new_filename
+                    })
+                    continue
+                
+                # Create target subfolder if it doesn't exist
+                os.makedirs(target_folder, exist_ok=True)
+                
+                # MOVE file to new location with new name
+                shutil.move(current_file_path, new_file_path)
+                
+                # Log successful operation for rollback
+                successful_operations.append({
+                    'original_path': current_file_path,
+                    'new_path': new_file_path,
+                    'original_dir': os.path.dirname(current_file_path),
+                    'data_folder': name_folder,
+                    'actual_folder': actual_folder,
+                    'expected_file': expected_filename,
+                    'actual_file': actual_filename
+                })
+                
+                # Log change for reporting
+                changes_log.append({
+                    'row_index': index,
+                    'status': 'SUCCESS',
+                    'data_folder': name_folder,
+                    'actual_folder': actual_folder,
+                    'expected_file': expected_filename,
+                    'actual_file': actual_filename,
+                    'new_file': new_filename,
+                    'subfolder': subfolder_name
+                })
+                
+                print(f"✅ {actual_folder}/{actual_filename} -> {actual_folder}/{subfolder_name}/{new_filename}.pdf")
+                if expected_filename != actual_filename:
+                    print(f"   (Expected: {expected_filename})")
+                
+            except Exception as e:
+                error_msg = f"Error processing row {index}: {e}"
+                logging.error(error_msg)
+                changes_log.append({
+                    'row_index': index,
+                    'status': f'FAILED - {error_msg}'
+                })
+                print(f"❌ Error in row {index}: {e}")
+                continue
+        
+        # Save changes log as CSV for review
+        changes_df = pd.DataFrame(changes_log)
+        changes_csv_path = "file_changes_report.csv"
+        changes_df.to_csv(changes_csv_path, index=False)
+        
+        # Save rollback information
+        rollback_data = {
+            'timestamp': datetime.now().isoformat(),
+            'base_folder': base_folder,
+            'data_file': data_file,
+            'folder_mapping': folder_mapping,
+            'file_mapping': file_mapping,
+            'operations': successful_operations
+        }
+        
+        rollback_json_path = "rollback_data.json"
+        with open(rollback_json_path, 'w') as f:
+            json.dump(rollback_data, f, indent=2)
+        
+        # Print summary
+        success_count = len([x for x in changes_log if x['status'] == 'SUCCESS'])
+        failed_count = len(changes_log) - success_count
+        
+        print(f"\n🎉 OPERATION COMPLETED!")
+        print(f"   ✅ Successful: {success_count}")
+        print(f"   ❌ Failed: {failed_count}")
+        print(f"   📊 Report: {changes_csv_path}")
+        print(f"   🔄 Rollback data: {rollback_json_path}")
+        
+        if success_count > 0:
+            print(f"\n💾 Remember: Keep 'rollback_data.json' safe until you're sure everything is correct!")
+        
+        return True
+        
+    except Exception as e:
+        logging.error(f"Critical error: {e}")
+        print(f"❌ Critical error: {e}")
+        return False
+
+def rollback_changes():
+    """
+    Rollback all changes using the rollback data
+    """
+    print("\n🔄 Starting rollback process...")
+    setup_logging()
+    
+    rollback_json_path = "rollback_data.json"
+    
+    if not os.path.exists(rollback_json_path):
+        print("❌ No rollback data found! Cannot perform rollback.")
+        return False
+    
+    try:
+        # Load rollback data
+        with open(rollback_json_path, 'r') as f:
+            rollback_data = json.load(f)
+        
+        successful_rollbacks = 0
+        failed_rollbacks = 0
+        
+        # Reverse each operation
+        for operation in reversed(rollback_data['operations']):
+            try:
+                original_path = operation['original_path']
+                new_path = operation['new_path']
+                original_dir = operation['original_dir']
+                
+                # Check if the moved file still exists in new location
+                if os.path.exists(new_path):
+                    # Ensure original directory exists
+                    os.makedirs(original_dir, exist_ok=True)
+                    
+                    # Move file back to original location
+                    shutil.move(new_path, original_path)
+                    
+                    # Remove empty directories
+                    new_dir = os.path.dirname(new_path)
+                    if os.path.exists(new_dir) and not os.listdir(new_dir):
+                        os.rmdir(new_dir)
+                    
+                    successful_rollbacks += 1
+                    print(f"✅ Rolled back: {os.path.basename(new_path)}")
+                    
+                else:
+                    failed_rollbacks += 1
+                    print(f"❌ File not found: {os.path.basename(new_path)}")
+                    
+            except Exception as e:
+                failed_rollbacks += 1
+                print(f"❌ Error rolling back: {e}")
+        
+        # Remove rollback data file after successful rollback
+        os.remove(rollback_json_path)
+        
+        print(f"\n🔄 ROLLBACK COMPLETED!")
+        print(f"   ✅ Successful: {successful_rollbacks}")
+        print(f"   ❌ Failed: {failed_rollbacks}")
+        
+        return True
+        
+    except Exception as e:
+        print(f"❌ Critical error during rollback: {e}")
+        return False
+
+if __name__ == "__main__":
+    # Set your base folder
+    BASE_FOLDER = r"D:\Vector Academy\Contents\PYQ\NTA"
+    
+    print("📁 SMART FILE REORGANIZATION SCRIPT")
+    print("=" * 60)
+    print(f"Base Folder: {BASE_FOLDER}")
+    
+    # Check if base folder exists
+    if not os.path.exists(BASE_FOLDER):
+        print(f"❌ Error: Base folder not found: {BASE_FOLDER}")
+        input("Press any key to exit . . .")
+        exit()
+    
+    # Let user select the data file from BASE FOLDER only
+    DATA_FILE_PATH = find_data_file_in_base_folder(BASE_FOLDER)
+    if not DATA_FILE_PATH:
+        input("Press any key to exit . . .")
+        exit()
+    
+    print(f"\nUsing data file: {os.path.basename(DATA_FILE_PATH)}")
+    
+    print("\nOptions:")
+    print("1. 📝 Preview changes (dry run)")
+    print("2. 🚀 Execute file reorganization") 
+    print("3. 🔄 Rollback changes")
+    
+    choice = input("Enter your choice (1/2/3): ").strip()
+    
+    if choice == "1":
+        preview_df, folder_mapping, file_mapping = preview_changes(DATA_FILE_PATH, BASE_FOLDER)
+        if preview_df is not None:
+            # Save mappings for later use
+            with open("folder_mapping.json", "w") as f:
+                json.dump(folder_mapping, f, indent=2)
+            with open("file_mapping.json", "w") as f:
+                json.dump(file_mapping, f, indent=2)
+            print(f"\n💾 Folder mapping saved to: folder_mapping.json")
+            print(f"💾 File mapping saved to: file_mapping.json")
+        
+    elif choice == "2":
+        # Load mappings from previous preview
+        if os.path.exists("folder_mapping.json") and os.path.exists("file_mapping.json"):
+            with open("folder_mapping.json", "r") as f:
+                folder_mapping = json.load(f)
+            with open("file_mapping.json", "r") as f:
+                file_mapping = json.load(f)
+            print("✅ Loaded folder and file mappings from previous preview")
+        else:
+            print("❌ No mapping files found! Please run preview first.")
+            input("Press any key to exit . . .")
+            exit()
+            
+        print("\n⚠️  WARNING: This will move your files permanently!")
+        print("   Make sure you have reviewed the preview first!")
+        confirm = input("Type 'YES' to continue: ")
+        if confirm == 'YES':
+            success = rename_and_reorganize_files(DATA_FILE_PATH, BASE_FOLDER, folder_mapping, file_mapping)
+            if success:
+                print("\n✅ Operation completed successfully!")
+            else:
+                print("\n❌ Operation failed! Check the log for errors.")
+        else:
+            print("Operation cancelled.")
+    
+    elif choice == "3":
+        rollback_changes()
+    
+    else:
+        print("Invalid choice!")
+    
+    input("\nPress any key to continue . . .")
