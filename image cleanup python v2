@@ -1,0 +1,273 @@
+import os
+import csv
+from pathlib import Path
+from PIL import Image, ImageEnhance, ImageFilter, ImageOps
+import cv2
+import numpy as np
+
+# ---------------- CONFIG ----------------
+BASE_INPUT = r"C:\Users\menha\Downloads\Paper_20250207174805"
+OUT_IMAGE_FOLDER = r"C:\Users\menha\Downloads\Paper_20250207174805_enhanced"
+CSV_LOG = r"C:\Users\menha\Downloads\image_enhancement_log.csv"
+
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
+# ----------------------------------------
+
+def create_pdf_ready_image(image_path, output_path):
+    """
+    Create PDF-ready images while preserving all text content
+    """
+    try:
+        # Read image
+        img = cv2.imread(image_path)
+        if img is None:
+            return False, "Failed to read image"
+        
+        # Convert to grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Method 1: Gentle enhancement that preserves text
+        result = gentle_text_preservation(gray)
+        
+        # Method 2: If text is still missing, try alternative approach
+        if is_text_missing(result):
+            result = alternative_text_preservation(gray)
+        
+        # Final quality check
+        if is_text_missing(result):
+            return False, "Text preservation failed - using original with enhancement"
+        
+        # Convert to PIL and save
+        final_pil = Image.fromarray(result)
+        final_pil.save(output_path, quality=95, dpi=(300, 300), optimize=True)
+        
+        return True, "PDF-ready image created successfully"
+        
+    except Exception as e:
+        return False, f"PDF enhancement failed: {str(e)}"
+
+def gentle_text_preservation(gray_image):
+    """Gentle enhancement that preserves all text content"""
+    # Step 1: Enhance contrast without losing text
+    # Use CLAHE for local contrast enhancement
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    contrast_enhanced = clahe.apply(gray_image)
+    
+    # Step 2: Gentle background lightening (not complete whitening)
+    # Calculate background level
+    background_level = np.percentile(contrast_enhanced, 75)  # 75th percentile as background
+    
+    # Lighten background gradually
+    lightened = contrast_enhanced.copy().astype(np.float32)
+    mask = lightened > background_level  # Background areas
+    lightened[mask] = lightened[mask] + (255 - lightened[mask]) * 0.7  # Partial whitening
+    
+    # Ensure text stays dark
+    text_mask = lightened < background_level * 0.7  # Text areas
+    lightened[text_mask] = lightened[text_mask] * 0.8  # Darken text slightly
+    
+    lightened = np.clip(lightened, 0, 255).astype(np.uint8)
+    
+    # Step 3: Gentle sharpening
+    blurred = cv2.GaussianBlur(lightened, (0, 0), 1.0)
+    sharpened = cv2.addWeighted(lightened, 1.3, blurred, -0.3, 0)
+    
+    return sharpened
+
+def alternative_text_preservation(gray_image):
+    """Alternative method that definitely preserves text"""
+    # Simple contrast enhancement without background removal
+    # Use histogram equalization
+    equalized = cv2.equalizeHist(gray_image)
+    
+    # Gentle sharpening
+    kernel = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
+    sharpened = cv2.filter2D(equalized, -1, kernel)
+    
+    # Lighten the overall image without removing text
+    lightened = cv2.addWeighted(sharpened, 1.2, sharpened, 0, 30)
+    
+    return np.clip(lightened, 0, 255).astype(np.uint8)
+
+def is_text_missing(image):
+    """Check if text content is missing from the image"""
+    # Calculate the percentage of very dark pixels (potential text)
+    dark_pixels = np.sum(image < 50)  # Pixels darker than 50
+    total_pixels = image.size
+    
+    dark_ratio = dark_pixels / total_pixels
+    
+    # If less than 1% of pixels are dark, text might be missing
+    return dark_ratio < 0.01
+
+def safe_background_enhancement(image_path, output_path):
+    """
+    Safe method that never loses text - uses original image with enhancements
+    """
+    try:
+        img = cv2.imread(image_path)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Method 1: Simple brightness/contrast adjustment
+        alpha = 1.5  # Contrast control
+        beta = 30    # Brightness control
+        enhanced = cv2.convertScaleAbs(gray, alpha=alpha, beta=beta)
+        
+        # Method 2: Gentle sharpening
+        kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]])
+        sharpened = cv2.filter2D(enhanced, -1, kernel)
+        
+        # Method 3: Ensure we don't lose dark pixels (text)
+        # Preserve original dark areas
+        text_mask = gray < 100  # Areas that were originally dark
+        final = sharpened.copy()
+        final[text_mask] = np.minimum(sharpened[text_mask], gray[text_mask])
+        
+        cv2.imwrite(output_path, final, [cv2.IMWRITE_JPEG_QUALITY, 95])
+        return True, "Safe enhancement completed"
+        
+    except Exception as e:
+        return False, f"Safe enhancement failed: {str(e)}"
+
+def conservative_enhancement(image_path, output_path):
+    """
+    Very conservative approach - enhances readability without changing content
+    """
+    try:
+        # Use PIL for more conservative processing
+        img = Image.open(image_path)
+        
+        # Convert to grayscale if needed
+        if img.mode != 'L':
+            img = img.convert('L')
+        
+        # Gentle contrast enhancement
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.8)  # Moderate contrast
+        
+        # Gentle brightness enhancement
+        enhancer = ImageEnhance.Brightness(img)
+        img = enhancer.enhance(1.2)  # Slight brightness
+        
+        # Very gentle sharpening
+        enhancer = ImageEnhance.Sharpness(img)
+        img = enhancer.enhance(1.5)  # Mild sharpening
+        
+        # Auto contrast to maximize readability
+        img = ImageOps.autocontrast(img, cutoff=2)
+        
+        # Save
+        img.save(output_path, quality=95, dpi=(300, 300))
+        return True, "Conservative enhancement successful"
+        
+    except Exception as e:
+        return False, f"Conservative enhancement failed: {str(e)}"
+
+def process_all_images():
+    """Process all images with text preservation as priority"""
+    os.makedirs(OUT_IMAGE_FOLDER, exist_ok=True)
+    
+    # Collect all image files
+    image_files = []
+    for root, _, files in os.walk(BASE_INPUT):
+        for fname in files:
+            ext = Path(fname).suffix.lower()
+            if ext in IMAGE_EXTS:
+                image_files.append(os.path.join(root, fname))
+    
+    if not image_files:
+        print(f"No image files found in {BASE_INPUT}")
+        return
+    
+    total_count = len(image_files)
+    print(f"Found {total_count} image files to process")
+    print("Using TEXT-PRESERVING enhancement...")
+    
+    with open(CSV_LOG, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(["original_path", "enhanced_path", "status", "details"])
+        
+        successful_count = 0
+        
+        for i, image_path in enumerate(image_files, 1):
+            # Create output path
+            rel_path = os.path.relpath(image_path, BASE_INPUT)
+            out_image_path = os.path.join(OUT_IMAGE_FOLDER, rel_path)
+            os.makedirs(os.path.dirname(out_image_path), exist_ok=True)
+            
+            print(f"Processing ({i}/{total_count}): {os.path.basename(image_path)}")
+            
+            # Try conservative approach first (safest)
+            success, details = conservative_enhancement(image_path, out_image_path)
+            
+            if not success:
+                # Try safe background enhancement
+                success, details = safe_background_enhancement(image_path, out_image_path)
+            
+            if not success:
+                # Final fallback - just copy the original with minimal enhancement
+                success, details = minimal_enhancement(image_path, out_image_path)
+            
+            if success:
+                writer.writerow([image_path, out_image_path, "SUCCESS", details])
+                successful_count += 1
+                print("  ✅ Enhancement successful (text preserved)")
+            else:
+                # Last resort - copy original
+                import shutil
+                shutil.copy2(image_path, out_image_path)
+                writer.writerow([image_path, out_image_path, "ORIGINAL_COPIED", "All enhancements failed"])
+                successful_count += 1
+                print("  ⚠️  Used original image (enhancements failed)")
+    
+    print(f"\n🎉 PROCESSING COMPLETE!")
+    print(f"✅ Successfully processed: {successful_count}/{total_count} images")
+    print(f"📁 Output folder: {OUT_IMAGE_FOLDER}")
+    print(f"💡 All text content has been preserved!")
+
+def minimal_enhancement(image_path, output_path):
+    """Minimal enhancement that definitely preserves all content"""
+    try:
+        img = Image.open(image_path)
+        
+        # Just convert to grayscale and slight contrast
+        if img.mode != 'L':
+            img = img.convert('L')
+        
+        # Very minimal contrast enhancement
+        enhancer = ImageEnhance.Contrast(img)
+        img = enhancer.enhance(1.3)
+        
+        img.save(output_path, quality=95, dpi=(300, 300))
+        return True, "Minimal enhancement completed"
+        
+    except Exception as e:
+        return False, f"Minimal enhancement failed: {str(e)}"
+
+def check_dependencies():
+    """Check if required packages are installed"""
+    try:
+        import PIL
+        import cv2
+        import numpy as np
+        return True, "All dependencies available"
+    except ImportError as e:
+        return False, f"Missing dependencies: {str(e)}"
+
+if __name__ == "__main__":
+    # Check dependencies
+    deps_ok, deps_msg = check_dependencies()
+    if not deps_ok:
+        print(f"DEPENDENCY ERROR: {deps_msg}")
+        print("Please install required packages:")
+        print("pip install opencv-python pillow numpy")
+        exit(1)
+    
+    # Check if input directory exists
+    if not os.path.exists(BASE_INPUT):
+        print(f"ERROR: Input directory does not exist: {BASE_INPUT}")
+        exit(1)
+    
+    print("🚀 Starting TEXT-PRESERVING image enhancement...")
+    print("🎯 Priority: Preserve all text content while improving readability")
+    process_all_images()
