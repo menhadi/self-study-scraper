@@ -278,15 +278,15 @@ Question:
 {q.get('text','')}
 
 REQUIREMENTS:
-- Provide the correct **numeric** answer.
-- If the answer is not numeric, convert it into a numeric form when possible.
-- Provide a complete step-by-step solution with mathematical equations in Unicode only (no LaTeX or ASCII art).
-- Provide a confidence score from 0–100.
+- Provide the correct numeric answer
+- Give concise step-by-step solution with Unicode math only
+- Keep explanations brief but complete
+- Confidence score 0-100
 
 JSON FORMAT:
 {{
   "correct_answer": "12.5",
-  "solution": "complete step-by-step solution with Unicode equations",
+  "solution": "concise step-by-step solution with Unicode equations",
   "confidence": 92
 }}
 """
@@ -322,13 +322,14 @@ D: {q.get('option_d','')}
 
 REQUIREMENTS:
 - Choose ONLY A, B, C, or D
-- Provide a complete step-by-step solution with mathematical equations in Unicode only (no LaTeX or ASCII art)
-- Provide confidence score (0–100)
+- Give concise step-by-step solution with Unicode math only
+- Keep explanations brief but complete
+- Confidence score 0-100
 
 JSON FORMAT:
 {{
   "correct_answer": "B",
-  "solution": "complete step-by-step solution with Unicode equations",
+  "solution": "concise step-by-step solution with Unicode equations",
   "confidence": 88
 }}
 """
@@ -343,7 +344,7 @@ JSON FORMAT:
             "model": ANSWER_MODEL,
             "temperature": ANSWER_TEMP,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 800  # Increased to handle longer solutions
+            "max_tokens": 450
         }
 
         try:
@@ -356,6 +357,14 @@ JSON FORMAT:
                 }
 
             content = r.json()["choices"][0]["message"]["content"]
+            
+            # If response is cut off, try one more time with slightly more tokens
+            if content.strip().endswith(('}', ']', '"')) == False:
+                print("⚠ Response appears truncated, retrying with more tokens...")
+                payload["max_tokens"] = 550
+                r = requests.post(self.base_url, headers=self.headers, json=payload, timeout=60)
+                content = r.json()["choices"][0]["message"]["content"]
+                
             return self._safe_json(content)
 
         except Exception as e:
@@ -394,25 +403,34 @@ JSON FORMAT:
         }
 
     # -----------------------------------------------
-    # PROCESS IMAGES IN BATCHES (OCR ONLY)
+    # PROCESS IMAGES IN BATCHES (OCR ONLY) - MAINTAINS ORDER
     # -----------------------------------------------
     def process_image_batch(self, image_batch: List[Tuple[str, str]]) -> List[Dict]:
-
         results = []
         with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
-            future_map = {
-                executor.submit(self.extract_all_questions_from_image, url, name): (name, url)
-                for name, url in image_batch
+            # Submit all tasks and store them in order
+            future_to_index = {
+                executor.submit(self.extract_all_questions_from_image, url, name): i 
+                for i, (name, url) in enumerate(image_batch)
             }
-
-            for fut in concurrent.futures.as_completed(future_map):
-                fname, url = future_map[fut]
+            
+            # Create a list to store results in original order
+            temp_results = [None] * len(image_batch)
+            
+            for future in concurrent.futures.as_completed(future_to_index):
+                index = future_to_index[future]
+                fname, url = image_batch[index]
                 try:
-                    res = fut.result()
-                    results.extend(res)
+                    res = future.result()
+                    temp_results[index] = res
                 except Exception as e:
-                    results.append({"error": str(e), "file_name": fname})
-
+                    temp_results[index] = [{"error": str(e), "file_name": fname}]
+            
+            # Flatten the results while maintaining order
+            for result in temp_results:
+                if result is not None:
+                    results.extend(result)
+        
         return results
 
     # -----------------------------------------------
