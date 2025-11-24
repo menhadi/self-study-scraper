@@ -2,6 +2,8 @@ import requests
 import base64
 import json
 import re
+import csv
+import os
 from PIL import Image
 from io import BytesIO
 from google.oauth2 import service_account
@@ -23,6 +25,9 @@ DETECTION_TEMP = 0.0
 
 CONFIDENCE_THRESHOLD = 80          # Not used for fallback anymore (always 4.1)
 MAX_ATTEMPTS = 2                   # Try twice if confidence invalid
+
+# Progress tracking file
+PROGRESS_FILE = "processed_files.csv"
 
 
 # ========================================
@@ -90,7 +95,7 @@ Answer ONLY "YES" or "NO".
                             "type": "image_url",
                             "image_url": {
                                 "url": f"data:image/jpeg;base64,{base64_image}",
-                                "detail": "low"  # Low detail for faster/cheaper detection
+                                "detail": "low"
                             }
                         }
                     ]
@@ -547,7 +552,7 @@ class GoogleSheetProcessor:
         try:
             result = self.service.spreadsheets().values().get(
                 spreadsheetId=self.sheet_id,
-                range=f"{self.sheet_tab}!A:Q"  # Read all columns to check progress
+                range=f"{self.sheet_tab}!A:B"  # Only read file names and URLs
             ).execute()
 
             return result.get("values", [])
@@ -556,18 +561,38 @@ class GoogleSheetProcessor:
             return []
 
     # ----------------------
-    # CHECK EXISTING PROGRESS
+    # PROGRESS TRACKING - CSV BASED
     # ----------------------
-    def check_existing_progress(self, data):
-        """Check which files have already been processed"""
+    def load_processed_files(self):
+        """Load already processed files from CSV"""
         processed_files = set()
-        if len(data) > 1:  # Has header + at least one row
-            for row in data[1:]:
-                if len(row) >= 15:  # Has data up to confidence column
-                    file_name = row[0] if row else ""
-                    if file_name and file_name != "ERROR":
-                        processed_files.add(file_name)
+        if os.path.exists(PROGRESS_FILE):
+            try:
+                with open(PROGRESS_FILE, 'r', newline='') as f:
+                    reader = csv.reader(f)
+                    for row in reader:
+                        if row:
+                            processed_files.add(row[0])
+                print(f"📊 Loaded {len(processed_files)} processed files from {PROGRESS_FILE}")
+            except Exception as e:
+                print(f"Error reading progress file: {e}")
         return processed_files
+
+    def save_processed_files(self, processed_files):
+        """Save processed files to CSV"""
+        try:
+            with open(PROGRESS_FILE, 'w', newline='') as f:
+                writer = csv.writer(f)
+                for file_name in processed_files:
+                    writer.writerow([file_name])
+            print(f"💾 Saved {len(processed_files)} processed files to {PROGRESS_FILE}")
+        except Exception as e:
+            print(f"Error saving progress file: {e}")
+
+    def mark_file_processed(self, file_name, processed_files):
+        """Mark a file as processed and save to CSV"""
+        processed_files.add(file_name)
+        self.save_processed_files(processed_files)
 
     # ----------------------
     # CLEAR OUTPUT COLUMNS (OPTIONAL - now only for full reset)
@@ -608,16 +633,15 @@ class GoogleSheetProcessor:
             print("No data in sheet.")
             return
 
-        # Check existing progress if resuming
-        processed_files = set()
-        if resume:
-            processed_files = self.check_existing_progress(data)
-            if processed_files:
-                print(f"📊 Resuming - Found {len(processed_files)} already processed files")
-            else:
-                print("🆕 Starting fresh - No previous progress found")
+        # Load processed files from CSV
+        processed_files = self.load_processed_files()
+        
+        if resume and processed_files:
+            print(f"📊 Resuming - Found {len(processed_files)} already processed files")
+        else:
+            print("🆕 Starting fresh - No previous progress found")
 
-        # Don't clear output if resuming
+        # Don't clear output if resuming and there are processed files
         if not resume or not processed_files:
             self.clear_output()
 
@@ -650,7 +674,7 @@ class GoogleSheetProcessor:
         if temp:
             batches.append(temp)
 
-        print(f"📁 Total files to check: {sum(len(b) for b in batches)}")
+        print(f"📁 New files to process: {sum(len(b) for b in batches)}")
         print(f"✅ Already processed: {processed_count}")
 
         if not batches:
@@ -674,6 +698,11 @@ class GoogleSheetProcessor:
                 all_questions.extend(solved)
 
             all_questions.extend(err_q)
+
+            # Mark files as processed
+            for q in qlist:
+                if "file_name" in q and q["file_name"] not in processed_files:
+                    self.mark_file_processed(q["file_name"], processed_files)
 
             time.sleep(3)
 
@@ -707,7 +736,9 @@ class GoogleSheetProcessor:
             ])
 
         # Find the next empty row for appending
-        next_row = len(data) + 1 if data else 2
+        # Count existing data rows (excluding header)
+        existing_data_rows = len(data) - 1 if len(data) > 1 else 0
+        next_row = existing_data_rows + 2  # +2 because header is row 1, data starts at row 2
         
         self.update_sheet(rows, next_row)
 
@@ -739,6 +770,7 @@ def main():
     print(f" Detection Model  : {DETECTION_MODEL}")
     print(f" Batch Size       : {BATCH_SIZE}")
     print(f" Resume Mode      : {'ON' if RESUME_MODE else 'OFF'}")
+    print(f" Progress File    : {PROGRESS_FILE}")
     print("="*80)
 
     try:
