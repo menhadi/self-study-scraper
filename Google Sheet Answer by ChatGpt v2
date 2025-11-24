@@ -483,7 +483,7 @@ class GoogleSheetProcessor:
         try:
             result = self.service.spreadsheets().values().get(
                 spreadsheetId=self.sheet_id,
-                range=f"{self.sheet_tab}!A:B"
+                range=f"{self.sheet_tab}!A:Q"  # Read all columns to check progress
             ).execute()
 
             return result.get("values", [])
@@ -492,7 +492,21 @@ class GoogleSheetProcessor:
             return []
 
     # ----------------------
-    # CLEAR OUTPUT COLUMNS
+    # CHECK EXISTING PROGRESS
+    # ----------------------
+    def check_existing_progress(self, data):
+        """Check which files have already been processed"""
+        processed_files = set()
+        if len(data) > 1:  # Has header + at least one row
+            for row in data[1:]:
+                if len(row) >= 15:  # Has data up to confidence column
+                    file_name = row[0] if row else ""
+                    if file_name and file_name != "ERROR":
+                        processed_files.add(file_name)
+        return processed_files
+
+    # ----------------------
+    # CLEAR OUTPUT COLUMNS (OPTIONAL - now only for full reset)
     # ----------------------
     def clear_output(self):
         try:
@@ -507,23 +521,22 @@ class GoogleSheetProcessor:
     # ----------------------
     # UPDATE SHEET
     # ----------------------
-    def update_sheet(self, rows: List[List]):
+    def update_sheet(self, rows: List[List], start_row: int = 2):
         try:
             self.service.spreadsheets().values().update(
                 spreadsheetId=self.sheet_id,
-                range=f"{self.sheet_tab}!C2",
+                range=f"{self.sheet_tab}!C{start_row}",
                 valueInputOption="RAW",
                 body={"values": rows}
             ).execute()
-            print("Sheet updated successfully.")
+            print(f"Sheet updated successfully from row {start_row}.")
         except Exception as e:
             print("Update failed:", e)
 
-
     # =====================================================
-    # PROCESS ALL IMAGES
+    # PROCESS ALL IMAGES WITH RESUME CAPABILITY
     # =====================================================
-    def process_all_images(self, batch_size=3):
+    def process_all_images(self, batch_size=3, resume=True):
 
         data = self.read_sheet()
 
@@ -531,11 +544,23 @@ class GoogleSheetProcessor:
             print("No data in sheet.")
             return
 
-        self.clear_output()
+        # Check existing progress if resuming
+        processed_files = set()
+        if resume:
+            processed_files = self.check_existing_progress(data)
+            if processed_files:
+                print(f"📊 Resuming - Found {len(processed_files)} already processed files")
+            else:
+                print("🆕 Starting fresh - No previous progress found")
 
-        # build batches
+        # Don't clear output if resuming
+        if not resume or not processed_files:
+            self.clear_output()
+
+        # build batches, skip already processed files
         batches = []
         temp = []
+        processed_count = 0
 
         for i, row in enumerate(data[1:], start=2):
             if len(row) < 2:
@@ -547,6 +572,11 @@ class GoogleSheetProcessor:
             if not url.startswith("http"):
                 continue
 
+            # Skip already processed files when resuming
+            if resume and fname in processed_files:
+                processed_count += 1
+                continue
+
             temp.append((fname, url))
 
             if len(temp) == batch_size:
@@ -555,6 +585,13 @@ class GoogleSheetProcessor:
 
         if temp:
             batches.append(temp)
+
+        print(f"📁 Files to process: {sum(len(b) for b in batches)}")
+        print(f"✅ Already processed: {processed_count}")
+
+        if not batches:
+            print("🎉 All files already processed!")
+            return
 
         # process batches
         all_questions = []
@@ -579,17 +616,12 @@ class GoogleSheetProcessor:
         # format sheet rows
         rows = []
 
-        header = [
-            "File Name", "Question Type", "Q Number", "Question Text",
-            "Option A", "Option B", "Option C", "Option D",
-            "Q Has Img", "Opt Img", "Has Inst", "Instructions",
-            "Correct Answer", "Solution", "Confidence"
-        ]
-        rows.append(header)
-
         for q in all_questions:
             if "error" in q:
-                rows.append([q.get("file_name",""), "ERROR", "", q["error"], "", "", "", "", "", "", "", "", "", "", "0"])
+                rows.append([
+                    q.get("file_name",""), "ERROR", "", q["error"], "", "", "", "", 
+                    "", "", "", "", "", "", "0"
+                ])
                 continue
 
             rows.append([
@@ -610,7 +642,11 @@ class GoogleSheetProcessor:
                 q.get("confidence",0)
             ])
 
-        self.update_sheet(rows)
+        # Find the next empty row for appending
+        next_row = len(data) + 1 if data else 2
+        
+        self.update_sheet(rows, next_row)
+
 # =====================================================
 # MAIN RUNNER
 # =====================================================
@@ -629,16 +665,15 @@ def main():
     SHEET_TAB = "Sheet4"
 
     BATCH_SIZE = 3            # OCR images per batch
-    ANSWER_DELAY = 1.0        # Seconds between answers
-    OCR_DELAY = 3.0           # Delay between OCR batches
+    RESUME_MODE = True        # Set to False to start from scratch
 
     print("\n" + "="*80)
     print(" 🔍 HIGH-ACCURACY EXAM EXTRACTION + SOLUTION SCRIPT ")
     print("="*80)
     print(f" Extraction Model : {EXTRACTION_MODEL}")
     print(f" Answer Model     : {ANSWER_MODEL}")
-    print(f" Confidence Thres : {CONFIDENCE_THRESHOLD}")
     print(f" Batch Size       : {BATCH_SIZE}")
+    print(f" Resume Mode      : {'ON' if RESUME_MODE else 'OFF'}")
     print("="*80)
 
     try:
@@ -649,7 +684,7 @@ def main():
             SHEET_TAB
         )
 
-        processor.process_all_images(batch_size=BATCH_SIZE)
+        processor.process_all_images(batch_size=BATCH_SIZE, resume=RESUME_MODE)
 
         print("\n🎉 COMPLETED SUCCESSFULLY!")
         print("All results saved to sheet columns C through Q.")
