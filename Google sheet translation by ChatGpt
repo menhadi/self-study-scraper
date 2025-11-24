@@ -1,0 +1,311 @@
+import requests
+import json
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from typing import List, Tuple
+import time
+import concurrent.futures
+
+# ==============================
+#  CONFIGURATION
+# ==============================
+OPENAI_API_KEY = "your_openai_api_key_here"
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+CREDENTIALS_FILE = "service-account.json"
+SHEET_TAB = "Sheet4"
+
+# Target languages (modify as needed)
+TARGET_LANGUAGES = ["Hindi", "Bengali"]  # Add more languages as needed
+
+# Performance settings
+MAX_WORKERS = 3  # Concurrent API calls
+REQUEST_TIMEOUT = 120  # Increased timeout
+
+# ==============================
+#  TRANSLATION SERVICE
+# ==============================
+class TranslationService:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.openai.com/v1/chat/completions"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+
+    def translate_batch(self, texts_with_info: List[Tuple[str, str, str, int]]) -> List[Tuple[str, str, int]]:
+        """Translate multiple texts in parallel"""
+        results = []
+        
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            # Submit all translation tasks
+            future_to_info = {
+                executor.submit(self._translate_single, text, lang, field_type, row_idx): (text, lang, field_type, row_idx, idx)
+                for idx, (text, lang, field_type, row_idx) in enumerate(texts_with_info)
+            }
+            
+            # Collect results
+            temp_results = [None] * len(texts_with_info)
+            
+            for future in concurrent.futures.as_completed(future_to_info):
+                text, lang, field_type, row_idx, original_idx = future_to_info[future]
+                try:
+                    translated_text = future.result()
+                    temp_results[original_idx] = (translated_text, field_type, row_idx)
+                except Exception as e:
+                    print(f"Translation failed for row {row_idx} field {field_type}: {e}")
+                    temp_results[original_idx] = (text, field_type, row_idx)  # Fallback to original
+            
+            results.extend([r for r in temp_results if r is not None])
+        
+        return results
+
+    def _translate_single(self, text: str, target_language: str, field_type: str, row_index: int) -> str:
+        """Translate single text with proper error handling"""
+        if not text or text.strip() == "":
+            return text
+            
+        prompt = f"""
+Translate the following text to {target_language}, but follow these rules carefully:
+
+RULES:
+1. Translate ONLY common words and conversational phrases
+2. PRESERVE all of the following in original English:
+   - Scientific/technical terms
+   - Mathematical symbols, equations, numbers
+   - Chemical formulas, units (kg, m/s, etc.)
+   - Proper nouns, acronyms
+   - Code-like syntax
+   - Question numbers (Q1, Q2, etc.)
+   - Option labels (A, B, C, D)
+3. Maintain the original formatting and structure
+
+Text to translate:
+{text}
+
+Return ONLY the translated text, no explanations.
+"""
+
+        payload = {
+            "model": "gpt-4",
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1000
+        }
+
+        try:
+            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=REQUEST_TIMEOUT)
+            if response.status_code == 200:
+                content = response.json()["choices"][0]["message"]["content"].strip()
+                return content
+            else:
+                print(f"Translation API error for row {row_index} field {field_type}: {response.status_code}")
+                return text  # Return original text on error
+        except requests.exceptions.Timeout:
+            print(f"Translation timeout for row {row_index} field {field_type}, using original text")
+            return text
+        except Exception as e:
+            print(f"Translation failed for row {row_index} field {field_type}: {e}")
+            return text  # Return original text on exception
+
+# ==============================
+#  GOOGLE SHEET MANAGER
+# ==============================
+class GoogleSheetManager:
+    def __init__(self, credentials_file: str, sheet_id: str, sheet_tab: str):
+        self.sheet_id = sheet_id
+        self.sheet_tab = sheet_tab
+        self.service = self._auth(credentials_file)
+
+    def _auth(self, credentials_file):
+        try:
+            scopes = ['https://www.googleapis.com/auth/spreadsheets']
+            creds = service_account.Credentials.from_service_account_file(
+                credentials_file, scopes=scopes)
+            return build('sheets', 'v4', credentials=creds)
+        except Exception as e:
+            print("Google Sheets Auth Failed:", e)
+            raise
+
+    def read_sheet_data(self):
+        """Read columns F, G, H, I, J, N (which are columns 6,7,8,9,10,14 in 0-based index)"""
+        try:
+            # Read columns A to O to get all needed data
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!A:O"
+            ).execute()
+            return result.get("values", [])
+        except Exception as e:
+            print("Error reading sheet:", e)
+            return []
+
+    def update_translations(self, translations_data: List[List]):
+        """Update columns R and beyond with translations"""
+        if not translations_data:
+            print("No translation data to update")
+            return
+
+        try:
+            # Clear existing translations in columns R onwards
+            self.service.spreadsheets().values().clear(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!R:ZZ"
+            ).execute()
+            print("Cleared previous translations (R:ZZ)")
+
+            # Update with new translations starting from column R (18th column)
+            self.service.spreadsheets().values().update(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!R1",
+                valueInputOption="RAW",
+                body={"values": translations_data}
+            ).execute()
+            print("Translations updated successfully in columns R onwards")
+        except Exception as e:
+            print("Update failed:", e)
+
+# ==============================
+#  TRANSLATION PROCESSOR
+# ==============================
+class TranslationProcessor:
+    def __init__(self, sheet_manager: GoogleSheetManager, translation_service: TranslationService):
+        self.sheet_manager = sheet_manager
+        self.translation_service = translation_service
+
+    def process_translations(self):
+        """Main method to process translations for all target languages"""
+        
+        print("📖 Reading sheet data...")
+        data = self.sheet_manager.read_sheet_data()
+        
+        if len(data) < 2:
+            print("No data found in sheet")
+            return
+
+        # Prepare header row for translations
+        headers = ["Original Text"]
+        for lang in TARGET_LANGUAGES:
+            headers.extend([
+                f"{lang} - Question Text",
+                f"{lang} - Option A", 
+                f"{lang} - Option B",
+                f"{lang} - Option C",
+                f"{lang} - Option D",
+                f"{lang} - Solution"
+            ])
+
+        translation_rows = [headers]
+
+        print(f"🔄 Processing {len(data)-1} rows for {len(TARGET_LANGUAGES)} languages...")
+        print(f"⚡ Performance: {MAX_WORKERS} concurrent workers")
+        
+        # Process each row
+        for row_index, row in enumerate(data[1:], start=2):  # Skip header
+            print(f"🚀 Processing row {row_index}...")
+            
+            # Ensure row has enough columns
+            if len(row) < 15:  # Need up to column O
+                # Pad with empty values if needed
+                row.extend([''] * (15 - len(row)))
+            
+            # Extract columns F,G,H,I,J,N (0-based indices 5,6,7,8,9,13)
+            question_text = row[5] if len(row) > 5 else ""  # Column F
+            option_a = row[6] if len(row) > 6 else ""       # Column G
+            option_b = row[7] if len(row) > 7 else ""       # Column H  
+            option_c = row[8] if len(row) > 8 else ""       # Column I
+            option_d = row[9] if len(row) > 9 else ""       # Column J
+            solution = row[13] if len(row) > 13 else ""     # Column N
+
+            # Create translation row
+            translation_row = [f"Row {row_index}"]  # Original text reference
+            
+            # Process all languages for this row
+            for lang in TARGET_LANGUAGES:
+                # Prepare all texts for this language with unique identifiers
+                texts_to_translate = [
+                    (question_text, lang, "question", row_index),
+                    (option_a, lang, "option_a", row_index),
+                    (option_b, lang, "option_b", row_index),
+                    (option_c, lang, "option_c", row_index),
+                    (option_d, lang, "option_d", row_index),
+                    (solution, lang, "solution", row_index)
+                ]
+                
+                # Filter out empty texts
+                valid_texts = [(text, l, field, idx) for text, l, field, idx in texts_to_translate if text and text.strip()]
+                
+                if valid_texts:
+                    # Translate in batch
+                    translated_results = self.translation_service.translate_batch(valid_texts)
+                    
+                    # Create a map for results by field type
+                    result_map = {}
+                    for translated_text, field_type, _ in translated_results:
+                        result_map[field_type] = translated_text
+                    
+                    # Add translations in correct order using the field type map
+                    translation_row.extend([
+                        result_map.get("question", question_text),  # Question
+                        result_map.get("option_a", option_a),       # Option A
+                        result_map.get("option_b", option_b),       # Option B
+                        result_map.get("option_c", option_c),       # Option C
+                        result_map.get("option_d", option_d),       # Option D
+                        result_map.get("solution", solution)        # Solution
+                    ])
+                else:
+                    # All texts are empty, add empty translations
+                    translation_row.extend([''] * 6)
+
+            translation_rows.append(translation_row)
+            
+            # Brief pause between rows to avoid rate limits
+            time.sleep(1)
+            
+            # Progress update
+            if (row_index - 1) % 3 == 0:  # Show progress every 3 rows
+                print(f"✅ Completed {row_index-1}/{len(data)-1} rows...")
+
+        # Update sheet with translations
+        print("📝 Updating Google Sheet with translations...")
+        self.sheet_manager.update_translations(translation_rows)
+
+# ==============================
+#  MAIN EXECUTION
+# ==============================
+def main():
+    # Validate API key
+    if not OPENAI_API_KEY or OPENAI_API_KEY == "your_openai_api_key_here":
+        print("❌ ERROR: Please set your OpenAI API key")
+        return
+
+    print("\n" + "="*60)
+    print("🌍 MULTI-LANGUAGE TRANSLATION SCRIPT")
+    print("="*60)
+    print(f"Target Languages: {', '.join(TARGET_LANGUAGES)}")
+    print(f"Translating Columns: F, G, H, I, J, N")
+    print(f"Output Columns: R and beyond")
+    print(f"Performance: {MAX_WORKERS} concurrent workers")
+    print("="*60)
+
+    try:
+        # Initialize services
+        sheet_manager = GoogleSheetManager(CREDENTIALS_FILE, GOOGLE_SHEET_ID, SHEET_TAB)
+        translation_service = TranslationService(OPENAI_API_KEY)
+        processor = TranslationProcessor(sheet_manager, translation_service)
+
+        # Process translations
+        start_time = time.time()
+        processor.process_translations()
+        end_time = time.time()
+
+        print(f"\n🎉 TRANSLATION COMPLETED SUCCESSFULLY!")
+        print(f"⏱️  Total time: {end_time - start_time:.2f} seconds")
+        print("All translations saved to columns R onwards in the sheet.")
+        print(f"Each language gets 6 columns: Question, Options A-D, Solution")
+
+    except Exception as e:
+        print(f"\n❌ TRANSLATION FAILED: {e}")
+
+if __name__ == "__main__":
+    main()
