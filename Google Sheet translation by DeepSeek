@@ -10,7 +10,7 @@ import re
 # ==============================
 #  CONFIGURATION
 # ==============================
-DEEPSEEK_API_KEY = "your_deepseek_api_key_here"  # Get from platform.deepseek.com
+DEEPSEEK_API_KEY = "your_deepseek_api_key_here"
 GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
 CREDENTIALS_FILE = "service-account.json"
 SHEET_TAB = "Sheet4"
@@ -19,11 +19,10 @@ SHEET_TAB = "Sheet4"
 TARGET_LANGUAGES = ["Hindi", "Bengali"]
 
 # Performance settings
-MAX_WORKERS = 3  # Can use more workers with DeepSeek (cheaper)
-MIN_TEXT_LENGTH = 10  # Skip very short text
+MAX_WORKERS = 3
 
 # ==============================
-#  DEEPSEEK TRANSLATION SERVICE
+#  COMPLETELY PERMISSIVE TRANSLATION SERVICE
 # ==============================
 class DeepSeekTranslationService:
     def __init__(self, api_key: str):
@@ -36,28 +35,36 @@ class DeepSeekTranslationService:
         self.translation_cache = {}
 
     def should_skip_translation(self, text: str) -> bool:
-        """Check if text should be skipped from translation"""
+        """VERY PERMISSIVE - only skip truly untranslatable content"""
         if not text or not text.strip():
             return True
-            
-        if len(text.strip()) < MIN_TEXT_LENGTH:
-            return True
         
-        # Skip text that's mostly numbers/symbols
-        clean_text = re.sub(r'[0-9\s\.\/\-]', '', text)
-        if len(clean_text) < 3:
-            return True
-            
-        # Skip common technical terms
+        text_clean = text.strip()
+        
+        # Skip ONLY these specific patterns (very restrictive list)
         skip_patterns = [
-            r'^\d+\.?\d*\s*[A-Z]*$',  # "1.0 J", "7 NS" etc.
-            r'^[A-Za-z]+\/?[A-Za-z]*$',  # Single words/acronyms
+            # Pure numbers with units: "1.0 J", "7 NS" 
+            r'^\d+\.?\d*\s*[A-Z]{1,2}$',
+            # Pure fractions: "2/3", "1/2"
+            r'^\d+\/\d+$',
+            # Single mathematical symbols with operators: "I₀/4"
+            r'^[A-Za-zα-ωΑ-Ω₀-₉]+\s*[\/\*\^]\s*[\d\.]+$',
+            # Pure numbers/decimal: "0.5", "123"
+            r'^\d+\.?\d*$',
+            # Single letters: "A", "B", "C"
+            r'^[A-Z]$',
         ]
         
         for pattern in skip_patterns:
-            if re.match(pattern, text.strip()):
+            if re.match(pattern, text_clean):
                 return True
                 
+        # SPECIAL CASE: If text ends with "है" (Hindi) or similar, it's already translated
+        if any(marker in text_clean for marker in ['है', 'होता', 'कर', 'गया', 'ती', 'ता']):
+            print(f"⚠️  Already translated text detected: {text_clean[:50]}...")
+            return True
+            
+        # DEFAULT: Translate everything else
         return False
 
     def translate_batch(self, texts_with_info: List[Tuple[str, str, str, int]]) -> List[Tuple[str, str, int]]:
@@ -81,6 +88,12 @@ class DeepSeekTranslationService:
         if not texts_to_translate:
             return results
             
+        print(f"🔤 Translating {len(texts_to_translate)} texts for row {texts_to_translate[0][3]}...")
+        
+        # Show what we're translating
+        for text, _, field_type, _, _ in texts_to_translate[:3]:  # Show first 3
+            print(f"   📄 {field_type}: {text[:80]}{'...' if len(text) > 80 else ''}")
+            
         # Process texts needing translation
         with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
             future_to_info = {
@@ -95,9 +108,14 @@ class DeepSeekTranslationService:
                     translated = future.result()
                     results.append((translated, field_type, row_idx))
                     self.translation_cache[cache_key] = translated
+                    
+                    # Show translation result
+                    if translated != text:
+                        print(f"   ✅ Translated: {translated[:80]}{'...' if len(translated) > 80 else ''}")
+                    
                 except Exception as e:
                     print(f"DeepSeek translation failed for row {row_idx}: {e}")
-                    results.append((text, field_type, row_idx))  # Fallback to original
+                    results.append((text, field_type, row_idx))
                     self.translation_cache[cache_key] = text
                     
         return results
@@ -108,42 +126,45 @@ class DeepSeekTranslationService:
             return text
             
         prompt = f"""
-Translate the following text to {target_language}, but follow these rules carefully:
+Translate the following technical/scientific/mathematical text to {target_language}, but follow these rules carefully:
 
 RULES:
-1. Translate ONLY common words and conversational phrases
-2. PRESERVE all of the following in original English:
-   - Scientific/technical terms
-   - Mathematical symbols, equations, numbers
-   - Chemical formulas, units (kg, m/s, etc.)
-   - Proper nouns, acronyms
-   - Code-like syntax
-   - Question numbers (Q1, Q2, etc.)
-   - Option labels (A, B, C, D)
-3. Maintain the original formatting and structure
+1. Translate ALL words, phrases, and descriptive text to {target_language}
+2. PRESERVE EXACTLY the following in original form:
+   - Mathematical symbols: ẋ, Δt, λₙ, π, etc.
+   - Equations and formulas
+   - Numbers, units, constants
+   - Variables and function names: f(x), xₙ, etc.
+   - Proper nouns: Euler, etc.
+   - Acronyms and technical abbreviations
+3. Maintain the original technical meaning completely
+4. Keep mathematical notation and symbols unchanged
+5. Translate only the natural language parts
 
 Text to translate:
-{text}
+"{text}"
 
 Return ONLY the translated text, no explanations.
 """
 
         payload = {
-            "model": "deepseek-chat",  # Use deepseek-chat model
+            "model": "deepseek-chat",
             "temperature": 0.1,
             "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": 1000,
+            "max_tokens": 1500,  # Increased for longer technical texts
             "stream": False
         }
 
         try:
-            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=60)
+            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=90)
             if response.status_code == 200:
                 content = response.json()["choices"][0]["message"]["content"].strip()
+                # Remove quotes if present
+                content = content.strip('"')
                 return content
             else:
-                print(f"DeepSeek API error: {response.status_code} - {response.text}")
-                return text  # Return original text on error
+                print(f"DeepSeek API error: {response.status_code}")
+                return text
         except requests.exceptions.Timeout:
             print("DeepSeek API timeout, using original text")
             return text
@@ -204,7 +225,7 @@ class GoogleSheetManager:
             print("Update failed:", e)
 
 # ==============================
-#  TRANSLATION PROCESSOR
+#  TRANSLATION PROCESSOR WITH DETAILED LOGGING
 # ==============================
 class TranslationProcessor:
     def __init__(self, sheet_manager: GoogleSheetManager, translation_service: DeepSeekTranslationService):
@@ -233,8 +254,8 @@ class TranslationProcessor:
 
         translation_rows = [headers]
 
-        print(f"🔄 Processing {len(data)-1} rows with DeepSeek API...")
-        print(f"💰 Using: DeepSeek Chat (10-20x cheaper than OpenAI)")
+        print(f"🔄 Processing {len(data)-1} rows with COMPLETELY PERMISSIVE logic...")
+        print("💡 Translating EVERYTHING except pure numbers/symbols")
         
         total_texts = 0
         skipped_texts = 0
@@ -252,6 +273,18 @@ class TranslationProcessor:
 
             translation_row = [f"Row {row_index}"]
             
+            # Check what will be translated vs skipped
+            all_texts = [question_text, option_a, option_b, option_c, option_d, solution]
+            field_names = ["Question", "Option A", "Option B", "Option C", "Option D", "Solution"]
+            
+            print(f"\n📋 Row {row_index} Analysis:")
+            for text, field_name in zip(all_texts, field_names):
+                if text and text.strip():
+                    if self.translation_service.should_skip_translation(text):
+                        print(f"   ⏭️  {field_name}: SKIPPED - '{text}'")
+                    else:
+                        print(f"   ✅ {field_name}: WILL TRANSLATE - '{text}'")
+            
             for lang in TARGET_LANGUAGES:
                 texts_to_translate = [
                     (question_text, lang, "question", row_index),
@@ -264,7 +297,7 @@ class TranslationProcessor:
                 
                 total_texts += len(texts_to_translate)
                 
-                # Count skipped texts
+                # Count skipped vs translated
                 for text, _, _, _ in texts_to_translate:
                     if self.translation_service.should_skip_translation(text):
                         skipped_texts += 1
@@ -286,23 +319,25 @@ class TranslationProcessor:
 
             translation_rows.append(translation_row)
             
-            # Small delay to be respectful to API
-            time.sleep(0.2)
+            time.sleep(0.5)  # Slightly longer delay for stability
             
-            if (row_index - 1) % 5 == 0:
+            if (row_index - 1) % 1 == 0:  # Show progress every row
                 print(f"✅ Completed {row_index-1}/{len(data)-1} rows...")
 
         cost_estimate = self._calculate_cost_estimate(total_texts - skipped_texts)
-        print(f"📊 Cost Summary: {skipped_texts}/{total_texts} texts skipped")
+        print(f"\n📊 FINAL SUMMARY:")
+        print(f"   Total texts processed: {total_texts}")
+        print(f"   Texts translated: {total_texts - skipped_texts}")
+        print(f"   Texts skipped: {skipped_texts}")
+        print(f"   Translation rate: {(total_texts - skipped_texts)/total_texts*100:.1f}%")
         print(f"💰 Estimated cost: ${cost_estimate:.4f}")
         
         self.sheet_manager.update_translations(translation_rows)
 
     def _calculate_cost_estimate(self, translated_texts_count: int) -> float:
         """Estimate DeepSeek API cost"""
-        # Rough estimate: average 200 tokens per text
-        estimated_tokens = translated_texts_count * 200
-        cost_per_million = 0.28  # Output tokens cost
+        estimated_tokens = translated_texts_count * 250  # Slightly higher for technical text
+        cost_per_million = 0.28
         return (estimated_tokens / 1_000_000) * cost_per_million
 
 # ==============================
@@ -314,13 +349,14 @@ def main():
         print("💡 Get API key from: https://platform.deepseek.com/api_keys")
         return
 
-    print("\n" + "="*60)
-    print("🌍 DEEPSEEK TRANSLATION SCRIPT")
-    print("="*60)
+    print("\n" + "="*70)
+    print("🌍 COMPLETELY PERMISSIVE DEEPSEEK TRANSLATION SCRIPT")
+    print("="*70)
     print(f"Target Languages: {', '.join(TARGET_LANGUAGES)}")
-    print(f"Model: DeepSeek Chat")
-    print(f"Cost: $0.14/1M input tokens, $0.28/1M output tokens")
-    print("="*60)
+    print("✨ TRANSLATING: All technical/scientific text with English words")
+    print("✨ INCLUDING: 'Euler iteration formula', 'differential equations', etc.")
+    print("⏭️  SKIPPING ONLY: Pure numbers (1.0 J), fractions (2/3), single symbols")
+    print("="*70)
 
     try:
         sheet_manager = GoogleSheetManager(CREDENTIALS_FILE, GOOGLE_SHEET_ID, SHEET_TAB)
@@ -331,9 +367,9 @@ def main():
         processor.process_translations()
         end_time = time.time()
 
-        print(f"\n🎉 DEEPSEEK TRANSLATION COMPLETED!")
+        print(f"\n🎉 COMPLETE TRANSLATION FINISHED!")
         print(f"⏱️  Total time: {end_time - start_time:.2f} seconds")
-        print(f"💰 Cost: 10-20x cheaper than OpenAI GPT models")
+        print("💡 All meaningful content including technical text should now be translated")
 
     except Exception as e:
         print(f"\n❌ TRANSLATION FAILED: {e}")
