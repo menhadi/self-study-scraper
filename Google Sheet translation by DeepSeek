@@ -1,0 +1,342 @@
+import requests
+import json
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from typing import List, Tuple, Dict
+import time
+import concurrent.futures
+import re
+
+# ==============================
+#  CONFIGURATION
+# ==============================
+DEEPSEEK_API_KEY = "your_deepseek_api_key_here"  # Get from platform.deepseek.com
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+CREDENTIALS_FILE = "service-account.json"
+SHEET_TAB = "Sheet4"
+
+# Target languages
+TARGET_LANGUAGES = ["Hindi", "Bengali"]
+
+# Performance settings
+MAX_WORKERS = 3  # Can use more workers with DeepSeek (cheaper)
+MIN_TEXT_LENGTH = 10  # Skip very short text
+
+# ==============================
+#  DEEPSEEK TRANSLATION SERVICE
+# ==============================
+class DeepSeekTranslationService:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.deepseek.com/v1/chat/completions"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        self.translation_cache = {}
+
+    def should_skip_translation(self, text: str) -> bool:
+        """Check if text should be skipped from translation"""
+        if not text or not text.strip():
+            return True
+            
+        if len(text.strip()) < MIN_TEXT_LENGTH:
+            return True
+        
+        # Skip text that's mostly numbers/symbols
+        clean_text = re.sub(r'[0-9\s\.\/\-]', '', text)
+        if len(clean_text) < 3:
+            return True
+            
+        # Skip common technical terms
+        skip_patterns = [
+            r'^\d+\.?\d*\s*[A-Z]*$',  # "1.0 J", "7 NS" etc.
+            r'^[A-Za-z]+\/?[A-Za-z]*$',  # Single words/acronyms
+        ]
+        
+        for pattern in skip_patterns:
+            if re.match(pattern, text.strip()):
+                return True
+                
+        return False
+
+    def translate_batch(self, texts_with_info: List[Tuple[str, str, str, int]]) -> List[Tuple[str, str, int]]:
+        """Translate multiple texts using DeepSeek API"""
+        results = []
+        
+        # Separate cached texts and texts needing translation
+        texts_to_translate = []
+        
+        for text, lang, field_type, row_idx in texts_with_info:
+            cache_key = f"{text}_{lang}"
+            
+            if cache_key in self.translation_cache:
+                results.append((self.translation_cache[cache_key], field_type, row_idx))
+            elif self.should_skip_translation(text):
+                results.append((text, field_type, row_idx))
+                self.translation_cache[cache_key] = text
+            else:
+                texts_to_translate.append((text, lang, field_type, row_idx, cache_key))
+        
+        if not texts_to_translate:
+            return results
+            
+        # Process texts needing translation
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            future_to_info = {
+                executor.submit(self._translate_single, text, lang): 
+                (text, lang, field_type, row_idx, cache_key)
+                for text, lang, field_type, row_idx, cache_key in texts_to_translate
+            }
+            
+            for future in concurrent.futures.as_completed(future_to_info):
+                text, lang, field_type, row_idx, cache_key = future_to_info[future]
+                try:
+                    translated = future.result()
+                    results.append((translated, field_type, row_idx))
+                    self.translation_cache[cache_key] = translated
+                except Exception as e:
+                    print(f"DeepSeek translation failed for row {row_idx}: {e}")
+                    results.append((text, field_type, row_idx))  # Fallback to original
+                    self.translation_cache[cache_key] = text
+                    
+        return results
+
+    def _translate_single(self, text: str, target_language: str) -> str:
+        """Translate single text using DeepSeek"""
+        if self.should_skip_translation(text):
+            return text
+            
+        prompt = f"""
+Translate the following text to {target_language}, but follow these rules carefully:
+
+RULES:
+1. Translate ONLY common words and conversational phrases
+2. PRESERVE all of the following in original English:
+   - Scientific/technical terms
+   - Mathematical symbols, equations, numbers
+   - Chemical formulas, units (kg, m/s, etc.)
+   - Proper nouns, acronyms
+   - Code-like syntax
+   - Question numbers (Q1, Q2, etc.)
+   - Option labels (A, B, C, D)
+3. Maintain the original formatting and structure
+
+Text to translate:
+{text}
+
+Return ONLY the translated text, no explanations.
+"""
+
+        payload = {
+            "model": "deepseek-chat",  # Use deepseek-chat model
+            "temperature": 0.1,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": 1000,
+            "stream": False
+        }
+
+        try:
+            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=60)
+            if response.status_code == 200:
+                content = response.json()["choices"][0]["message"]["content"].strip()
+                return content
+            else:
+                print(f"DeepSeek API error: {response.status_code} - {response.text}")
+                return text  # Return original text on error
+        except requests.exceptions.Timeout:
+            print("DeepSeek API timeout, using original text")
+            return text
+        except Exception as e:
+            print(f"DeepSeek API exception: {e}")
+            return text
+
+# ==============================
+#  GOOGLE SHEET MANAGER
+# ==============================
+class GoogleSheetManager:
+    def __init__(self, credentials_file: str, sheet_id: str, sheet_tab: str):
+        self.sheet_id = sheet_id
+        self.sheet_tab = sheet_tab
+        self.service = self._auth(credentials_file)
+
+    def _auth(self, credentials_file):
+        try:
+            scopes = ['https://www.googleapis.com/auth/spreadsheets']
+            creds = service_account.Credentials.from_service_account_file(
+                credentials_file, scopes=scopes)
+            return build('sheets', 'v4', credentials=creds)
+        except Exception as e:
+            print("Google Sheets Auth Failed:", e)
+            raise
+
+    def read_sheet_data(self):
+        try:
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!A:O"
+            ).execute()
+            return result.get("values", [])
+        except Exception as e:
+            print("Error reading sheet:", e)
+            return []
+
+    def update_translations(self, translations_data: List[List]):
+        if not translations_data:
+            print("No translation data to update")
+            return
+
+        try:
+            self.service.spreadsheets().values().clear(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!R:ZZ"
+            ).execute()
+            print("Cleared previous translations (R:ZZ)")
+
+            self.service.spreadsheets().values().update(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!R1",
+                valueInputOption="RAW",
+                body={"values": translations_data}
+            ).execute()
+            print("Translations updated successfully")
+        except Exception as e:
+            print("Update failed:", e)
+
+# ==============================
+#  TRANSLATION PROCESSOR
+# ==============================
+class TranslationProcessor:
+    def __init__(self, sheet_manager: GoogleSheetManager, translation_service: DeepSeekTranslationService):
+        self.sheet_manager = sheet_manager
+        self.translation_service = translation_service
+
+    def process_translations(self):
+        print("📖 Reading sheet data...")
+        data = self.sheet_manager.read_sheet_data()
+        
+        if len(data) < 2:
+            print("No data found in sheet")
+            return
+
+        # Prepare headers
+        headers = ["Original Text"]
+        for lang in TARGET_LANGUAGES:
+            headers.extend([
+                f"{lang} - Question Text",
+                f"{lang} - Option A", 
+                f"{lang} - Option B",
+                f"{lang} - Option C",
+                f"{lang} - Option D",
+                f"{lang} - Solution"
+            ])
+
+        translation_rows = [headers]
+
+        print(f"🔄 Processing {len(data)-1} rows with DeepSeek API...")
+        print(f"💰 Using: DeepSeek Chat (10-20x cheaper than OpenAI)")
+        
+        total_texts = 0
+        skipped_texts = 0
+        
+        for row_index, row in enumerate(data[1:], start=2):
+            if len(row) < 15:
+                row.extend([''] * (15 - len(row)))
+            
+            question_text = row[5] if len(row) > 5 else ""
+            option_a = row[6] if len(row) > 6 else ""
+            option_b = row[7] if len(row) > 7 else ""
+            option_c = row[8] if len(row) > 8 else ""
+            option_d = row[9] if len(row) > 9 else ""
+            solution = row[13] if len(row) > 13 else ""
+
+            translation_row = [f"Row {row_index}"]
+            
+            for lang in TARGET_LANGUAGES:
+                texts_to_translate = [
+                    (question_text, lang, "question", row_index),
+                    (option_a, lang, "option_a", row_index),
+                    (option_b, lang, "option_b", row_index),
+                    (option_c, lang, "option_c", row_index),
+                    (option_d, lang, "option_d", row_index),
+                    (solution, lang, "solution", row_index)
+                ]
+                
+                total_texts += len(texts_to_translate)
+                
+                # Count skipped texts
+                for text, _, _, _ in texts_to_translate:
+                    if self.translation_service.should_skip_translation(text):
+                        skipped_texts += 1
+
+                translated_results = self.translation_service.translate_batch(texts_to_translate)
+                
+                result_map = {}
+                for translated_text, field_type, _ in translated_results:
+                    result_map[field_type] = translated_text
+                
+                translation_row.extend([
+                    result_map.get("question", question_text),
+                    result_map.get("option_a", option_a),
+                    result_map.get("option_b", option_b),
+                    result_map.get("option_c", option_c),
+                    result_map.get("option_d", option_d),
+                    result_map.get("solution", solution)
+                ])
+
+            translation_rows.append(translation_row)
+            
+            # Small delay to be respectful to API
+            time.sleep(0.2)
+            
+            if (row_index - 1) % 5 == 0:
+                print(f"✅ Completed {row_index-1}/{len(data)-1} rows...")
+
+        cost_estimate = self._calculate_cost_estimate(total_texts - skipped_texts)
+        print(f"📊 Cost Summary: {skipped_texts}/{total_texts} texts skipped")
+        print(f"💰 Estimated cost: ${cost_estimate:.4f}")
+        
+        self.sheet_manager.update_translations(translation_rows)
+
+    def _calculate_cost_estimate(self, translated_texts_count: int) -> float:
+        """Estimate DeepSeek API cost"""
+        # Rough estimate: average 200 tokens per text
+        estimated_tokens = translated_texts_count * 200
+        cost_per_million = 0.28  # Output tokens cost
+        return (estimated_tokens / 1_000_000) * cost_per_million
+
+# ==============================
+#  MAIN EXECUTION
+# ==============================
+def main():
+    if not DEEPSEEK_API_KEY or DEEPSEEK_API_KEY == "your_deepseek_api_key_here":
+        print("❌ ERROR: Please set your DeepSeek API key")
+        print("💡 Get API key from: https://platform.deepseek.com/api_keys")
+        return
+
+    print("\n" + "="*60)
+    print("🌍 DEEPSEEK TRANSLATION SCRIPT")
+    print("="*60)
+    print(f"Target Languages: {', '.join(TARGET_LANGUAGES)}")
+    print(f"Model: DeepSeek Chat")
+    print(f"Cost: $0.14/1M input tokens, $0.28/1M output tokens")
+    print("="*60)
+
+    try:
+        sheet_manager = GoogleSheetManager(CREDENTIALS_FILE, GOOGLE_SHEET_ID, SHEET_TAB)
+        translation_service = DeepSeekTranslationService(DEEPSEEK_API_KEY)
+        processor = TranslationProcessor(sheet_manager, translation_service)
+
+        start_time = time.time()
+        processor.process_translations()
+        end_time = time.time()
+
+        print(f"\n🎉 DEEPSEEK TRANSLATION COMPLETED!")
+        print(f"⏱️  Total time: {end_time - start_time:.2f} seconds")
+        print(f"💰 Cost: 10-20x cheaper than OpenAI GPT models")
+
+    except Exception as e:
+        print(f"\n❌ TRANSLATION FAILED: {e}")
+
+if __name__ == "__main__":
+    main()
