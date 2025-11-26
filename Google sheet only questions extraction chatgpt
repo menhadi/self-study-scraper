@@ -104,7 +104,9 @@ Answer ONLY "YES" or "NO".
             if response.status_code == 200:
                 content = response.json()["choices"][0]["message"]["content"].strip().upper()
                 return "YES" in content
-            return False
+            else:
+                print(f"Detection API Error {response.status_code}: {response.text}")
+                return False
         except Exception as e:
             print(f"Detection failed for {file_name}: {e}")
             return False
@@ -121,25 +123,39 @@ Answer ONLY "YES" or "NO".
         prompt = """
 You are an OCR + parsing expert. Extract ALL questions from the exam image.
 
-RULES:
-1. Extract each question individually.
-2. Detect question type: "MCQ" or "FILL_IN_BLANK".
-3. Extract instructions (text BEFORE the first question OR lines beginning with:
-   - Instruction(s)
-   - Direction(s)
-   - Read the following
-   - For questions ... etc.)
-4. Extract option text A/B/C/D.
-5. If question or options contain images, put "[IMAGE]" as placeholder for each image in the text.
-6. Convert math/chem formulas to **Unicode text** (NOT LaTeX).
-7. If the question contains a TABLE:
-   - Convert the table strictly into valid HTML <table> format.
-   - Use only these tags: <table>, <tr>, <th>, <td>.
-   - DO NOT return tables as plain text.
-   - The table must appear exactly at the same place inside the question.
-8. DO NOT wrap the output inside markdown or any emoji.
-9. Output must be valid HTML-compatible text only.
-10. Output ONLY a JSON ARRAY (no explanation).
+CRITICAL RULES FOR MATHEMATICAL TEXT:
+1. PRESERVE ALL ORIGINAL UNICODE CHARACTERS EXACTLY as they appear in the image
+2. DO NOT convert to LaTeX or add any **asterisks** for formatting
+3. Keep subscript characters like v₁, v₂, v₃ AS IS (do not change to v_1, v_2, v_3)
+4. Keep superscript characters like x², y³ AS IS (do not change to x^2, y^3)
+5. Keep mathematical operators like ·, ×, ÷, ±, ≠, ≤, ≥, ∂, ∫, ∑, ∏ AS IS
+6. Keep Greek letters like α, β, γ, Δ, θ, λ, μ, σ, ω AS IS
+7. Keep vector notation like v, u, a AS IS (do not add **bold** formatting)
+
+OTHER RULES:
+8. Extract each question individually.
+9. Detect question type: "MCQ" or "FILL_IN_BLANK".
+10. Extract instructions (text BEFORE the first question OR lines beginning with:
+    - Instruction(s)
+    - Direction(s)
+    - Read the following
+    - For questions ... etc.)
+11. Extract option text A/B/C/D.
+12. If question or options contain images, put "[IMAGE]" as placeholder for each image in the text.
+13. If the question contains a TABLE:
+    - Convert the table strictly into valid HTML <table> format.
+    - Use only these tags: <table>, <tr>, <th>, <td>.
+    - DO NOT return tables as plain text.
+    - The table must appear exactly at the same place inside the question.
+14. DO NOT wrap the output inside markdown or any emoji.
+15. Output must be valid HTML-compatible text only.
+16. Output ONLY a JSON ARRAY (no explanation).
+
+IMPORTANT EXAMPLES:
+- If you see "v₁ = v₂ + v₃" in the image → output "v₁ = v₂ + v₃" (NOT "v_1 = v_2 + v_3")
+- If you see "x² + y² = z²" in the image → output "x² + y² = z²" (NOT "x^2 + y^2 = z^2")
+- If you see "∂f/∂x" in the image → output "∂f/∂x" (NOT "\\frac{\\partial f}{\\partial x}")
+- If you see "α + β = γ" in the image → output "α + β = γ" (NOT "\\alpha + \\beta = \\gamma")
 
 JSON SCHEMA EXAMPLE:
 [
@@ -147,10 +163,10 @@ JSON SCHEMA EXAMPLE:
     "number": "Q1",
     "type": "MCQ",
     "text": "question text [IMAGE] [IMAGE]",
-    "option_a": "A text [IMAGE]",
-    "option_b": "B text",
-    "option_c": "C text [IMAGE]",
-    "option_d": "D text",
+    "option_a": "v₃ = v₁ - (v₁ · v₂) v₂ / |v₂|²",
+    "option_b": "v₃ = k̂",
+    "option_c": "v₃ = v₂ - (v₂ · v₁) v₁ / |v₁|²",
+    "option_d": "v₃ = v₁ / |v₁|² v₂ / |v₂|²",
     "instructions": "common instructions here"
   }
 ]
@@ -174,7 +190,7 @@ JSON SCHEMA EXAMPLE:
                     ]
                 }
             ],
-            "max_tokens": 3500
+            "max_tokens": 4000
         }
 
         try:
@@ -182,7 +198,18 @@ JSON SCHEMA EXAMPLE:
             response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=90)
 
             if response.status_code != 200:
-                return [{"error": f"OCR API Error: {response.status_code}", "file_name": file_name}]
+                error_msg = f"OCR API Error: {response.status_code}"
+                if response.status_code == 400:
+                    error_msg += " - Bad Request (check image format or size)"
+                elif response.status_code == 429:
+                    error_msg += " - Rate Limit Exceeded"
+                elif response.status_code == 500:
+                    error_msg += " - Internal Server Error"
+                elif response.status_code == 503:
+                    error_msg += " - Service Unavailable"
+                
+                print(f"{error_msg} for {file_name}")
+                return [{"error": error_msg, "file_name": file_name}]
 
             content = response.json()["choices"][0]["message"]["content"].strip()
 
