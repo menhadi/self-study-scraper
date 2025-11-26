@@ -549,8 +549,8 @@ class GoogleSheetProcessorPart1:
             time.sleep(3)
 
         # format sheet rows (only question data, no answers)
-        # Columns: C=Type, D=Number, E=Text, F=Option A, G=Option B, H=Option C, I=Option D, 
-        #          M=Instructions, N=File Name
+        # NEW COLUMN ORDER:
+        # C=Type, D=Number, E=File Name, F=Instructions, G=Text, H=Option A, I=Option B, J=Option C, K=Option D
         rows = []
 
         for q in all_questions:
@@ -558,25 +558,23 @@ class GoogleSheetProcessorPart1:
                 rows.append([
                     "ERROR",           # C: Type
                     "",                # D: Number  
-                    q["error"],        # E: Text
-                    "", "", "", "",    # F-I: Options A-D
-                    "", "", "", "",   # J-L: (Empty - removed columns)
-                    "",               # M: Instructions
-                    q.get("file_name","")  # N: File Name
+                    q.get("file_name",""),  # E: File Name
+                    "",               # F: Instructions
+                    q["error"],        # G: Text
+                    "", "", "", ""     # H-K: Options A-D
                 ])
                 continue
             
             rows.append([
                 q.get("type",""),      # C: Type
                 q.get("number",""),    # D: Number
-                q.get("text",""),      # E: Text
-                q.get("option_a",""),  # F: Option A
-                q.get("option_b",""),  # G: Option B  
-                q.get("option_c",""),  # H: Option C
-                q.get("option_d",""),  # I: Option D
-                "", "", "",           # J-L: (Empty - removed columns)
-                q.get("instructions",""),  # M: Instructions
-                q.get("file_name","")  # N: File Name
+                q.get("file_name",""), # E: File Name
+                q.get("instructions",""),  # F: Instructions
+                q.get("text",""),      # G: Text
+                q.get("option_a",""),  # H: Option A
+                q.get("option_b",""),  # I: Option B  
+                q.get("option_c",""),  # J: Option C
+                q.get("option_d","")   # K: Option D
             ])
 
         # Find the next empty row for appending
@@ -630,7 +628,7 @@ def main_part1():
         processor.process_all_images(batch_size=BATCH_SIZE, resume=RESUME_MODE)
 
         print("\n🎉 PART 1 COMPLETED SUCCESSFULLY!")
-        print("All questions extracted and saved to sheet columns C through N.")
+        print("All questions extracted and saved to sheet columns C through K.")
 
     except Exception as e:
         print(f"\n❌ FATAL ERROR: {e}")
