@@ -130,7 +130,7 @@ RULES:
    - Read the following
    - For questions ... etc.)
 4. Extract option text A/B/C/D.
-5. Detect if question or options contain an image.
+5. If question or options contain images, put "[IMAGE]" as placeholder for each image in the text.
 6. Convert math/chem formulas to **Unicode text** (NOT LaTeX).
 7. If the question contains a TABLE:
    - Convert the table strictly into valid HTML <table> format.
@@ -146,14 +146,12 @@ JSON SCHEMA EXAMPLE:
   {
     "number": "Q1",
     "type": "MCQ",
-    "text": "question text",
-    "option_a": "A text",
+    "text": "question text [IMAGE] [IMAGE]",
+    "option_a": "A text [IMAGE]",
     "option_b": "B text",
-    "option_c": "C text",
+    "option_c": "C text [IMAGE]",
     "option_d": "D text",
-    "instructions": "common instructions here",
-    "has_q_image": false,
-    "opt_images": []
+    "instructions": "common instructions here"
   }
 ]
 """
@@ -203,19 +201,6 @@ JSON SCHEMA EXAMPLE:
                 q.setdefault("option_c", "")
                 q.setdefault("option_d", "")
                 q.setdefault("instructions", "")
-                q.setdefault("has_q_image", False)
-                
-                # Ensure opt_images is always a list of strings
-                opt_images = q.get("opt_images", [])
-                if isinstance(opt_images, bool):
-                    q["opt_images"] = []
-                elif isinstance(opt_images, str):
-                    q["opt_images"] = [opt_images] if opt_images else []
-                elif not isinstance(opt_images, list):
-                    q["opt_images"] = []
-                else:
-                    # Ensure all items in the list are strings
-                    q["opt_images"] = [str(img) for img in opt_images if img]
 
             return questions
 
@@ -291,8 +276,6 @@ JSON SCHEMA EXAMPLE:
                     "option_c": "",
                     "option_d": "",
                     "instructions": "",
-                    "has_q_image": False,
-                    "opt_images": [],
                     "file_name": file_name
                 }
                 continue
@@ -540,7 +523,7 @@ class GoogleSheetProcessorPart1:
 
         # format sheet rows (only question data, no answers)
         # Columns: C=Type, D=Number, E=Text, F=Option A, G=Option B, H=Option C, I=Option D, 
-        #          J=Has Q Image, K=Opt Images, L=Has Instructions, M=Instructions, N=File Name
+        #          M=Instructions, N=File Name
         rows = []
 
         for q in all_questions:
@@ -550,14 +533,11 @@ class GoogleSheetProcessorPart1:
                     "",                # D: Number  
                     q["error"],        # E: Text
                     "", "", "", "",    # F-I: Options A-D
-                    "", "",           # J-K: Image fields
-                    "", "",           # L-M: Instruction fields
+                    "", "", "", "",   # J-L: (Empty - removed columns)
+                    "",               # M: Instructions
                     q.get("file_name","")  # N: File Name
                 ])
                 continue
-
-            # Safely handle opt_images joining
-            opt_images_str = ",".join(str(img) for img in q.get("opt_images", []))
             
             rows.append([
                 q.get("type",""),      # C: Type
@@ -567,9 +547,7 @@ class GoogleSheetProcessorPart1:
                 q.get("option_b",""),  # G: Option B  
                 q.get("option_c",""),  # H: Option C
                 q.get("option_d",""),  # I: Option D
-                "Yes" if q.get("has_q_image") else "No",  # J: Has Q Image
-                opt_images_str,        # K: Opt Images (safe join)
-                "Yes" if q.get("instructions") else "No",  # L: Has Instructions
+                "", "", "",           # J-L: (Empty - removed columns)
                 q.get("instructions",""),  # M: Instructions
                 q.get("file_name","")  # N: File Name
             ])
