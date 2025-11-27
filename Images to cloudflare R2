@@ -1,0 +1,99 @@
+import os
+import boto3
+from tqdm import tqdm
+from botocore.client import Config
+from datetime import datetime
+
+# ==============================
+# ✅ R2 CONFIGURATION
+# ==============================
+R2_ACCOUNT_ID   = "9c3a111cd1c8101060111b18f9dda444"
+R2_ACCESS_KEY   = "cd09fc348dc0e5ac72d04d7b301ae141"
+R2_SECRET_KEY   = "15c67f92b18a5b0dc5a4ce9f6b675e76367544a316aa21118ce0d737ab080d7a"
+R2_BUCKET_NAME  = "tech4learn"
+R2_CDN_BASE     = "https://cdn.tech4learn.com"
+
+# ==============================
+# ✅ IMAGE BASE FOLDER (INPUT)
+# ==============================
+IMAGE_BASE_DIR = r"D:\Vector Academy\Contents\PYQ\GATE\Image"
+
+# ==============================
+# ✅ OUTPUT LOG FILES
+# ==============================
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+LOG_FILE     = os.path.join(IMAGE_BASE_DIR, f"image_upload_log_{TIMESTAMP}.csv")
+URL_FILE     = os.path.join(IMAGE_BASE_DIR, f"image_uploaded_urls_{TIMESTAMP}.txt")
+MAPPING_FILE = os.path.join(IMAGE_BASE_DIR, f"image_uploaded_mapping_{TIMESTAMP}.txt")
+
+# ==============================
+# ✅ CONNECT TO R2
+# ==============================
+endpoint_url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=endpoint_url,
+    aws_access_key_id=R2_ACCESS_KEY,
+    aws_secret_access_key=R2_SECRET_KEY,
+    config=Config(signature_version="s3v4"),
+    region_name="auto"
+)
+
+# ==============================
+# ✅ FIND ALL IMAGES
+# ==============================
+all_images = []
+
+for root, _, files in os.walk(IMAGE_BASE_DIR):
+    for f in files:
+        if f.lower().endswith((".png", ".jpg", ".jpeg", ".webp")):
+            all_images.append(os.path.join(root, f))
+
+print(f"✅ Total Images Found: {len(all_images)}")
+
+# ==============================
+# ✅ OUTPUT HOLDERS
+# ==============================
+log_lines = ["Image_File,Status,Message,Public_URL"]
+url_lines = []
+mapping_lines = ["Image_File,Public_URL"]
+
+# ==============================
+# ✅ MAIN UPLOAD LOOP
+# ==============================
+for image_path in tqdm(all_images, desc="Uploading Images to R2"):
+    try:
+        rel_path = os.path.relpath(image_path, IMAGE_BASE_DIR).replace("\\", "/")
+
+        s3.upload_file(image_path, R2_BUCKET_NAME, rel_path)
+
+        public_url = f"{R2_CDN_BASE}/{rel_path}"
+
+        log_lines.append(f"{rel_path},OK,Uploaded,{public_url}")
+        url_lines.append(public_url)
+        mapping_lines.append(f"{rel_path},{public_url}")
+
+        print(f"✅ Uploaded: {rel_path}")
+
+    except Exception as e:
+        log_lines.append(f"{image_path},FAIL,{str(e)},")
+        print(f"❌ Upload failed: {image_path}")
+
+# ==============================
+# ✅ SAVE OUTPUT FILES
+# ==============================
+with open(LOG_FILE, "w", encoding="utf-8") as f:
+    f.write("\n".join(log_lines))
+
+with open(URL_FILE, "w", encoding="utf-8") as f:
+    f.write("\n".join(url_lines))
+
+with open(MAPPING_FILE, "w", encoding="utf-8") as f:
+    f.write("\n".join(mapping_lines))
+
+print("\n✅ ALL IMAGES UPLOADED SUCCESSFULLY!")
+print(f"📋 Log File    : {LOG_FILE}")
+print(f"🌐 URL File    : {URL_FILE}")
+print(f"🔗 Mapping File: {MAPPING_FILE}")
