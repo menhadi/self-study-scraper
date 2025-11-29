@@ -1,0 +1,176 @@
+import cv2
+import numpy as np
+import os
+import hashlib
+
+# ======================================
+# PATHS
+# ======================================
+input_folder = r"C:\Users\menha\Downloads\test\pages"
+output_folder = r"C:\Users\menha\Downloads\test\extracted_compounds"
+os.makedirs(output_folder, exist_ok=True)
+
+# ======================================
+# SETTINGS
+# ======================================
+min_area = 3500
+seen_hashes = set()
+
+# ======================================
+# DUPLICATE FILTER
+# ======================================
+def is_duplicate(img):
+    h = hashlib.md5(img.tobytes()).hexdigest()
+    if h in seen_hashes:
+        return True
+    seen_hashes.add(h)
+    return False
+
+# ======================================
+# SAFE HEADER + FOOTER CROP
+# ======================================
+def crop_header_footer(img):
+    h, w, _ = img.shape
+    top = int(0.06 * h)
+    bottom = int(0.95 * h)
+    return img[top:bottom, :]
+
+# ======================================
+# IOU OVERLAP REMOVAL
+# ======================================
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+    yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+
+    interW = max(0, xB - xA)
+    interH = max(0, yB - yA)
+    inter = interW * interH
+
+    areaA = boxA[2] * boxA[3]
+    areaB = boxB[2] * boxB[3]
+    union = areaA + areaB - inter
+
+    return inter / union if union != 0 else 0
+
+def non_max_suppression(boxes, thresh=0.45):
+    if not boxes:
+        return []
+
+    boxes = sorted(boxes, key=lambda b: b[2] * b[3], reverse=True)
+    final = []
+
+    while boxes:
+        best = boxes.pop(0)
+        final.append(best)
+        boxes = [b for b in boxes if iou(best, b) < thresh]
+
+    return final
+
+# ======================================
+# TIGHT PADDING
+# ======================================
+def pad_box(x, y, w, h, img_w, img_h, pad_ratio=0.10):
+    px = int(w * pad_ratio)
+    py = int(h * pad_ratio)
+
+    x0 = max(0, x - px)
+    y0 = max(0, y - py)
+    x1 = min(img_w, x + w + px)
+    y1 = min(img_h, y + h + py)
+
+    return x0, y0, x1 - x0, y1 - y0
+
+# ======================================
+# TEXT REJECTION FILTER
+# ======================================
+def is_text_like(crop):
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 60, 160)
+    density = np.sum(edges > 0) / edges.size
+    return density > 0.20
+
+# ======================================
+# MAIN EXTRACTION LOOP
+# ======================================
+page_counter = 1
+
+for fname in sorted(os.listdir(input_folder)):
+
+    if not fname.lower().endswith((".png", ".jpg", ".jpeg")):
+        continue
+
+    page_path = os.path.join(input_folder, fname)
+    page = cv2.imread(page_path)
+
+    if page is None:
+        continue
+
+    page = crop_header_footer(page)
+    H, W = page.shape[:2]
+    gray = cv2.cvtColor(page, cv2.COLOR_BGR2GRAY)
+
+    th = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY_INV,
+        17, 3
+    )
+
+    edges = cv2.Canny(gray, 60, 160)
+    combined = cv2.bitwise_or(th, edges)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 4))
+    dilated = cv2.dilate(combined, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(
+        dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    raw_boxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = w * h
+        aspect = w / h if h != 0 else 0
+
+        if (
+            area > min_area and
+            80 < w < 2200 and
+            80 < h < 1600 and
+            0.15 < aspect < 7.0
+        ):
+            x, y, w, h = pad_box(x, y, w, h, W, H)
+            raw_boxes.append((x, y, w, h))
+
+    boxes = non_max_suppression(raw_boxes, thresh=0.45)
+
+    print(f"\n📄 Page {page_counter} → Raw: {len(raw_boxes)} | Final: {len(boxes)}")
+
+    image_counter = 1
+
+    for (x, y, w, h) in boxes:
+        crop = page[y:y + h, x:x + w]
+
+        if is_text_like(crop):
+            continue
+
+        if is_duplicate(crop):
+            continue
+
+        out_name = f"Page{str(page_counter).zfill(2)}_{image_counter}.png"
+        out_path = os.path.join(output_folder, out_name)
+
+        cv2.imwrite(out_path, crop)
+
+        print(f"   ✅ Saved {out_name}")
+
+        image_counter += 1   # ✅ NO LIMIT ANYMORE
+
+    if image_counter == 1:
+        print("   ⚠️ No valid compounds found on this page")
+
+    page_counter += 1
+
+print("\n🎉 FINAL UNLIMITED CHEMICAL IMAGE EXTRACTION COMPLETE")
+print(f"📂 Output folder: {output_folder}")
