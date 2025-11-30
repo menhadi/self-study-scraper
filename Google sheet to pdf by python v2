@@ -501,39 +501,61 @@ class PDFGenerator:
                         
                         # If there are images, create a table for text + images
                         if opt_data['images']:
-                            # For multiple images, stack them vertically
+                            # For multiple images, stack them vertically with PROPER LEFT INDENT
                             if len(opt_data['images']) > 1:
                                 images_table_data = []
                                 for img in opt_data['images']:
-                                    images_table_data.append([img])
-                                images_table = Table(images_table_data, colWidths=[doc.width * 0.4])
+                                    # ✅ FIXED: Each image gets proper left indent
+                                    img_row_table = Table([["", img]], colWidths=[QUESTION_LEFT_INDENT, doc.width - QUESTION_LEFT_INDENT])
+                                    img_row_table.setStyle(TableStyle([
+                                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                                    ]))
+                                    images_table_data.append([img_row_table])
+                                
+                                images_table = Table(images_table_data, colWidths=[doc.width])
                                 images_table.setStyle(TableStyle([
                                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                     ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                     ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
                                 ]))
+                                
                                 # Create table with proper indentation for option text and images
-                                option_row_table = Table([["", opt_paragraph, images_table]], 
-                                                       colWidths=[QUESTION_LEFT_INDENT, doc.width * 0.5, doc.width * 0.4 - QUESTION_LEFT_INDENT])
-                                option_row_table.setStyle(TableStyle([
-                                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
-                                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-                                ]))
-                                data.append([option_row_table])
+                                if opt_paragraph:
+                                    text_table = Table([["", opt_paragraph]], colWidths=[QUESTION_LEFT_INDENT, doc.width - QUESTION_LEFT_INDENT])
+                                    text_table.setStyle(TableStyle([
+                                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                                    ]))
+                                    data.append([text_table])
+                                
+                                data.append([images_table])
                             else:
                                 # Single image - create table with proper indentation
-                                option_row_table = Table([["", opt_paragraph, opt_data['images'][0]]], 
-                                                       colWidths=[QUESTION_LEFT_INDENT, doc.width * 0.5, doc.width * 0.4 - QUESTION_LEFT_INDENT])
-                                option_row_table.setStyle(TableStyle([
+                                if opt_paragraph:
+                                    text_table = Table([["", opt_paragraph]], colWidths=[QUESTION_LEFT_INDENT, doc.width - QUESTION_LEFT_INDENT])
+                                    text_table.setStyle(TableStyle([
+                                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                                    ]))
+                                    data.append([text_table])
+                                
+                                # ✅ FIXED: Single image with proper left indent
+                                img_table = Table([["", opt_data['images'][0]]], colWidths=[QUESTION_LEFT_INDENT, doc.width - QUESTION_LEFT_INDENT])
+                                img_table.setStyle(TableStyle([
                                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                     ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                     ('RIGHTPADDING', (0, 0), (-1, -1), 0),
                                     ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
                                 ]))
-                                data.append([option_row_table])
+                                data.append([img_table])
                         else:
                             # Text-only option - create table with proper indentation
                             option_row_table = Table([["", opt_paragraph]], 
@@ -547,15 +569,16 @@ class PDFGenerator:
                             data.append([option_row_table])
                     
                     # Create options table
-                    options_table = Table(data, colWidths=[doc.width])
-                    options_table.setStyle(TableStyle([
-                        ('VALIGN', (0,0), (-1,-1), 'TOP'),
-                        ('LEFTPADDING', (0,0), (-1,-1), 0),
-                        ('RIGHTPADDING', (0,0), (-1,-1), 0),
-                        ('TOPPADDING', (0,0), (-1,-1), 2),
-                        ('BOTTOMPADDING', (0,0), (-1,-1), 2),
-                    ]))
-                    story.append(options_table)
+                    if data:
+                        options_table = Table(data, colWidths=[doc.width])
+                        options_table.setStyle(TableStyle([
+                            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                            ('LEFTPADDING', (0,0), (-1,-1), 0),
+                            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+                            ('TOPPADDING', (0,0), (-1,-1), 2),
+                            ('BOTTOMPADDING', (0,0), (-1,-1), 2),
+                        ]))
+                        story.append(options_table)
                     
                 else:
                     # Two column layout for text-only options with proper indentation
@@ -847,39 +870,61 @@ class PDFGenerator:
                         
                         # If there are images, create a table for text + images
                         if opt_data['images']:
-                            # For multiple images, stack them vertically
+                            # For multiple images, stack them vertically with PROPER LEFT INDENT
                             if len(opt_data['images']) > 1:
                                 images_table_data = []
                                 for img in opt_data['images']:
-                                    images_table_data.append([img])
-                                images_table = Table(images_table_data, colWidths=[doc.width * 0.4])
+                                    # ✅ FIXED: Each image gets proper left indent
+                                    img_row_table = Table([["", img]], colWidths=[QUESTION_LEFT_INDENT, doc.width - QUESTION_LEFT_INDENT])
+                                    img_row_table.setStyle(TableStyle([
+                                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                                    ]))
+                                    images_table_data.append([img_row_table])
+                                
+                                images_table = Table(images_table_data, colWidths=[doc.width])
                                 images_table.setStyle(TableStyle([
                                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                     ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                     ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
                                 ]))
+                                
                                 # Create table with proper indentation for option text and images
-                                option_row_table = Table([["", opt_paragraph, images_table]], 
-                                                       colWidths=[QUESTION_LEFT_INDENT, doc.width * 0.5, doc.width * 0.4 - QUESTION_LEFT_INDENT])
-                                option_row_table.setStyle(TableStyle([
-                                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
-                                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
-                                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
-                                ]))
-                                data.append([option_row_table])
+                                if opt_paragraph:
+                                    text_table = Table([["", opt_paragraph]], colWidths=[QUESTION_LEFT_INDENT, doc.width - QUESTION_LEFT_INDENT])
+                                    text_table.setStyle(TableStyle([
+                                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                                    ]))
+                                    data.append([text_table])
+                                
+                                data.append([images_table])
                             else:
                                 # Single image - create table with proper indentation
-                                option_row_table = Table([["", opt_paragraph, opt_data['images'][0]]], 
-                                                       colWidths=[QUESTION_LEFT_INDENT, doc.width * 0.5, doc.width * 0.4 - QUESTION_LEFT_INDENT])
-                                option_row_table.setStyle(TableStyle([
+                                if opt_paragraph:
+                                    text_table = Table([["", opt_paragraph]], colWidths=[QUESTION_LEFT_INDENT, doc.width - QUESTION_LEFT_INDENT])
+                                    text_table.setStyle(TableStyle([
+                                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                                    ]))
+                                    data.append([text_table])
+                                
+                                # ✅ FIXED: Single image with proper left indent
+                                img_table = Table([["", opt_data['images'][0]]], colWidths=[QUESTION_LEFT_INDENT, doc.width - QUESTION_LEFT_INDENT])
+                                img_table.setStyle(TableStyle([
                                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                     ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                     ('RIGHTPADDING', (0, 0), (-1, -1), 0),
                                     ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
                                 ]))
-                                data.append([option_row_table])
+                                data.append([img_table])
                         else:
                             # Text-only option - create table with proper indentation
                             option_row_table = Table([["", opt_paragraph]], 
@@ -893,15 +938,16 @@ class PDFGenerator:
                             data.append([option_row_table])
                     
                     # Create options table
-                    options_table = Table(data, colWidths=[doc.width])
-                    options_table.setStyle(TableStyle([
-                        ('VALIGN', (0,0), (-1,-1), 'TOP'),
-                        ('LEFTPADDING', (0,0), (-1,-1), 0),
-                        ('RIGHTPADDING', (0,0), (-1,-1), 0),
-                        ('TOPPADDING', (0,0), (-1,-1), 2),
-                        ('BOTTOMPADDING', (0,0), (-1,-1), 2),
-                    ]))
-                    story.append(options_table)
+                    if data:
+                        options_table = Table(data, colWidths=[doc.width])
+                        options_table.setStyle(TableStyle([
+                            ('VALIGN', (0,0), (-1,-1), 'TOP'),
+                            ('LEFTPADDING', (0,0), (-1,-1), 0),
+                            ('RIGHTPADDING', (0,0), (-1,-1), 0),
+                            ('TOPPADDING', (0,0), (-1,-1), 2),
+                            ('BOTTOMPADDING', (0,0), (-1,-1), 2),
+                        ]))
+                        story.append(options_table)
                     
                 else:
                     # Two column layout for text-only options with proper indentation
