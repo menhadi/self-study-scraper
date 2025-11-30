@@ -495,20 +495,23 @@ class PDFGenerator:
                     # Single column layout - better for images
                     data = []
                     for opt_data in option_data:
-                        # Create option text with proper indentation
-                        opt_text = f"({opt_data['letter']}) {opt_data['text']}" if opt_data['text'].strip() else ""
+                        # ✅ FIXED: Always show option letter (A), (B), etc.
+                        opt_text = f"({opt_data['letter']}) {opt_data['text']}" if opt_data['text'].strip() else f"({opt_data['letter']})"
                         opt_paragraph = Paragraph(opt_text, option_style) if opt_text else ""
                         
                         # If there are images, create a table for text + images
                         if opt_data['images']:
                             # For multiple images, stack them vertically
                             if len(opt_data['images']) > 1:
-                                images_table_data = [[img] for img in opt_data['images']]
+                                images_table_data = []
+                                for img in opt_data['images']:
+                                    images_table_data.append([img])
                                 images_table = Table(images_table_data, colWidths=[doc.width * 0.4])
                                 images_table.setStyle(TableStyle([
                                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                     ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                     ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
                                 ]))
                                 # Create table with proper indentation for option text and images
                                 option_row_table = Table([["", opt_paragraph, images_table]], 
@@ -517,6 +520,7 @@ class PDFGenerator:
                                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                     ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                     ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
                                 ]))
                                 data.append([option_row_table])
                             else:
@@ -527,6 +531,7 @@ class PDFGenerator:
                                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                     ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                     ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
                                 ]))
                                 data.append([option_row_table])
                         else:
@@ -537,6 +542,7 @@ class PDFGenerator:
                                 ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                 ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                 ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
                             ]))
                             data.append([option_row_table])
                     
@@ -560,6 +566,7 @@ class PDFGenerator:
                             option_index = row_num * 2 + col
                             if option_index < len(option_data):
                                 opt_data = option_data[option_index]
+                                # ✅ FIXED: Always show option letter
                                 opt_text = f"({opt_data['letter']}) {opt_data['text']}"
                                 opt_paragraph = Paragraph(opt_text, option_style)
                                 # Create table for proper indentation
@@ -569,6 +576,7 @@ class PDFGenerator:
                                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                     ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                     ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
                                 ]))
                                 row.append(option_cell_table)
                                 row.append("")  # Empty cell for spacing
@@ -833,20 +841,23 @@ class PDFGenerator:
                     # Single column layout for better image display with proper indentation
                     data = []
                     for opt_data in option_data:
-                        # Create option text with proper indentation
-                        opt_text = f"({opt_data['letter']}) {opt_data['text']}" if opt_data['text'].strip() else ""
+                        # ✅ FIXED: Always show option letter (A), (B), etc.
+                        opt_text = f"({opt_data['letter']}) {opt_data['text']}" if opt_data['text'].strip() else f"({opt_data['letter']})"
                         opt_paragraph = Paragraph(opt_text, option_style) if opt_text else ""
                         
                         # If there are images, create a table for text + images
                         if opt_data['images']:
                             # For multiple images, stack them vertically
                             if len(opt_data['images']) > 1:
-                                images_table_data = [[img] for img in opt_data['images']]
+                                images_table_data = []
+                                for img in opt_data['images']:
+                                    images_table_data.append([img])
                                 images_table = Table(images_table_data, colWidths=[doc.width * 0.4])
                                 images_table.setStyle(TableStyle([
                                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                     ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                     ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
                                 ]))
                                 # Create table with proper indentation for option text and images
                                 option_row_table = Table([["", opt_paragraph, images_table]], 
@@ -855,6 +866,7 @@ class PDFGenerator:
                                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                     ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                     ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
                                 ]))
                                 data.append([option_row_table])
                             else:
@@ -865,6 +877,7 @@ class PDFGenerator:
                                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                     ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                     ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
                                 ]))
                                 data.append([option_row_table])
                         else:
@@ -875,6 +888,7 @@ class PDFGenerator:
                                 ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                 ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                 ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
                             ]))
                             data.append([option_row_table])
                     
@@ -898,6 +912,7 @@ class PDFGenerator:
                             option_index = row_num * 2 + col
                             if option_index < len(option_data):
                                 opt_data = option_data[option_index]
+                                # ✅ FIXED: Always show option letter
                                 opt_text = f"({opt_data['letter']}) {opt_data['text']}"
                                 opt_paragraph = Paragraph(opt_text, option_style)
                                 # Create table for proper indentation
@@ -907,6 +922,7 @@ class PDFGenerator:
                                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                     ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                     ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
                                 ]))
                                 row.append(option_cell_table)
                                 row.append("")  # Empty cell for spacing
