@@ -14,6 +14,7 @@ import pandas as pd
 import re
 import requests
 from io import BytesIO
+import urllib.parse
 
 # Set up logging
 logging.basicConfig(
@@ -107,39 +108,94 @@ class PDFGenerator:
         os.makedirs(path, exist_ok=True)
         return path
 
+    def extract_urls_from_text(self, text):
+        """Extract ALL URLs from text, including those in separate square brackets [url1] [url2]"""
+        if not text:
+            return []
+        
+        text = str(text).strip()
+        urls = []
+        
+        # Pattern to match URLs in separate square brackets: [url1] [url2] [url3]
+        bracket_pattern = r'\[(https?://[^\]]+)\]'
+        bracket_urls = re.findall(bracket_pattern, text)
+        urls.extend(bracket_urls)
+        
+        # Also look for standalone URLs outside brackets
+        url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
+        standalone_urls = re.findall(url_pattern, text)
+        for url in standalone_urls:
+            if not url.startswith('http'):
+                url = 'https://' + url
+            # Only add if not already in bracket_urls (avoid duplicates)
+            if url not in urls:
+                urls.append(url)
+        
+        return urls
+
     def clean_text(self, text):
-        """Simple text cleaning - remove HTML tags only"""
+        """Clean text by removing HTML tags AND URLs (including those in separate square brackets)"""
         if not text:
             return text
-        return re.sub(r'<[^>]+>', '', str(text)).strip()
+        
+        text = str(text)
+        
+        # Remove HTML tags
+        text = re.sub(r'<[^>]+>', '', text)
+        
+        # Remove URLs in separate square brackets [url1] [url2]
+        text = re.sub(r'\[https?://[^\]]+\]', '', text)
+        
+        # Remove standalone URLs
+        text = re.sub(r'https?://[^\s<>"]+|www\.[^\s<>"]+', '', text)
+        
+        # Clean up extra spaces that might be left after removal
+        text = re.sub(r'\s+', ' ', text)
+        
+        return text.strip()
 
-    # ✅ IMPROVED IMAGE PARSING WITH BETTER LAYOUT
-    def fetch_image_from_url(self, url, max_width=1.6 * inch):
-        try:
-            if not url:
-                return None
+    # ✅ IMPROVED IMAGE PARSING WITH MULTIPLE URL SUPPORT
+    def fetch_images_from_urls(self, urls, max_width=1.6 * inch):
+        """Fetch multiple images from URLs and return list of Image objects"""
+        images = []
+        for url in urls:
+            try:
+                if not url:
+                    continue
 
-            url = str(url).strip()
-            if not url.lower().startswith("http"):
-                return None
+                url = str(url).strip()
+                if not url.lower().startswith("http"):
+                    continue
 
-            resp = requests.get(url, timeout=10)
-            if resp.status_code != 200:
-                return None
+                resp = requests.get(url, timeout=15)
+                if resp.status_code != 200:
+                    continue
 
-            img_data = BytesIO(resp.content)
-            img = Image(img_data)
+                img_data = BytesIO(resp.content)
+                img = Image(img_data)
 
-            # Scale image proportionally
-            scale = max_width / img.drawWidth
-            img.drawWidth = max_width
-            img.drawHeight *= scale
+                # Scale image proportionally to fit within max_width
+                if img.drawWidth > max_width:
+                    scale = max_width / img.drawWidth
+                    img.drawWidth = max_width
+                    img.drawHeight *= scale
 
-            # ✅ ZERO PADDING AND PROPER ALIGNMENT
-            img.hAlign = 'LEFT'
-            return img
-        except:
-            return None
+                # Maintain aspect ratio for very tall images
+                max_height = 2.0 * inch
+                if img.drawHeight > max_height:
+                    scale = max_height / img.drawHeight
+                    img.drawHeight = max_height
+                    img.drawWidth *= scale
+
+                # ✅ ZERO PADDING AND PROPER ALIGNMENT
+                img.hAlign = 'LEFT'
+                images.append(img)
+                
+            except Exception as e:
+                logging.debug(f"Failed to fetch image from {url}: {e}")
+                continue
+        
+        return images
 
     def add_header_footer(self, canvas, doc, paper_name=None):
         """Add header and footer to all pages - 80% width (no margins)"""
@@ -311,7 +367,7 @@ class PDFGenerator:
                 if not actual_question_no or str(actual_question_no).strip() == '':
                     actual_question_no = i
                 
-                # Clean text (remove HTML tags only)
+                # Clean text (remove HTML tags AND URLs)
                 question_text = self.clean_text(question['question_text'])
                 
                 # ✅ ADD INSTRUCTIONS BEFORE QUESTION TEXT (IF PRESENT)
@@ -343,65 +399,141 @@ class PDFGenerator:
                 story.append(question_table)
                 story.append(Spacer(1, 8))
                 
-                # ✅ ADD QUESTION IMAGE IF AVAILABLE WITH PROPER ALIGNMENT
-                img_q = self.fetch_image_from_url(question.get('question_image_url'))
-                if img_q:
-                    # Create a table to align image with question text (same left margin)
-                    img_table = Table([[img_q]], colWidths=[doc.width])
+                # ✅ IMPROVED QUESTION IMAGE HANDLING WITH MULTIPLE URL SUPPORT
+                question_image_urls = []
+                
+                # Get URLs from dedicated image URL column
+                if question.get('question_image_url'):
+                    dedicated_urls = self.extract_urls_from_text(question['question_image_url'])
+                    question_image_urls.extend(dedicated_urls)
+                
+                # Also extract URLs from question text itself
+                text_urls = self.extract_urls_from_text(question['question_text'])
+                question_image_urls.extend(text_urls)
+                
+                # Remove duplicates while preserving order
+                seen = set()
+                unique_urls = []
+                for url in question_image_urls:
+                    if url not in seen:
+                        seen.add(url)
+                        unique_urls.append(url)
+                
+                # Fetch all images from unique URLs
+                question_images = self.fetch_images_from_urls(unique_urls)
+                
+                # Add all question images in separate lines
+                for img in question_images:
+                    img_table = Table([[img]], colWidths=[doc.width])
                     img_table.setStyle(TableStyle([
+                        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                         ('LEFTPADDING', (0, 0), (-1, -1), 0),
                         ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
                     ]))
                     story.append(img_table)
                     story.append(Spacer(1, 6))
                 
-                # Clean text for options
-                raw_a = self.clean_text(question['option_a'])
-                raw_b = self.clean_text(question['option_b'])
-                raw_c = self.clean_text(question['option_c'])
-                raw_d = self.clean_text(question['option_d'])
+                # ✅ IMPROVED OPTION IMAGE HANDLING WITH MULTIPLE URL SUPPORT
+                # Process each option to get images and clean text
+                option_data = []
+                for option_key in ['option_a', 'option_b', 'option_c', 'option_d']:
+                    raw_text = question[option_key]
+                    clean_text = self.clean_text(raw_text)
+                    
+                    # Get image URLs from dedicated image URL column
+                    image_urls = []
+                    dedicated_url_col = f"{option_key}_image_url"
+                    if question.get(dedicated_url_col):
+                        dedicated_urls = self.extract_urls_from_text(question[dedicated_url_col])
+                        image_urls.extend(dedicated_urls)
+                    
+                    # Also extract URLs from option text itself
+                    text_urls = self.extract_urls_from_text(raw_text)
+                    image_urls.extend(text_urls)
+                    
+                    # Remove duplicates
+                    seen = set()
+                    unique_urls = []
+                    for url in image_urls:
+                        if url not in seen:
+                            seen.add(url)
+                            unique_urls.append(url)
+                    
+                    # Fetch images
+                    images = self.fetch_images_from_urls(unique_urls)
+                    
+                    option_data.append({
+                        'letter': option_key[-1].upper(),  # A, B, C, D
+                        'text': clean_text,
+                        'images': images
+                    })
                 
-                # ✅ IMPROVED IMAGE LOGIC WITH BETTER LAYOUT
-                img_a = self.fetch_image_from_url(question.get('option_a_image_url')) or self.fetch_image_from_url(raw_a)
-                img_b = self.fetch_image_from_url(question.get('option_b_image_url')) or self.fetch_image_from_url(raw_b)
-                img_c = self.fetch_image_from_url(question.get('option_c_image_url')) or self.fetch_image_from_url(raw_c)
-                img_d = self.fetch_image_from_url(question.get('option_d_image_url')) or self.fetch_image_from_url(raw_d)
+                opt_a_data = option_data[0]
+                opt_b_data = option_data[1]
+                opt_c_data = option_data[2]
+                opt_d_data = option_data[3]
 
-                opt_a = "" if img_a else raw_a
-                opt_b = "" if img_b else raw_b
-                opt_c = "" if img_c else raw_c
-                opt_d = "" if img_d else raw_d
-
-                use_single = self.should_use_single_column(opt_a, opt_b, opt_c, opt_d, doc.width)
+                # ✅ IMPROVED LAYOUT: Check if we have any images to determine best layout
+                has_images = any([
+                    len(opt_a_data['images']) > 0,
+                    len(opt_b_data['images']) > 0, 
+                    len(opt_c_data['images']) > 0,
+                    len(opt_d_data['images']) > 0
+                ])
+                
+                use_single = has_images or self.should_use_single_column(
+                    opt_a_data['text'], opt_b_data['text'], opt_c_data['text'], opt_d_data['text'], doc.width
+                )
 
                 if use_single:
-                    # Single column layout with images integrated
-                    data = [
-                        [Paragraph(f"(A) {opt_a}", option_style), img_a or ""],
-                        [Paragraph(f"(B) {opt_b}", option_style), img_b or ""],
-                        [Paragraph(f"(C) {opt_c}", option_style), img_c or ""],
-                        [Paragraph(f"(D) {opt_d}", option_style), img_d or ""],
-                    ]
-                    widths = [doc.width * 0.7, doc.width * 0.3]
+                    # Single column layout - better for images
+                    data = []
+                    for opt_data in option_data:
+                        opt_paragraph = Paragraph(f"({opt_data['letter']}) {opt_data['text']}", option_style) if opt_data['text'].strip() else ""
+                        
+                        # If there are images, create a table for text + images
+                        if opt_data['images']:
+                            # For multiple images, stack them vertically
+                            if len(opt_data['images']) > 1:
+                                images_table_data = [[img] for img in opt_data['images']]
+                                images_table = Table(images_table_data, colWidths=[doc.width * 0.4])
+                                images_table.setStyle(TableStyle([
+                                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                ]))
+                                data.append([opt_paragraph, images_table])
+                            else:
+                                data.append([opt_paragraph, opt_data['images'][0]])
+                        else:
+                            data.append([opt_paragraph, ""])
+                    
+                    # Use flexible column widths based on content
+                    text_col_width = doc.width * 0.6 if has_images else doc.width * 0.8
+                    img_col_width = doc.width * 0.4 if has_images else doc.width * 0.2
+                    widths = [text_col_width, img_col_width]
+                    
                 else:
-                    # Two column layout with images integrated
+                    # Two column layout for text-only options
                     data = [
-                        [Paragraph(f"(A) {opt_a}", option_style), img_a or "",
-                         Paragraph(f"(B) {opt_b}", option_style), img_b or ""],
-                        [Paragraph(f"(C) {opt_c}", option_style), img_c or "",
-                         Paragraph(f"(D) {opt_d}", option_style), img_d or ""],
+                        [Paragraph(f"(A) {opt_a_data['text']}", option_style), "",
+                         Paragraph(f"(B) {opt_b_data['text']}", option_style), ""],
+                        [Paragraph(f"(C) {opt_c_data['text']}", option_style), "",
+                         Paragraph(f"(D) {opt_d_data['text']}", option_style), ""],
                     ]
-                    widths = [doc.width * 0.35, doc.width * 0.15,
-                              doc.width * 0.35, doc.width * 0.15]
+                    widths = [doc.width * 0.45, doc.width * 0.05,
+                              doc.width * 0.45, doc.width * 0.05]
 
                 tbl = Table(data, colWidths=widths)
                 tbl.setStyle(TableStyle([
                     ('VALIGN', (0,0), (-1,-1), 'TOP'),
-                    ('LEFTPADDING', (0,0), (-1,-1), 0),  # ✅ ZERO PADDING
-                    ('RIGHTPADDING', (0,0), (-1,-1), 0), # ✅ ZERO PADDING
-                    ('TOPPADDING', (0,0), (-1,-1), 0),   # ✅ ZERO PADDING
-                    ('BOTTOMPADDING', (0,0), (-1,-1), 0),# ✅ ZERO PADDING
+                    ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+                    ('LEFTPADDING', (0,0), (-1,-1), 0),
+                    ('RIGHTPADDING', (0,0), (-1,-1), 0),
+                    ('TOPPADDING', (0,0), (-1,-1), 2),
+                    ('BOTTOMPADDING', (0,0), (-1,-1), 2),
                 ]))
 
                 story.append(tbl)
@@ -510,7 +642,7 @@ class PDFGenerator:
                 parent=styles['Normal'],
                 fontName=UNICODE_FONT,
                 fontSize=12,
-                leftIndent=0,  # ✅ ZERO INDENT FOR BETTER ALIGNMENT
+                leftIndent=0,
                 spaceAfter=3,
                 leading=14,
                 textColor=colors.black
@@ -536,11 +668,8 @@ class PDFGenerator:
                 if question.get('instructions'):
                     instr_text = self.clean_text(question['instructions'])
                     if instr_text and instr_text.strip():
-                        # Create instruction with "Instruction:" in bold and text in normal
                         instruction_label = Paragraph("<b>Instruction:</b>", instruction_label_style)
                         instruction_content = Paragraph(f"{instr_text}", instruction_text_style)
-                        
-                        # Add instruction to story
                         story.append(instruction_label)
                         story.append(instruction_content)
                         story.append(Spacer(1, 8))
@@ -560,63 +689,138 @@ class PDFGenerator:
                 story.append(question_table)
                 story.append(Spacer(1, 8))
                 
-                # ✅ ADD QUESTION IMAGE WITH PROPER ALIGNMENT
-                img_q = self.fetch_image_from_url(question.get('question_image_url'))
-                if img_q:
-                    # Create a table to align image with question text (same left margin)
-                    img_table = Table([[img_q]], colWidths=[doc.width])
+                # ✅ IMPROVED QUESTION IMAGE HANDLING WITH MULTIPLE URL SUPPORT
+                question_image_urls = []
+                
+                # Get URLs from dedicated image URL column
+                if question.get('question_image_url'):
+                    dedicated_urls = self.extract_urls_from_text(question['question_image_url'])
+                    question_image_urls.extend(dedicated_urls)
+                
+                # Also extract URLs from question text itself
+                text_urls = self.extract_urls_from_text(question['question_text'])
+                question_image_urls.extend(text_urls)
+                
+                # Remove duplicates while preserving order
+                seen = set()
+                unique_urls = []
+                for url in question_image_urls:
+                    if url not in seen:
+                        seen.add(url)
+                        unique_urls.append(url)
+                
+                # Fetch all images from unique URLs
+                question_images = self.fetch_images_from_urls(unique_urls)
+                
+                # Add all question images in separate lines
+                for img in question_images:
+                    img_table = Table([[img]], colWidths=[doc.width])
                     img_table.setStyle(TableStyle([
+                        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                         ('LEFTPADDING', (0, 0), (-1, -1), 0),
                         ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                     ]))
                     story.append(img_table)
                     story.append(Spacer(1, 6))
                 
-                # Clean text for options
-                raw_a = self.clean_text(question['option_a'])
-                raw_b = self.clean_text(question['option_b'])
-                raw_c = self.clean_text(question['option_c'])
-                raw_d = self.clean_text(question['option_d'])
+                # ✅ IMPROVED OPTION IMAGE HANDLING WITH MULTIPLE URL SUPPORT
+                # Process each option to get images and clean text
+                option_data = []
+                for option_key in ['option_a', 'option_b', 'option_c', 'option_d']:
+                    raw_text = question[option_key]
+                    clean_text = self.clean_text(raw_text)
+                    
+                    # Get image URLs from dedicated image URL column
+                    image_urls = []
+                    dedicated_url_col = f"{option_key}_image_url"
+                    if question.get(dedicated_url_col):
+                        dedicated_urls = self.extract_urls_from_text(question[dedicated_url_col])
+                        image_urls.extend(dedicated_urls)
+                    
+                    # Also extract URLs from option text itself
+                    text_urls = self.extract_urls_from_text(raw_text)
+                    image_urls.extend(text_urls)
+                    
+                    # Remove duplicates
+                    seen = set()
+                    unique_urls = []
+                    for url in image_urls:
+                        if url not in seen:
+                            seen.add(url)
+                            unique_urls.append(url)
+                    
+                    # Fetch images
+                    images = self.fetch_images_from_urls(unique_urls)
+                    
+                    option_data.append({
+                        'letter': option_key[-1].upper(),  # A, B, C, D
+                        'text': clean_text,
+                        'images': images
+                    })
                 
-                # ✅ IMPROVED IMAGE LOGIC WITH BETTER LAYOUT
-                img_a = self.fetch_image_from_url(question.get('option_a_image_url')) or self.fetch_image_from_url(raw_a)
-                img_b = self.fetch_image_from_url(question.get('option_b_image_url')) or self.fetch_image_from_url(raw_b)
-                img_c = self.fetch_image_from_url(question.get('option_c_image_url')) or self.fetch_image_from_url(raw_c)
-                img_d = self.fetch_image_from_url(question.get('option_d_image_url')) or self.fetch_image_from_url(raw_d)
+                opt_a_data = option_data[0]
+                opt_b_data = option_data[1]
+                opt_c_data = option_data[2]
+                opt_d_data = option_data[3]
 
-                opt_a = "" if img_a else raw_a
-                opt_b = "" if img_b else raw_b
-                opt_c = "" if img_c else raw_c
-                opt_d = "" if img_d else raw_d
-
-                use_single = self.should_use_single_column(opt_a, opt_b, opt_c, opt_d, doc.width)
+                has_images = any([
+                    len(opt_a_data['images']) > 0,
+                    len(opt_b_data['images']) > 0, 
+                    len(opt_c_data['images']) > 0,
+                    len(opt_d_data['images']) > 0
+                ])
+                
+                use_single = has_images or self.should_use_single_column(
+                    opt_a_data['text'], opt_b_data['text'], opt_c_data['text'], opt_d_data['text'], doc.width
+                )
 
                 if use_single:
-                    data = [
-                        [Paragraph(f"(A) {opt_a}", option_style), img_a or ""],
-                        [Paragraph(f"(B) {opt_b}", option_style), img_b or ""],
-                        [Paragraph(f"(C) {opt_c}", option_style), img_c or ""],
-                        [Paragraph(f"(D) {opt_d}", option_style), img_d or ""],
-                    ]
-                    widths = [doc.width * 0.7, doc.width * 0.3]
+                    # Single column layout for better image display
+                    data = []
+                    for opt_data in option_data:
+                        opt_paragraph = Paragraph(f"({opt_data['letter']}) {opt_data['text']}", option_style) if opt_data['text'].strip() else ""
+                        
+                        # If there are images, create a table for text + images
+                        if opt_data['images']:
+                            # For multiple images, stack them vertically
+                            if len(opt_data['images']) > 1:
+                                images_table_data = [[img] for img in opt_data['images']]
+                                images_table = Table(images_table_data, colWidths=[doc.width * 0.4])
+                                images_table.setStyle(TableStyle([
+                                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                ]))
+                                data.append([opt_paragraph, images_table])
+                            else:
+                                data.append([opt_paragraph, opt_data['images'][0]])
+                        else:
+                            data.append([opt_paragraph, ""])
+                    
+                    text_col_width = doc.width * 0.6 if has_images else doc.width * 0.8
+                    img_col_width = doc.width * 0.4 if has_images else doc.width * 0.2
+                    widths = [text_col_width, img_col_width]
+                    
                 else:
+                    # Two column layout for text-only
                     data = [
-                        [Paragraph(f"(A) {opt_a}", option_style), img_a or "",
-                         Paragraph(f"(B) {opt_b}", option_style), img_b or ""],
-                        [Paragraph(f"(C) {opt_c}", option_style), img_c or "",
-                         Paragraph(f"(D) {opt_d}", option_style), img_d or ""],
+                        [Paragraph(f"(A) {opt_a_data['text']}", option_style), "",
+                         Paragraph(f"(B) {opt_b_data['text']}", option_style), ""],
+                        [Paragraph(f"(C) {opt_c_data['text']}", option_style), "",
+                         Paragraph(f"(D) {opt_d_data['text']}", option_style), ""],
                     ]
-                    widths = [doc.width * 0.35, doc.width * 0.15,
-                              doc.width * 0.35, doc.width * 0.15]
+                    widths = [doc.width * 0.45, doc.width * 0.05,
+                              doc.width * 0.45, doc.width * 0.05]
 
                 tbl = Table(data, colWidths=widths)
                 tbl.setStyle(TableStyle([
                     ('VALIGN', (0,0), (-1,-1), 'TOP'),
-                    ('LEFTPADDING', (0,0), (-1,-1), 0),  # ✅ ZERO PADDING
-                    ('RIGHTPADDING', (0,0), (-1,-1), 0), # ✅ ZERO PADDING
-                    ('TOPPADDING', (0,0), (-1,-1), 0),   # ✅ ZERO PADDING
-                    ('BOTTOMPADDING', (0,0), (-1,-1), 0),# ✅ ZERO PADDING
+                    ('ALIGN', (0,0), (-1,-1), 'LEFT'),
+                    ('LEFTPADDING', (0,0), (-1,-1), 0),
+                    ('RIGHTPADDING', (0,0), (-1,-1), 0),
+                    ('TOPPADDING', (0,0), (-1,-1), 2),
+                    ('BOTTOMPADDING', (0,0), (-1,-1), 2),
                 ]))
 
                 story.append(tbl)
