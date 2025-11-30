@@ -6,7 +6,7 @@ import hashlib
 # ======================================
 # PATHS
 # ======================================
-input_folder = r"C:\Users\menha\Downloads\test\pages"
+input_folder = r"C:\Users\menha\Downloads\test"
 output_folder = r"C:\Users\menha\Downloads\test\extracted_compounds"
 os.makedirs(output_folder, exist_ok=True)
 
