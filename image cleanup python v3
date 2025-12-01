@@ -6,8 +6,8 @@ import numpy as np
 from PIL import Image
 
 # ================== CONFIG ==================
-BASE_INPUT = r"C:\Users\menha\Downloads\test\extracted_options_final"
-OUT_IMAGE_FOLDER = r"C:\Users\menha\Downloads\test\extracted_options_final_DIGITAL"
+BASE_INPUT = r"C:\Users\menha\Downloads\test\extracted_compounds"
+OUT_IMAGE_FOLDER = r"C:\Users\menha\Downloads\test\extracted_compounds1"
 CSV_LOG = r"C:\Users\menha\Downloads\test\image_enhancement_report.csv"
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
@@ -17,7 +17,6 @@ IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tif", ".tiff"}
 # ---------- STRICT HORIZONTAL DESKEW (ZERO TOLERANCE) ----------
 def deskew_strict_horizontal(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-
     edges = cv2.Canny(gray, 50, 150)
 
     angles = []
@@ -38,7 +37,6 @@ def deskew_strict_horizontal(image):
 
     best_angle = max(angles, key=lambda x: x[0])[1]
 
-    # ✅ FORCE rotation even if very small
     (h, w) = image.shape[:2]
     M = cv2.getRotationMatrix2D((w // 2, h // 2), best_angle, 1.0)
 
@@ -84,6 +82,7 @@ def digital_clean(image_path, output_path):
         result = cv2.addWeighted(result, 1.2, blur, -0.2, 0)
 
         # ✅ SAVE TRUE DIGITAL OUTPUT
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         pil_img = Image.fromarray(result)
         pil_img.save(output_path, dpi=(300, 300), quality=95, subsampling=0)
 
@@ -96,6 +95,7 @@ def digital_clean(image_path, output_path):
 # ---------- SAFE FALLBACK ----------
 def fallback_copy(image_path, output_path):
     try:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
         img = Image.open(image_path)
         img.save(output_path, dpi=(300, 300))
         return True, "Copied original as fallback"
@@ -126,9 +126,9 @@ def process_all_images():
         success_count = 0
 
         for i, img_path in enumerate(images, 1):
+            # ✅ PRESERVE FOLDER & SUBFOLDER HIERARCHY
             rel = os.path.relpath(img_path, BASE_INPUT)
             out_path = os.path.join(OUT_IMAGE_FOLDER, rel)
-            os.makedirs(os.path.dirname(out_path), exist_ok=True)
 
             print(f"({i}/{len(images)}) Processing:", os.path.basename(img_path))
 
