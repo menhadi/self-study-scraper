@@ -1,0 +1,998 @@
+import requests
+import base64
+import json
+import re
+import csv
+import os
+from PIL import Image
+from io import BytesIO
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+from typing import Dict, List, Tuple
+import time
+import concurrent.futures
+
+# ==============================
+#  MODEL SETTINGS
+# ==============================
+EXTRACTION_MODEL = "gpt-4o"        # OCR extraction
+DETECTION_MODEL_CHEAP = "gpt-4o-mini"    # Cheap detection model first
+DETECTION_MODEL_ACCURATE = "gpt-4o"      # Accurate detection model second
+
+EXTRACTION_TEMP = 0.1
+DETECTION_TEMP = 0.0
+
+# Progress tracking file
+PROGRESS_FILE = "processed_files_part1.csv"
+
+# Timely update settings
+UPDATE_BATCH_SIZE = 10  # Update sheet every 10 questions extracted
+
+# LESS AGGRESSIVE patterns for filename filtering
+SKIP_PATTERNS = ['cover', 'title_page', 'instruction_only', 'answer_key', 'solution_manual']
+
+
+# ========================================
+#  MultiQuestionExtractor
+# ========================================
+class MultiQuestionExtractor:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = "https://api.openai.com/v1/chat/completions"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        self.cheap_detection_count = 0
+        self.accurate_detection_count = 0
+
+    # --------------------------
+    # IMAGE OPTIMIZATION - OPTIMIZED FOR COST
+    # --------------------------
+    def optimize_image(self, image_url, target_width=600):
+        """Download + resize + convert → base64 JPEG."""
+        try:
+            response = requests.get(image_url, timeout=30)
+            img = Image.open(BytesIO(response.content))
+
+            width, height = img.size
+            if width > target_width:
+                ratio = target_width / float(width)
+                new_height = int(float(height) * ratio)
+                img = img.resize((target_width, new_height), Image.Resampling.LANCZOS)
+
+            if img.mode in ('RGBA', 'P'):
+                img = img.convert('RGB')
+
+            output = BytesIO()
+            img.save(output, format='JPEG', quality=85, optimize=True)
+            return base64.b64encode(output.getvalue()).decode('utf-8')
+
+        except Exception as e:
+            print(f"[Image optimization failed] {e}")
+            return None
+
+    # --------------------------
+    # AUTO-FILL IMAGE OPTIONS - FIXED VERSION
+    # --------------------------
+    def _fix_image_options(self, questions):
+        """Auto-detect and fill [IMAGE] placeholders for options with chemical structures"""
+        for q in questions:
+            # Check if options are empty or contain image indicators
+            options_to_check = ['option_a', 'option_b', 'option_c', 'option_d']
+            
+            for opt_key in options_to_check:
+                opt_value = q.get(opt_key, "").strip()
+                
+                # If option is empty or contains image-like patterns, use [IMAGE]
+                if not opt_value or self._looks_like_image_placeholder(opt_value):
+                    q[opt_key] = "[IMAGE]"
+                
+                # Convert ALL LaTeX to Unicode - NO EXCEPTIONS
+                else:
+                    q[opt_key] = self._convert_all_latex_to_unicode(opt_value)
+            
+            # Also process question text for LaTeX conversion - NO EXCEPTIONS
+            if 'text' in q:
+                q['text'] = self._convert_all_latex_to_unicode(q['text'])
+                
+        return questions
+
+    def _looks_like_image_placeholder(self, text):
+        """Check if text indicates it should be an image placeholder"""
+        image_indicators = [
+            'structure', 'diagram', 'figure', 'chart', 'graph',
+            'chemical structure', 'molecular structure', 'reaction scheme'
+        ]
+        text_lower = text.lower()
+        return any(indicator in text_lower for indicator in image_indicators)
+
+    def _convert_all_latex_to_unicode(self, text):
+        """Convert ALL LaTeX chemical notation to Unicode - COMPLETE CONVERSION"""
+        if not text:
+            return text
+            
+        # COMPREHENSIVE LaTeX to Unicode substitutions - NO LaTeX REMAINS
+        substitutions = {
+            # Subscripts
+            r'_{0}': '₀', r'_0': '₀', r'_{1}': '₁', r'_1': '₁', 
+            r'_{2}': '₂', r'_2': '₂', r'_{3}': '₃', r'_3': '₃', 
+            r'_{4}': '₄', r'_4': '₄', r'_{5}': '₅', r'_5': '₅', 
+            r'_{6}': '₆', r'_6': '₆', r'_{7}': '₇', r'_7': '₇', 
+            r'_{8}': '₈', r'_8': '₈', r'_{9}': '₉', r'_9': '₉', 
+            r'_{10}': '₁₀', r'_{11}': '₁₁', r'_{12}': '₁₂',
+            
+            # Superscripts
+            r'^{0}': '⁰', r'^0': '⁰', r'^{1}': '¹', r'^1': '¹',
+            r'^{2}': '²', r'^2': '²', r'^{3}': '³', r'^3': '³',
+            r'^{4}': '⁴', r'^4': '⁴', r'^{5}': '⁵', r'^5': '⁵',
+            r'^{6}': '⁶', r'^6': '⁶', r'^{7}': '⁷', r'^7': '⁷',
+            r'^{8}': '⁸', r'^8': '⁸', r'^{9}': '⁹', r'^9': '⁹',
+            r'^{+}': '⁺', r'^+': '⁺', r'^{-}': '⁻', r'^-': '⁻',
+            r'^{}': '', r'^{ }': '',
+            
+            # Greek letters
+            r'\alpha': 'α', r'\beta': 'β', r'\gamma': 'γ', r'\delta': 'δ',
+            r'\epsilon': 'ε', r'\zeta': 'ζ', r'\eta': 'η', r'\theta': 'θ',
+            r'\iota': 'ι', r'\kappa': 'κ', r'\lambda': 'λ', r'\mu': 'μ',
+            r'\nu': 'ν', r'\xi': 'ξ', r'\pi': 'π', r'\rho': 'ρ',
+            r'\sigma': 'σ', r'\tau': 'τ', r'\upsilon': 'υ', r'\phi': 'φ',
+            r'\chi': 'χ', r'\psi': 'ψ', r'\omega': 'ω',
+            r'\Alpha': 'Α', r'\Beta': 'Β', r'\Gamma': 'Γ', r'\Delta': 'Δ',
+            r'\Epsilon': 'Ε', r'\Zeta': 'Ζ', r'\Eta': 'Η', r'\Theta': 'Θ',
+            r'\Iota': 'Ι', r'\Kappa': 'Κ', r'\Lambda': 'Λ', r'\Mu': 'Μ',
+            r'\Nu': 'Ν', r'\Xi': 'Ξ', r'\Pi': 'Π', r'\Rho': 'Ρ',
+            r'\Sigma': 'Σ', r'\Tau': 'Τ', r'\Upsilon': 'Υ', r'\Phi': 'Φ',
+            r'\Chi': 'Χ', r'\Psi': 'Ψ', r'\Omega': 'Ω',
+            
+            # Chemical notation
+            r'\rightarrow': '→', r'\leftarrow': '←', r'\Rightarrow': '⇒', r'\Leftarrow': '⇐',
+            r'\leftrightarrow': '↔', r'\Leftrightarrow': '⇔', r'\longrightarrow': '⟶', 
+            r'\longleftarrow': '⟵', r'\longleftrightarrow': '⟷', r'\implies': '⇒',
+            r'\to': '→', r'\gets': '←',
+            
+            # Math symbols
+            r'\times': '×', r'\div': '÷', r'\pm': '±', r'\mp': '∓',
+            r'\leq': '≤', r'\geq': '≥', r'\neq': '≠', r'\approx': '≈',
+            r'\equiv': '≡', r'\propto': '∝', r'\infty': '∞', r'\partial': '∂',
+            r'\nabla': '∇', r'\cdot': '·', r'\bullet': '•', r'\circ': '∘',
+            r'\ast': '∗', r'\star': '⋆', r'\cap': '∩', r'\cup': '∪',
+            r'\subset': '⊂', r'\supset': '⊃', r'\subseteq': '⊆', r'\supseteq': '⊇',
+            r'\in': '∈', r'\notin': '∉', r'\forall': '∀', r'\exists': '∃',
+            r'\emptyset': '∅', r'\varnothing': '∅', r'\mathbb{R}': 'ℝ', r'\mathbb{C}': 'ℂ',
+            r'\mathbb{N}': 'ℕ', r'\mathbb{Z}': 'ℤ', r'\mathbb{Q}': 'ℚ',
+            
+            # Arrows
+            r'\uparrow': '↑', r'\downarrow': '↓', r'\Uparrow': '⇑', r'\Downarrow': '⇓',
+            r'\leftarrow': '←', r'\rightarrow': '→', r'\Leftarrow': '⇐', r'\Rightarrow': '⇒',
+            r'\leftrightarrow': '↔', r'\Leftrightarrow': '⇔',
+            
+            # Brackets and parentheses
+            r'\langle': '⟨', r'\rangle': '⟩', r'\lbrace': '{', r'\rbrace': '}',
+            r'\lbrack': '[', r'\rbrack': ']', r'\lfloor': '⌊', r'\rfloor': '⌋',
+            r'\lceil': '⌈', r'\rceil': '⌉',
+            
+            # Accents and decorations
+            r'\hat': '̂', r'\bar': '̄', r'\vec': '⃗', r'\dot': '̇', r'\ddot': '̈',
+            r'\tilde': '̃', r'\underline': '̲',
+            
+            # Chemical specific
+            r'^{\circ}': '°', r'^\circ': '°', r'\circ': '°',
+            r'\mathrm': '', r'\text': '', r'\mathbf': '', r'\mathit': '', r'\mathcal': '',
+            
+            # Common chemical compounds (preserve as is, but handle subscripts)
+            r'NaH': 'NaH', r'LiAlH_4': 'LiAlH₄', r'BuOOH': 'BuOOH',
+            r'Ti(OPr)_4': 'Ti(OPr)₄', r'OEt': 'OEt', r'OMe': 'OMe',
+            r'EtO': 'EtO', r'MeO': 'MeO',
+            
+            # Fractions
+            r'\frac{1}{2}': '½', r'\frac{1}{3}': '⅓', r'\frac{2}{3}': '⅔',
+            r'\frac{1}{4}': '¼', r'\frac{3}{4}': '¾', r'\frac{1}{5}': '⅕',
+            r'\frac{2}{5}': '⅖', r'\frac{3}{5}': '⅗', r'\frac{4}{5}': '⅘',
+            
+            # Operators
+            r'\sum': '∑', r'\prod': '∏', r'\int': '∫', r'\oint': '∮',
+            r'\lim': 'lim', r'\log': 'log', r'\ln': 'ln', r'\exp': 'exp',
+            r'\sin': 'sin', r'\cos': 'cos', r'\tan': 'tan', r'\cot': 'cot',
+            r'\sec': 'sec', r'\csc': 'csc',
+            
+            # Relations
+            r'\sim': '∼', r'\simeq': '≃', r'\cong': '≅', r'\approx': '≈',
+            r'\asymp': '≍', r'\propto': '∝', r'\models': '⊧', r'\parallel': '∥',
+            r'\perp': '⊥', r'\smile': '⌣', r'\frown': '⌢',
+        }
+        
+        # First pass: apply all direct substitutions
+        converted_text = text
+        for latex, unicode_char in substitutions.items():
+            converted_text = converted_text.replace(latex, unicode_char)
+        
+        # Handle generic subscripts: H_2O → H₂O, CH_3 → CH₃, etc.
+        # Match patterns like _2, _{2}, _n, _{n}
+        converted_text = re.sub(r'_\{(\d+)\}', r'₊\1', converted_text)  # _{2} → ₊2
+        converted_text = re.sub(r'_\{([a-zA-Z])\}', r'₊\1', converted_text)  # _{n} → ₊n
+        converted_text = re.sub(r'_(\d+)', r'₊\1', converted_text)  # _2 → ₊2
+        converted_text = re.sub(r'_([a-zA-Z])', r'₊\1', converted_text)  # _n → ₊n
+        converted_text = converted_text.replace('₊', '')  # Remove temporary marker
+        
+        # Handle generic superscripts: x^2 → x², x^{n} → xⁿ
+        converted_text = re.sub(r'\^\{(\d+)\}', r'⁺\1', converted_text)  # ^{2} → ⁺2
+        converted_text = re.sub(r'\^\{([a-zA-Z])\}', r'⁺\1', converted_text)  # ^{n} → ⁺n
+        converted_text = re.sub(r'\^(\d+)', r'⁺\1', converted_text)  # ^2 → ⁺2
+        converted_text = re.sub(r'\^([a-zA-Z])', r'⁺\1', converted_text)  # ^n → ⁺n
+        converted_text = converted_text.replace('⁺', '')  # Remove temporary marker
+        
+        # Remove any remaining LaTeX braces
+        converted_text = converted_text.replace('{', '').replace('}', '')
+        
+        # Final cleanup: remove any remaining LaTeX commands that start with backslash
+        converted_text = re.sub(r'\\[a-zA-Z]+\{.*?\}', '', converted_text)  # \command{content}
+        converted_text = re.sub(r'\\[a-zA-Z]+', '', converted_text)  # \command
+        
+        return converted_text
+
+    # --------------------------
+    # HYBRID DETECTION - IMPROVED TO PREVENT SKIPPING
+    # --------------------------
+    def contains_questions(self, image_url: str, file_name: str) -> bool:
+        """Hybrid detection: cheap model first, accurate model if uncertain"""
+        
+        # Step 1: Quick filename check (free)
+        file_lower = file_name.lower()
+        if any(pattern in file_lower for pattern in SKIP_PATTERNS):
+            print(f"⏭️ {file_name} - Skipped by filename pattern")
+            return False
+        
+        # Step 2: First pass with cheap model ($0.00015)
+        cheap_result = self._detect_with_cheap_model(image_url, file_name)
+        
+        if cheap_result == "YES":
+            print(f"✅ {file_name} - Cheap model detected questions")
+            return True
+        elif cheap_result == "NO":
+            # IMPORTANT: Don't trust cheap model's NO completely - verify with accurate model
+            print(f"🔍 {file_name} - Cheap model says NO, but verifying with accurate model to prevent skipping")
+            accurate_result = self._detect_with_accurate_model(image_url, file_name)
+            return accurate_result
+        else:
+            # Step 3: Second pass with accurate model ($0.0025)
+            print(f"🔍 {file_name} - Uncertain, using accurate model")
+            accurate_result = self._detect_with_accurate_model(image_url, file_name)
+            return accurate_result
+
+    def _detect_with_cheap_model(self, image_url: str, file_name: str) -> str:
+        """First pass with cheap model - cost: $0.00015 per image"""
+        self.cheap_detection_count += 1
+        
+        base64_image = self.optimize_image(image_url, target_width=300)  # Very small for cost savings
+        if not base64_image:
+            return "UNCERTAIN"
+
+        # OPTIMIZED PROMPT for chemistry questions
+        detection_prompt = """
+CRITICAL: This is for CHEMISTRY/SCIENCE exams. Look for:
+1. Questions with numbers (Q39, 39., etc.)  
+2. Chemical structures, molecular formulas, reactions
+3. Multiple choice options (A) B) C) D)
+4. Chemical notation like OEt, NaH, LIAH4, BuOOH
+5. Structural formulas or diagrams
+6. Text ending with "?" or question marks
+
+If you see ANY chemical structures, numbered questions, or multiple choice options, answer YES.
+If it's completely blank or only instructions, answer NO.
+
+Answer ONLY "YES" or "NO".
+"""
+
+        payload = {
+            "model": DETECTION_MODEL_CHEAP,
+            "temperature": DETECTION_TEMP,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": detection_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}",
+                                "detail": "low"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 5
+        }
+
+        try:
+            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=20)
+            if response.status_code == 200:
+                content = response.json()["choices"][0]["message"]["content"].strip().upper()
+                if "YES" in content:
+                    return "YES"
+                elif "NO" in content:
+                    return "NO"
+                else:
+                    return "UNCERTAIN"
+            else:
+                print(f"Cheap detection API Error {response.status_code}")
+                return "UNCERTAIN"
+        except Exception as e:
+            print(f"Cheap detection failed for {file_name}: {e}")
+            return "UNCERTAIN"
+
+    def _detect_with_accurate_model(self, image_url: str, file_name: str) -> bool:
+        """Second pass with accurate model - cost: $0.0025 per image"""
+        self.accurate_detection_count += 1
+        
+        base64_image = self.optimize_image(image_url, target_width=400)
+        if not base64_image:
+            return True  # When in doubt, process the image
+
+        # COMPREHENSIVE PROMPT for accurate detection
+        detection_prompt = """
+Analyze this exam image thoroughly. Does it contain ANY question content including:
+
+QUESTION PATTERNS:
+- Numbered questions: Q39, 39., Q.39, etc.
+- Multiple choice options: (A), (B), (C), (D)
+- Questions ending with "?" or question text
+
+CHEMISTRY/SCIENCE CONTENT:
+- Chemical structures and molecular diagrams
+- Chemical formulas: OEt, NaH, LIAH4, BuOOH, Ti(OPt)4, etc.
+- Reaction schemes and chemical equations
+- Structural formulas and organic chemistry notation
+- Scientific diagrams and graphs
+
+If you see ANY of the above question elements, chemical structures, or multiple choice content, answer YES.
+If it's completely blank, only instructions, or a cover page, answer NO.
+
+Answer ONLY "YES" or "NO".
+"""
+
+        payload = {
+            "model": DETECTION_MODEL_ACCURATE,
+            "temperature": DETECTION_TEMP,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": detection_prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}",
+                                "detail": "low"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 5
+        }
+
+        try:
+            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=25)
+            if response.status_code == 200:
+                content = response.json()["choices"][0]["message"]["content"].strip().upper()
+                result = "YES" in content
+                print(f"🎯 Accurate detection for {file_name}: {'✅ QUESTION' if result else '❌ NO QUESTION'}")
+                return result
+            else:
+                print(f"Accurate detection API Error {response.status_code}")
+                return True  # When in doubt, process
+        except Exception as e:
+            print(f"Accurate detection failed for {file_name}: {e}")
+            return True  # When in doubt, process
+
+    def print_detection_stats(self):
+        """Print cost statistics for detection"""
+        cheap_cost = self.cheap_detection_count * 0.00015
+        accurate_cost = self.accurate_detection_count * 0.0025
+        total_cost = cheap_cost + accurate_cost
+        
+        print(f"\n💰 DETECTION COST STATISTICS:")
+        print(f"Cheap model detections: {self.cheap_detection_count} (${cheap_cost:.4f})")
+        print(f"Accurate model detections: {self.accurate_detection_count} (${accurate_cost:.4f})")
+        print(f"Total detection cost: ${total_cost:.4f}")
+        print(f"Average cost per image: ${total_cost/(self.cheap_detection_count + self.accurate_detection_count):.6f}")
+
+     # ----------------------------------------------
+    # MAIN EXTRACTION: gpt-4o (OCR + question split) - UPDATED WITH TABLE SUPPORT
+    # ----------------------------------------------
+    def extract_all_questions_from_image(self, image_url: str, file_name: str) -> List[Dict]:
+        base64_image = self.optimize_image(image_url, target_width=600)
+        if not base64_image:
+            return [{"error": "Image processing failed", "file_name": file_name}]
+
+        # IMPROVED PROMPT for chemistry questions with explicit [IMAGE] and TABLE instructions
+        prompt = """
+You are an OCR expert for scientific exams. Extract ALL questions from this image.
+
+CRITICAL RULES FOR CHEMISTRY EXAMS:
+1. For ANY chemical structures, molecular diagrams, reaction schemes, or complex graphics in options → use "[IMAGE]"
+2. For text-based chemical formulas (like OEt, NaH, LiAlH₄, BuOOH) → preserve exactly but CONVERT ALL LaTeX TO UNICODE
+3. Convert ALL LaTeX to Unicode: H_2O → H₂O, \alpha → α, \rightarrow → →, ^{circ} → °
+4. Extract questions even if they use chemical structures instead of traditional numbering
+5. Detect question type: "MCQ" or "FILL_IN_BLANK" or "MATCHING"
+6. Extract instructions before questions
+7. Output ONLY a valid JSON array
+8. NO LaTeX SHOULD REMAIN IN OUTPUT - CONVERT EVERYTHING TO UNICODE
+
+SPECIAL INSTRUCTION FOR TABLES:
+- When you encounter a table in the question or options, extract it as a clean HTML table
+- Use proper table structure: <table>, <thead>, <tbody>, <tr>, <th>, <td>
+- Preserve all table formatting, headers, and data
+- For matching questions with tables, include the full table in the question text
+- Format example:
+  <table>
+    <thead>
+      <tr><th>Group I</th><th>Group II</th></tr>
+    </thead>
+    <tbody>
+      <tr><td>P: Short period mode</td><td>1: Coupled roll-yaw oscillations</td></tr>
+      <tr><td>Q: Wing rock</td><td>2: Angle of attack remains constant</td></tr>
+    </tbody>
+  </table>
+
+SPECIFIC [IMAGE] PLACEHOLDER CASES:
+- Chemical structure diagrams → "[IMAGE]"
+- Reaction mechanism schemes → "[IMAGE]" 
+- Molecular orbital diagrams → "[IMAGE]"
+- Complex graphs/charts → "[IMAGE]"
+- Any non-text visual representation → "[IMAGE]"
+
+LOOK FOR THESE QUESTION PATTERNS:
+- "Q.39", "39.", "Q39" etc.
+- Questions about chemical reactions, products, structures
+- Multiple choice options (A), B), C), D) even with chemical structures
+- Questions ending with question marks
+- Matching questions with tables or lists
+
+JSON SCHEMA:
+[
+  {
+    "number": "Q39",
+    "type": "MCQ", 
+    "text": "question text [IMAGE] [IMAGE]",
+    "option_a": "chemical formula or [IMAGE]",
+    "option_b": "chemical formula or [IMAGE]", 
+    "option_c": "chemical formula or [IMAGE]",
+    "option_d": "chemical formula or [IMAGE]",
+    "instructions": "any instructions before the question"
+  }
+]
+
+For matching questions, the table should be included in the "text" field as HTML.
+"""
+
+        payload = {
+            "model": EXTRACTION_MODEL,
+            "temperature": EXTRACTION_TEMP,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}",
+                                "detail": "high"
+                            }
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 4000  # Increased for HTML table support
+        }
+
+        try:
+            print(f"🧪 Extracting chemistry questions from: {file_name}")
+            response = requests.post(self.base_url, headers=self.headers, json=payload, timeout=90)
+
+            if response.status_code != 200:
+                error_msg = f"OCR API Error: {response.status_code}"
+                if response.status_code == 400:
+                    error_msg += " - Bad Request (check image format or size)"
+                elif response.status_code == 429:
+                    error_msg += " - Rate Limit Exceeded"
+                elif response.status_code == 500:
+                    error_msg += " - Internal Server Error"
+                elif response.status_code == 503:
+                    error_msg += " - Service Unavailable"
+                
+                print(f"{error_msg} for {file_name}")
+                return [{"error": error_msg, "file_name": file_name}]
+
+            content = response.json()["choices"][0]["message"]["content"].strip()
+
+            # Parse JSON
+            questions = self._parse_questions_json(content)
+            if not questions:
+                print("⚠ OCR JSON parsing failed → fallback text parser")
+                return self._fallback_parse(content, file_name)
+
+            # FIXED: Auto-fill image options with better detection
+            questions = self._fix_image_options(questions)
+
+            # Add defaults with safe type handling
+            for q in questions:
+                q["file_name"] = file_name
+                q.setdefault("type", "MCQ")
+                q.setdefault("option_a", "")
+                q.setdefault("option_b", "")
+                q.setdefault("option_c", "")
+                q.setdefault("option_d", "")
+                q.setdefault("instructions", "")
+                
+                # Convert any remaining LaTeX in HTML tables
+                if q.get("text"):
+                    q["text"] = self._convert_html_tables_latex(q["text"])
+                for opt_key in ['option_a', 'option_b', 'option_c', 'option_d']:
+                    if q.get(opt_key):
+                        q[opt_key] = self._convert_html_tables_latex(q[opt_key])
+
+            print(f"✅ Extracted {len(questions)} questions from {file_name}")
+            return questions
+
+        except Exception as e:
+            return [{"error": f"Extraction failed: {e}", "file_name": file_name}]
+
+    def _convert_html_tables_latex(self, text: str) -> str:
+        """Convert LaTeX within HTML tables to Unicode while preserving table structure"""
+        if not text or "<table>" not in text:
+            return self._convert_all_latex_to_unicode(text)
+        
+        # Extract and process tables separately
+        import re
+        
+        def process_table_content(table_html):
+            # Convert LaTeX in table content
+            processed = self._convert_all_latex_to_unicode(table_html)
+            # Ensure proper HTML structure
+            processed = processed.replace("<table>", "<table border='1' style='border-collapse: collapse;'>")
+            return processed
+        
+        # Find and process all tables
+        table_pattern = r'(<table>.*?</table>)'
+        tables = re.findall(table_pattern, text, re.DOTALL)
+        
+        for table in tables:
+            processed_table = process_table_content(table)
+            text = text.replace(table, processed_table)
+        
+        # Process any remaining text outside tables
+        text = self._convert_all_latex_to_unicode(text)
+        
+        return text
+    # --------------------------
+    # JSON PARSER
+    # --------------------------
+    def _parse_questions_json(self, text):
+        text = text.strip()
+
+        # Direct array
+        try:
+            obj = json.loads(text)
+            if isinstance(obj, list):
+                return obj
+        except:
+            pass
+
+        # Code block
+        m = re.search(r'```json\s*(\[.*?\])\s*```', text, re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except:
+                pass
+
+        # None found
+        return None
+
+    # -----------------------------------
+    # FALLBACK TEXT PARSER (simple regex)
+    # -----------------------------------
+    def _fallback_parse(self, raw_text, file_name):
+
+        lines = raw_text.split("\n")
+        questions = []
+        current = None
+        instructions = []
+        question_found = False
+
+        for line in lines:
+            t = line.strip()
+            if not t:
+                continue
+
+            # instructions block BEFORE first question
+            if not question_found and re.match(r'(instruction|direction|read)', t, re.I):
+                instructions.append(t)
+                continue
+
+            # IMPROVED question detection for chemistry
+            qmatch = re.match(r'(Q\.?\s*\d+|\d+\.)', t, re.I)
+            if qmatch:
+                question_found = True
+
+                if current:
+                    current["instructions"] = " ".join(instructions)
+                    questions.append(current)
+
+                num = qmatch.group(1)
+                txt = t[len(num):].strip()
+
+                current = {
+                    "number": num.replace(".", ""),
+                    "type": "MCQ",
+                    "text": txt,
+                    "option_a": "",
+                    "option_b": "",
+                    "option_c": "",
+                    "option_d": "",
+                    "instructions": "",
+                    "file_name": file_name
+                }
+                continue
+
+            # detect options
+            if current:
+                om = re.match(r'([A-D])[\.\)]\s*(.+)', t)
+                if om:
+                    key = f"option_{om.group(1).lower()}"
+                    current[key] = om.group(2)
+                    continue
+
+                # add to question text
+                current["text"] += " " + t
+
+        # last question
+        if current:
+            current["instructions"] = " ".join(instructions)
+            questions.append(current)
+
+        return questions
+
+    # -----------------------------------------------
+    # PROCESS IMAGES IN BATCHES - FIXED ORDER PRESERVATION
+    # -----------------------------------------------
+    def process_image_batch(self, image_batch: List[Tuple[str, str]]) -> List[Dict]:
+        results = []
+        
+        # First, detect which images contain actual questions
+        print("🔍 Hybrid detection: cheap model first, accurate if uncertain...")
+        valid_images = []
+        
+        for name, url in image_batch:
+            if self.contains_questions(url, name):
+                print(f"✅ {name} - Contains questions")
+                valid_images.append((name, url))
+            else:
+                print(f"⏭️ {name} - No questions found")
+        
+        if not valid_images:
+            return results
+            
+        # Process images SEQUENTIALLY to preserve order - no concurrent processing
+        print(f"🔄 Processing {len(valid_images)} images sequentially to preserve order...")
+        
+        for name, url in valid_images:
+            try:
+                print(f"📖 Processing: {name}")
+                questions = self.extract_all_questions_from_image(url, name)
+                results.extend(questions)
+                
+                # Add small delay between API calls
+                time.sleep(2)
+                
+            except Exception as e:
+                error_result = [{"error": f"Processing failed: {str(e)}", "file_name": name}]
+                results.extend(error_result)
+                print(f"❌ Error processing {name}: {e}")
+        
+        return results
+
+
+# =====================================================
+#  GOOGLE SHEET PROCESSOR - PART 1
+# =====================================================
+class GoogleSheetProcessorPart1:
+    def __init__(self, credentials_file: str, sheet_id: str, api_key: str, sheet_tab: str):
+        self.sheet_id = sheet_id
+        self.sheet_tab = sheet_tab
+        self.extractor = MultiQuestionExtractor(api_key)
+        self.service = self._auth(credentials_file)
+        self.processed_questions = []  # Track all processed questions
+        self.next_output_row = 2  # Start from row 2 (after header)
+
+    # ----------------------
+    # AUTH
+    # ----------------------
+    def _auth(self, credentials_file):
+        try:
+            scopes = ['https://www.googleapis.com/auth/spreadsheets']
+            creds = service_account.Credentials.from_service_account_file(
+                credentials_file, scopes=scopes)
+            return build('sheets', 'v4', credentials=creds)
+        except Exception as e:
+            print("Google Sheets Auth Failed:", e)
+            raise
+
+    # ----------------------
+    # READ SHEET
+    # ----------------------
+    def read_sheet(self):
+        try:
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!A:B"  # Only read file names and URLs
+            ).execute()
+
+            return result.get("values", [])
+        except Exception as e:
+            print("Error reading sheet:", e)
+            return []
+
+    # ----------------------
+    # PROGRESS TRACKING - CSV BASED
+    # ----------------------
+    def load_processed_files(self):
+        """Load already processed files from CSV"""
+        processed_files = set()
+        if os.path.exists(PROGRESS_FILE):
+            try:
+                with open(PROGRESS_FILE, 'r', newline='') as f:
+                    reader = csv.reader(f)
+                    for row in reader:
+                        if row:
+                            processed_files.add(row[0])
+                print(f"📊 Loaded {len(processed_files)} processed files from {PROGRESS_FILE}")
+            except Exception as e:
+                print(f"Error reading progress file: {e}")
+        return processed_files
+
+    def save_processed_files(self, processed_files):
+        """Save processed files to CSV"""
+        try:
+            with open(PROGRESS_FILE, 'w', newline='') as f:
+                writer = csv.writer(f)
+                for file_name in processed_files:
+                    writer.writerow([file_name])
+            print(f"💾 Saved {len(processed_files)} processed files to {PROGRESS_FILE}")
+        except Exception as e:
+            print(f"Error saving progress file: {e}")
+
+    def mark_file_processed(self, file_name, processed_files):
+        """Mark a file as processed and save to CSV"""
+        processed_files.add(file_name)
+        self.save_processed_files(processed_files)
+
+    # ----------------------
+    # CLEAR OUTPUT COLUMNS (OPTIONAL - now only for full reset)
+    # ----------------------
+    def clear_output(self):
+        try:
+            # Clear columns C to N (question data columns)
+            self.service.spreadsheets().values().clear(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!C:N"
+            ).execute()
+            print("Old question data cleared (C:N).")
+        except Exception as e:
+            print("Clear failed:", e)
+
+    # ----------------------
+    # UPDATE SHEET - TIMELY UPDATES
+    # ----------------------
+    def update_sheet_timely(self, questions_batch: List[Dict]):
+        """Update sheet with a batch of questions (timely updates)"""
+        if not questions_batch:
+            return
+
+        # format sheet rows (only question data, no answers)
+        # NEW COLUMN ORDER:
+        # C=Type, D=Number, E=File Name, F=Instructions, G=Text, H=Option A, I=Option B, J=Option C, K=Option D
+        rows = []
+
+        for q in questions_batch:
+            if "error" in q:
+                rows.append([
+                    "ERROR",           # C: Type
+                    "",                # D: Number  
+                    q.get("file_name",""),  # E: File Name
+                    "",               # F: Instructions
+                    q["error"],        # G: Text
+                    "", "", "", ""     # H-K: Options A-D
+                ])
+                continue
+            
+            rows.append([
+                q.get("type",""),      # C: Type
+                q.get("number",""),    # D: Number
+                q.get("file_name",""), # E: File Name
+                q.get("instructions",""),  # F: Instructions
+                q.get("text",""),      # G: Text
+                q.get("option_a",""),  # H: Option A
+                q.get("option_b",""),  # I: Option B  
+                q.get("option_c",""),  # J: Option C
+                q.get("option_d","")   # K: Option D
+            ])
+
+        try:
+            self.service.spreadsheets().values().update(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!C{self.next_output_row}",
+                valueInputOption="RAW",
+                body={"values": rows}
+            ).execute()
+            
+            print(f"📊 TIMELY UPDATE: Added {len(rows)} questions to sheet (starting row {self.next_output_row})")
+            self.next_output_row += len(rows)  # Move pointer for next update
+            
+        except Exception as e:
+            print(f"Timely update failed: {e}")
+
+    # =====================================================
+    # PROCESS ALL IMAGES WITH TIMELY UPDATES - IMPROVED ORDER PRESERVATION
+    # =====================================================
+    def process_all_images(self, batch_size=3, resume=True):
+
+        data = self.read_sheet()
+
+        if len(data) < 2:
+            print("No data in sheet.")
+            return
+
+        # Load processed files from CSV
+        processed_files = self.load_processed_files()
+        
+        if resume and processed_files:
+            print(f"📊 Resuming - Found {len(processed_files)} already processed files")
+        else:
+            print("🆕 Starting fresh - No previous progress found")
+
+        # Don't clear output if resuming and there are processed files
+        if not resume or not processed_files:
+            self.clear_output()
+            self.next_output_row = 2  # Reset to row 2
+
+        # Collect all files to process in ORIGINAL ORDER
+        files_to_process = []
+        processed_count = 0
+
+        for i, row in enumerate(data[1:], start=2):
+            if len(row) < 2:
+                continue
+
+            fname = row[0]
+            url = row[1]
+
+            if not url.startswith("http"):
+                continue
+
+            # Skip already processed files when resuming
+            if resume and fname in processed_files:
+                processed_count += 1
+                continue
+
+            files_to_process.append((fname, url))
+
+        print(f"📁 Files to process: {len(files_to_process)}")
+        print(f"✅ Already processed: {processed_count}")
+
+        if not files_to_process:
+            print("🎉 All files already processed!")
+            return
+
+        # Process files in batches BUT maintain strict order
+        all_questions = []
+        pending_questions = []  # Questions waiting to be written to sheet
+
+        # Process in batches but sequentially within each batch
+        for batch_num in range(0, len(files_to_process), batch_size):
+            batch = files_to_process[batch_num:batch_num + batch_size]
+            
+            print(f"\n=== Processing batch {batch_num//batch_size + 1}/{(len(files_to_process)-1)//batch_size + 1} ===")
+            print(f"📚 Files in this batch: {[f[0] for f in batch]}")
+            
+            qlist = self.extractor.process_image_batch(batch)
+
+            # Mark files as processed - FIXED: Only mark if we actually got results
+            for name, url in batch:
+                if name not in processed_files:
+                    # Only mark as processed if we got some result (even if empty)
+                    has_result = any(q.get("file_name") == name for q in qlist)
+                    if has_result or len(qlist) > 0:
+                        self.mark_file_processed(name, processed_files)
+                        print(f"✅ Marked {name} as processed")
+                    else:
+                        print(f"⚠️  {name} - No results obtained, will retry in next run")
+
+            all_questions.extend(qlist)
+            pending_questions.extend(qlist)
+
+            # TIMELY UPDATE: Update sheet every UPDATE_BATCH_SIZE questions
+            if len(pending_questions) >= UPDATE_BATCH_SIZE:
+                print(f"🔄 Updating sheet with {len(pending_questions)} questions...")
+                self.update_sheet_timely(pending_questions)
+                pending_questions = []  # Clear pending questions after update
+
+            time.sleep(3)  # Delay between batches
+
+        # Update any remaining questions
+        if pending_questions:
+            print(f"🔄 Final update with {len(pending_questions)} remaining questions...")
+            self.update_sheet_timely(pending_questions)
+
+        # Print cost statistics
+        self.extractor.print_detection_stats()
+
+        print(f"✅ Successfully processed {len(all_questions)} total questions")
+        print(f"📊 Questions written to sheet starting from row 2")
+        print(f"📝 Processed {len(files_to_process)} files in original order")
+
+# =====================================================
+# MAIN RUNNER - PART 1
+# =====================================================
+
+def main_part1():
+
+    # ====== IMPORTANT CONFIGURATION ======
+    OPENAI_API_KEY = "your_openai_api_key_here"
+
+    if not OPENAI_API_KEY or OPENAI_API_KEY == "your_openai_api_key_here":
+        print("❌ ERROR: Please put your real OpenAI API key in the script.")
+        return
+
+    GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+    CREDENTIALS_FILE = "service-account.json"
+    SHEET_TAB = "Sheet5"
+
+    BATCH_SIZE = 3            # OCR images per batch
+    RESUME_MODE = True        # Set to False to start from scratch
+
+    print("\n" + "="*80)
+    print(" 🔍 PART 1: QUESTION EXTRACTION WITH HYBRID DETECTION ")
+    print("="*80)
+    print(f" Extraction Model : {EXTRACTION_MODEL}")
+    print(f" Detection Models : {DETECTION_MODEL_CHEAP} + {DETECTION_MODEL_ACCURATE}")
+    print(f" Batch Size       : {BATCH_SIZE}")
+    print(f" Resume Mode      : {'ON' if RESUME_MODE else 'OFF'}")
+    print(f" Progress File    : {PROGRESS_FILE}")
+    print(f" Timely Updates   : Every {UPDATE_BATCH_SIZE} questions")
+    print("="*80)
+    print("💰 Cost Strategy: Cheap detection first ($0.00015), accurate if uncertain ($0.0025)")
+    print("🔄 ORDER PRESERVATION: Sequential processing to maintain original file order")
+    print("🔤 UNICODE ENFORCEMENT: ALL LaTeX converted to Unicode - NO LaTeX remains")
+    print("="*80)
+
+    try:
+        processor = GoogleSheetProcessorPart1(
+            CREDENTIALS_FILE,
+            GOOGLE_SHEET_ID,
+            OPENAI_API_KEY,
+            SHEET_TAB
+        )
+
+        processor.process_all_images(batch_size=BATCH_SIZE, resume=RESUME_MODE)
+
+        print("\n🎉 PART 1 COMPLETED SUCCESSFULLY!")
+        print("All questions extracted and saved to sheet columns C through K.")
+        print("✅ Original file order preserved in output")
+        print("✅ ALL LaTeX converted to Unicode - no LaTeX remains")
+
+    except Exception as e:
+        print(f"\n❌ FATAL ERROR: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+# =====================================================
+# ENTRY POINT
+# =====================================================
+if __name__ == "__main__":
+    main_part1()
