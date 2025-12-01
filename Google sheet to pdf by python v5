@@ -187,7 +187,6 @@ class PDFGenerator:
         # Now clean the text (remove HTML tags but keep table markers)
         cleaned_text = text
 
-        # Remove HTML tags but keep the text content
         try:
             soup = BeautifulSoup(text, 'html.parser')
 
@@ -206,8 +205,8 @@ class PDFGenerator:
             # Clean up extra whitespace
             cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
 
-            # Put table markers back in a clean way (here we remove them)
-            for i, marker in enumerate(table_markers):
+            # Remove markers (we keep tables separately)
+            for marker in table_markers:
                 cleaned_text = cleaned_text.replace(marker, "")
 
         except Exception as e:
@@ -293,7 +292,6 @@ class PDFGenerator:
                     img.drawHeight = max_height
                     img.drawWidth *= scale
 
-                # ✅ ZERO PADDING AND PROPER ALIGNMENT
                 img.hAlign = 'LEFT'
                 images.append(img)
 
@@ -337,11 +335,9 @@ class PDFGenerator:
 
     def should_use_single_column(self, option_a, option_b, option_c, option_d, doc_width):
         """Check if options should be displayed in single column to avoid overlap"""
-        # Estimate text width - if any option is longer than 40% of available width, use single column
         max_option_length = max(len(str(option_a)), len(str(option_b)), len(str(option_c)), len(str(option_d)))
         available_width_per_option = (doc_width / 2) - 20  # Account for padding
 
-        # If any option is longer than 40% of available space, use single column
         estimated_char_width = 6  # Approximate width per character in points
         estimated_text_width = max_option_length * estimated_char_width
 
@@ -352,9 +348,7 @@ class PDFGenerator:
         if len(images) < 2:
             return False
 
-        # Very flexible: only check if total width fits with spacing
         total_width = images[0].drawWidth + images[1].drawWidth + 20
-
         result = total_width < available_width
 
         logging.debug(
@@ -388,11 +382,9 @@ class PDFGenerator:
         i = 0
         while i < len(images):
             if i + 1 < len(images) and self.can_images_fit_two_per_row([images[i], images[i + 1]], available_width):
-                # Two images side by side
                 img1_width = images[i].drawWidth
                 img2_width = images[i + 1].drawWidth
 
-                # Calculate widths proportionally
                 spacing = 15
                 available_img_width = available_width - spacing
                 total_img_width = img1_width + img2_width
@@ -400,7 +392,6 @@ class PDFGenerator:
                 col1_width = (img1_width / total_img_width) * available_img_width
                 col2_width = (img2_width / total_img_width) * available_img_width
 
-                # Ensure minimum width
                 min_col_width = available_width * 0.3
                 if col1_width < min_col_width:
                     col1_width = min_col_width
@@ -420,7 +411,6 @@ class PDFGenerator:
                 layout_items.append(image_row_table)
                 i += 2
             else:
-                # Single image (either large or odd one out)
                 img_table = Table([["", images[i]]],
                                   colWidths=[left_indent, available_width])
                 img_table.setStyle(TableStyle([
@@ -449,16 +439,13 @@ class PDFGenerator:
         if len(opts_with_images) < 2:
             return False  # not worth grid layout
 
-        # All options that have images should have exactly one image and no tables
         for opt in opts_with_images:
             if len(opt['images']) != 1:
                 return False
             if opt['tables'] is not None:
                 return False
 
-        # Check that two images can fit side by side in a row
         max_img_width = max(opt['images'][0].drawWidth for opt in opts_with_images)
-        # simple margin
         return (2 * max_img_width + 30) <= available_width
 
     def build_option_image_grid(self, option_data, doc_width, left_indent, option_style):
@@ -484,29 +471,21 @@ class PDFGenerator:
 
                 opt = option_data[idx]
 
-                # Build inner content for this option
                 elements = []
-
-                # Option label + (optional) short text
                 label_text = f"({opt['letter']})"
                 if opt['text'].strip():
                     label_text += f" {opt['text']}"
                 elements.append(Paragraph(label_text, option_style))
 
-                # Single image (we already ensured len(images)==1)
                 if opt['images']:
                     img = opt['images'][0]
-
-                    # If image is wider than column, scale it down
                     if img.drawWidth > col_width - 10:
                         scale = (col_width - 10) / float(img.drawWidth)
                         img.drawWidth *= scale
                         img.drawHeight *= scale
-
                     elements.append(Spacer(1, 4))
                     elements.append(img)
 
-                # Wrap elements in an inner table to keep them together
                 inner_table = Table([[e] for e in elements],
                                     colWidths=[col_width])
                 inner_table.setStyle(TableStyle([
@@ -546,7 +525,6 @@ class PDFGenerator:
 
         for row in data:
             try:
-                # Extract paper information
                 folder = self.clean_name(row.get(COLUMN_FOLDER, 'Default_Folder'))
                 sub_folder = self.clean_name(row.get(COLUMN_SUB_FOLDER, 'General'))
                 file_name = self.clean_name(row.get(COLUMN_FILE_NAME, 'Default_Paper'))
@@ -561,7 +539,6 @@ class PDFGenerator:
                         'questions': []
                     }
 
-                # Create question dictionary
                 question = {
                     'question_no': row.get(COLUMN_QUESTION_NO, ''),
                     'question_text': row.get(COLUMN_QUESTION_TEXT, ''),
@@ -591,6 +568,7 @@ class PDFGenerator:
     def create_complete_pdf(self, questions, output_path, paper_name):
         """Create complete PDF with questions, options, answers and explanations"""
         try:
+            # Standard 1-inch margins all sides on Letter
             doc = SimpleDocTemplate(
                 output_path,
                 pagesize=letter,
@@ -602,11 +580,12 @@ class PDFGenerator:
 
             styles = getSampleStyleSheet()
 
-            # ✅ CONSISTENT LEFT INDENTATION
-            QUESTION_LEFT_INDENT = 35
-            OPTION_IMAGE_INDENT = 45
+            # ✅ Single consistent indent for all content blocks under question
+            QUESTION_INDENT = 40
+            OPTION_IMAGE_INDENT = QUESTION_INDENT
+            QNUM_COL_WIDTH = QUESTION_INDENT
 
-            # Custom styles
+            # Styles
             title_style = ParagraphStyle(
                 'CustomTitle',
                 parent=styles['Heading1'],
@@ -639,12 +618,13 @@ class PDFGenerator:
                 textColor=colors.black
             )
 
+            # For labels/text that we now place inside tables, leftIndent is 0
             instruction_label_style = ParagraphStyle(
                 'InstructionLabelStyle',
                 parent=styles['Normal'],
                 fontName=UNICODE_FONT_BOLD,
                 fontSize=12,
-                leftIndent=QUESTION_LEFT_INDENT,
+                leftIndent=0,
                 spaceAfter=0,
                 leading=14,
                 textColor=colors.black
@@ -655,7 +635,7 @@ class PDFGenerator:
                 parent=styles['Normal'],
                 fontName=UNICODE_FONT,
                 fontSize=12,
-                leftIndent=QUESTION_LEFT_INDENT,
+                leftIndent=0,
                 spaceAfter=8,
                 leading=14,
                 textColor=colors.black
@@ -680,7 +660,7 @@ class PDFGenerator:
                 textColor=colors.black,
                 spaceAfter=8,
                 leading=14,
-                leftIndent=QUESTION_LEFT_INDENT
+                leftIndent=0   # we’ll indent using a table
             )
 
             explanation_label_style = ParagraphStyle(
@@ -691,7 +671,7 @@ class PDFGenerator:
                 textColor=colors.black,
                 spaceAfter=0,
                 leading=14,
-                leftIndent=QUESTION_LEFT_INDENT
+                leftIndent=0
             )
 
             explanation_text_style = ParagraphStyle(
@@ -702,98 +682,109 @@ class PDFGenerator:
                 textColor=colors.black,
                 spaceAfter=15,
                 leading=14,
-                leftIndent=QUESTION_LEFT_INDENT
+                leftIndent=0
             )
 
             story = []
 
-            # Add title
+            # Title
             title = Paragraph(f"{paper_name}", title_style)
             story.append(title)
             story.append(Spacer(1, 30))
 
             for i, question in enumerate(questions, 1):
-                # ✅ USE ACTUAL QUESTION NUMBER
                 actual_question_no = question.get('question_no', i)
                 if not actual_question_no or str(actual_question_no).strip() == '':
                     actual_question_no = i
 
-                # ✅ IMPROVED: Clean text and extract tables
                 question_text, question_tables = self.clean_text_with_tables(question['question_text'])
 
-                # ✅ ADD INSTRUCTIONS
+                # ---- Instructions (indented using tables for alignment) ----
                 if question.get('instructions'):
                     instr_text, instr_tables = self.clean_text_with_tables(question['instructions'])
                     if instr_text and instr_text.strip():
-                        instruction_label = Paragraph("<b>Instruction:</b>", instruction_label_style)
-                        instruction_content = Paragraph(f"{instr_text}", instruction_text_style)
-                        story.append(instruction_label)
-                        story.append(instruction_content)
+                        instr_label_para = Paragraph("<b>Instruction:</b>", instruction_label_style)
+                        instr_label_tbl = Table(
+                            [["", instr_label_para]],
+                            colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                        )
+                        instr_label_tbl.setStyle(TableStyle([
+                            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                        ]))
+                        story.append(instr_label_tbl)
 
-                        # ✅ ADD INSTRUCTION TABLES IF ANY
+                        instr_para = Paragraph(instr_text, instruction_text_style)
+                        instr_tbl = Table(
+                            [["", instr_para]],
+                            colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                        )
+                        instr_tbl.setStyle(TableStyle([
+                            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                        ]))
+                        story.append(instr_tbl)
+
                         if instr_tables:
-                            story.append(Spacer(1, 8))
+                            story.append(Spacer(1, 4))
                             for table_data in instr_tables:
-                                table = self.create_table_from_html_data(table_data, doc.width - QUESTION_LEFT_INDENT)
+                                table = self.create_table_from_html_data(table_data, doc.width - QUESTION_INDENT)
                                 if table:
-                                    # Create indented table
                                     indented_table = Table(
                                         [["", table]],
-                                        colWidths=[QUESTION_LEFT_INDENT, doc.width - QUESTION_LEFT_INDENT]
+                                        colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
                                     )
                                     indented_table.setStyle(TableStyle([
                                         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                         ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                         ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
                                     ]))
                                     story.append(indented_table)
-                                    story.append(Spacer(1, 8))
 
                         story.append(Spacer(1, 8))
 
-                # Question number and text
+                # ---- Question number + text ----
                 q_number = Paragraph(f"Q.{actual_question_no}", question_number_style)
-                q_text = Paragraph(f"{question_text}", question_text_style)
-
-                question_table = Table([[q_number, q_text]], colWidths=[35, doc.width - 35])
+                q_text = Paragraph(question_text, question_text_style)
+                question_table = Table(
+                    [[q_number, q_text]],
+                    colWidths=[QNUM_COL_WIDTH, doc.width - QNUM_COL_WIDTH]
+                )
                 question_table.setStyle(TableStyle([
-                    ('VALIGN', (0, 0), (-1, 0), 'TOP'),
-                    ('LEFTPADDING', (0, 0), (-1, 0), 0),
-                    ('RIGHTPADDING', (0, 0), (-1, 0), 0),
-                    ('BOTTOMPADDING', (0, 0), (-1, 0), 0),
+                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
                 ]))
-
                 story.append(question_table)
-                story.append(Spacer(1, 8))
+                story.append(Spacer(1, 6))
 
-                # ✅ ADD QUESTION TABLES IF ANY (BEFORE IMAGES)
+                # ---- Question tables ----
                 if question_tables:
                     for table_data in question_tables:
-                        table = self.create_table_from_html_data(table_data, doc.width - QUESTION_LEFT_INDENT)
+                        table = self.create_table_from_html_data(table_data, doc.width - QUESTION_INDENT)
                         if table:
-                            # Create indented table
                             indented_table = Table(
                                 [["", table]],
-                                colWidths=[QUESTION_LEFT_INDENT, doc.width - QUESTION_LEFT_INDENT]
+                                colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
                             )
                             indented_table.setStyle(TableStyle([
                                 ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                 ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                 ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-                                ('BOTTOMPADDING', (0, 0), (-1, -1), 10),
+                                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
                             ]))
                             story.append(indented_table)
-                            story.append(Spacer(1, 8))
+                    story.append(Spacer(1, 6))
 
-                # ✅ QUESTION IMAGES
+                # ---- Question images (aligned to QUESTION_INDENT) ----
                 question_image_urls = []
                 if question.get('question_image_url'):
-                    dedicated_urls = self.extract_urls_from_text(question['question_image_url'])
-                    question_image_urls.extend(dedicated_urls)
-
-                text_urls = self.extract_urls_from_text(question['question_text'])
-                question_image_urls.extend(text_urls)
+                    question_image_urls.extend(self.extract_urls_from_text(question['question_image_url']))
+                question_image_urls.extend(self.extract_urls_from_text(question['question_text']))
 
                 seen = set()
                 unique_urls = []
@@ -803,33 +794,28 @@ class PDFGenerator:
                         unique_urls.append(url)
 
                 question_images = self.fetch_images_from_urls(unique_urls)
-
                 if question_images:
-                    available_width = doc.width - QUESTION_LEFT_INDENT
+                    available_width = doc.width - QUESTION_INDENT
                     question_image_layout = self.layout_images_for_option(
                         question_images,
                         available_width,
-                        QUESTION_LEFT_INDENT
+                        QUESTION_INDENT
                     )
                     for layout_item in question_image_layout:
                         story.append(layout_item)
-                        story.append(Spacer(1, 6))
+                        story.append(Spacer(1, 4))
 
-                # ✅ PROCESS OPTIONS WITH TABLES SUPPORT
+                # ---- Options ----
                 option_data = []
                 for option_key in ['option_a', 'option_b', 'option_c', 'option_d']:
                     raw_text = question[option_key]
                     clean_text, option_tables = self.clean_text_with_tables(raw_text)
 
-                    # Get image URLs
                     image_urls = []
                     dedicated_url_col = f"{option_key}_image_url"
                     if question.get(dedicated_url_col):
-                        dedicated_urls = self.extract_urls_from_text(question[dedicated_url_col])
-                        image_urls.extend(dedicated_urls)
-
-                    text_urls = self.extract_urls_from_text(raw_text)
-                    image_urls.extend(text_urls)
+                        image_urls.extend(self.extract_urls_from_text(question[dedicated_url_col]))
+                    image_urls.extend(self.extract_urls_from_text(raw_text))
 
                     seen = set()
                     unique_urls = []
@@ -838,7 +824,6 @@ class PDFGenerator:
                             seen.add(url)
                             unique_urls.append(url)
 
-                    # Fetch images
                     images = self.fetch_images_from_urls(unique_urls)
 
                     option_data.append({
@@ -848,68 +833,49 @@ class PDFGenerator:
                         'tables': option_tables
                     })
 
-                # ✅ CHECK IF WE SHOULD USE SINGLE COLUMN
-                opt_a_data = option_data[0]
-                opt_b_data = option_data[1]
-                opt_c_data = option_data[2]
-                opt_d_data = option_data[3]
+                opt_a_data, opt_b_data, opt_c_data, opt_d_data = option_data
 
-                has_images = any([
-                    len(opt_a_data['images']) > 0,
-                    len(opt_b_data['images']) > 0,
-                    len(opt_c_data['images']) > 0,
-                    len(opt_d_data['images']) > 0
-                ])
-
-                has_tables = any([
-                    opt_a_data['tables'] is not None,
-                    opt_b_data['tables'] is not None,
-                    opt_c_data['tables'] is not None,
-                    opt_d_data['tables'] is not None
-                ])
+                has_images = any(len(opt['images']) > 0 for opt in option_data)
+                has_tables = any(opt['tables'] is not None for opt in option_data)
 
                 use_single = has_images or has_tables or self.should_use_single_column(
                     opt_a_data['text'], opt_b_data['text'], opt_c_data['text'], opt_d_data['text'], doc.width
                 )
 
-                available_option_width = doc.width - QUESTION_LEFT_INDENT
+                available_option_width = doc.width - QUESTION_INDENT
 
                 if use_single:
-                    # --- NEW: try side-by-side image grid when suitable ---
                     if self.can_show_options_as_image_grid(option_data, available_option_width):
                         grid = self.build_option_image_grid(
                             option_data,
                             doc.width,
-                            QUESTION_LEFT_INDENT,
+                            QUESTION_INDENT,
                             option_style
                         )
                         story.append(grid)
-                        story.append(Spacer(1, 10))
+                        story.append(Spacer(1, 8))
                     else:
-                        # ✅ FALLBACK: SINGLE COLUMN LAYOUT - EACH OPTION WITH ITS TEXT, TABLES, AND IMAGES
+                        # Single-column, each option aligned by QUESTION_INDENT
                         for opt_data in option_data:
-                            # Option text
                             opt_text = f"({opt_data['letter']}) {opt_data['text']}" if opt_data['text'].strip() else f"({opt_data['letter']})"
                             if opt_text:
-                                opt_paragraph = Paragraph(opt_text, option_style)
-                                text_table = Table(
-                                    [["", opt_paragraph]],
-                                    colWidths=[QUESTION_LEFT_INDENT, doc.width - QUESTION_LEFT_INDENT]
+                                opt_para = Paragraph(opt_text, option_style)
+                                opt_tbl = Table(
+                                    [["", opt_para]],
+                                    colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
                                 )
-                                text_table.setStyle(TableStyle([
+                                opt_tbl.setStyle(TableStyle([
                                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                     ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                     ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
                                 ]))
-                                story.append(text_table)
+                                story.append(opt_tbl)
 
-                            # ✅ OPTION TABLES (IF ANY)
                             if opt_data['tables']:
                                 for table_data in opt_data['tables']:
                                     table = self.create_table_from_html_data(table_data, doc.width - OPTION_IMAGE_INDENT)
                                     if table:
-                                        # Create indented table
                                         indented_table = Table(
                                             [["", table]],
                                             colWidths=[OPTION_IMAGE_INDENT, doc.width - OPTION_IMAGE_INDENT]
@@ -918,12 +884,10 @@ class PDFGenerator:
                                             ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                             ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                             ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-                                            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                                            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
                                         ]))
                                         story.append(indented_table)
-                                        story.append(Spacer(1, 5))
 
-                            # ✅ OPTION IMAGES - RIGHT AFTER TEXT AND TABLES
                             if opt_data['images']:
                                 available_width = doc.width - OPTION_IMAGE_INDENT
                                 option_image_layout = self.layout_images_for_option(
@@ -931,16 +895,13 @@ class PDFGenerator:
                                     available_width,
                                     OPTION_IMAGE_INDENT
                                 )
-
                                 for layout_item in option_image_layout:
                                     story.append(layout_item)
 
-                            # Small space between options
                             if opt_data != option_data[-1]:
-                                story.append(Spacer(1, 8))
-
+                                story.append(Spacer(1, 6))
                 else:
-                    # Two column layout for text-only options (no images/tables)
+                    # Two-column text-only layout (both columns respect QUESTION_INDENT)
                     data = []
                     for row_num in range(2):
                         row = []
@@ -949,18 +910,18 @@ class PDFGenerator:
                             if option_index < len(option_data):
                                 opt_data = option_data[option_index]
                                 opt_text = f"({opt_data['letter']}) {opt_data['text']}"
-                                opt_paragraph = Paragraph(opt_text, option_style)
-                                option_cell_table = Table(
-                                    [["", opt_paragraph]],
-                                    colWidths=[QUESTION_LEFT_INDENT, doc.width * 0.45 - QUESTION_LEFT_INDENT]
+                                opt_para = Paragraph(opt_text, option_style)
+                                opt_cell_tbl = Table(
+                                    [["", opt_para]],
+                                    colWidths=[QUESTION_INDENT, doc.width * 0.45 - QUESTION_INDENT]
                                 )
-                                option_cell_table.setStyle(TableStyle([
+                                opt_cell_tbl.setStyle(TableStyle([
                                     ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                     ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                     ('RIGHTPADDING', (0, 0), (-1, -1), 0),
                                     ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
                                 ]))
-                                row.append(option_cell_table)
+                                row.append(opt_cell_tbl)
                                 row.append("")
                             else:
                                 row.extend(["", ""])
@@ -977,42 +938,72 @@ class PDFGenerator:
                     ]))
                     story.append(tbl)
 
-                story.append(Spacer(1, 10))
+                story.append(Spacer(1, 8))
 
-                # Correct answer
+                # ---- Correct answer (indented, aligned) ----
                 correct_option = question['correct_option']
                 if correct_option:
-                    correct_answer = f"Correct Answer: {correct_option}"
-                    story.append(Paragraph(correct_answer, correct_answer_style))
+                    correct_para = Paragraph(f"Correct Answer: {correct_option}", correct_answer_style)
+                    correct_tbl = Table(
+                        [["", correct_para]],
+                        colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                    )
+                    correct_tbl.setStyle(TableStyle([
+                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                    ]))
+                    story.append(correct_tbl)
 
-                # Explanation (with table support)
+                # ---- Explanation (label + text + tables, all aligned) ----
                 if question.get('explanation'):
                     expl_text, expl_tables = self.clean_text_with_tables(question['explanation'])
                     if expl_text and expl_text.strip():
-                        story.append(Paragraph("Explanation:", explanation_label_style))
-                        story.append(Paragraph(expl_text, explanation_text_style))
+                        expl_label_para = Paragraph("Explanation:", explanation_label_style)
+                        expl_label_tbl = Table(
+                            [["", expl_label_para]],
+                            colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                        )
+                        expl_label_tbl.setStyle(TableStyle([
+                            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                        ]))
+                        story.append(expl_label_tbl)
 
-                        # ✅ ADD EXPLANATION TABLES IF ANY
+                        expl_para = Paragraph(expl_text, explanation_text_style)
+                        expl_tbl = Table(
+                            [["", expl_para]],
+                            colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                        )
+                        expl_tbl.setStyle(TableStyle([
+                            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                        ]))
+                        story.append(expl_tbl)
+
                         if expl_tables:
                             for table_data in expl_tables:
-                                table = self.create_table_from_html_data(table_data, doc.width - QUESTION_LEFT_INDENT)
+                                table = self.create_table_from_html_data(table_data, doc.width - QUESTION_INDENT)
                                 if table:
-                                    # Create indented table
                                     indented_table = Table(
                                         [["", table]],
-                                        colWidths=[QUESTION_LEFT_INDENT, doc.width - QUESTION_LEFT_INDENT]
+                                        colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
                                     )
                                     indented_table.setStyle(TableStyle([
                                         ('VALIGN', (0, 0), (-1, -1), 'TOP'),
                                         ('LEFTPADDING', (0, 0), (-1, -1), 0),
                                         ('RIGHTPADDING', (0, 0), (-1, -1), 0),
-                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
                                     ]))
                                     story.append(indented_table)
 
                 story.append(Spacer(1, 15))
 
-                # Add page break after every 5 questions
+                # Page break after every 5 questions
                 if i % 5 == 0:
                     story.append(PageBreak())
 
@@ -1037,21 +1028,16 @@ def main():
     WORKSHEET_NAME = "Sheet4"
     OUTPUT_DIR = "Generated_PDFs"
 
-    # Create output directory
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     try:
-        # Initialize PDF generator
         pdf_gen = PDFGenerator(CREDENTIALS_FILE)
 
-        # Load data from Google Sheets
         data = pdf_gen.load_data_from_sheets(SPREADSHEET_ID, WORKSHEET_NAME)
 
-        # Process questions
         papers = pdf_gen.process_questions(data)
         logging.info(f"Found {len(papers)} papers to process")
 
-        # Generate PDFs
         results = []
 
         for paper_key, paper_info in papers.items():
@@ -1063,10 +1049,8 @@ def main():
 
                 logging.info(f"Processing: {paper_name} ({len(questions)} questions)")
 
-                # Create folder structure
                 local_folder_path = pdf_gen.create_folder_structure(OUTPUT_DIR, folder, sub_folder)
 
-                # Create PDF filenames
                 safe_name = "".join(c for c in paper_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
 
                 pdf_files = {
@@ -1075,7 +1059,6 @@ def main():
                     'answers_only': os.path.join(local_folder_path, f"{safe_name}_Correct_Answers.pdf")
                 }
 
-                # Generate complete PDF
                 pdf_results = {}
 
                 if pdf_gen.create_complete_pdf(questions, pdf_files['complete'], paper_name):
@@ -1085,7 +1068,6 @@ def main():
                     pdf_results['complete'] = None
                     logging.error(f"✗ Failed to create complete PDF")
 
-                # Store results
                 result = {
                     'paper_name': paper_name,
                     'folder': folder,
@@ -1114,13 +1096,11 @@ def main():
                 }
                 results.append(result)
 
-        # Save processing report
         report_df = pd.DataFrame(results)
         report_path = os.path.join(OUTPUT_DIR, "Processing_Report.csv")
         report_df.to_csv(report_path, index=False)
         logging.info(f"Results saved to: {report_path}")
 
-        # Print summary
         successful = len([r for r in results if r['status'] == 'Success'])
         total = len(results)
 
@@ -1128,7 +1108,7 @@ def main():
         print("PDF GENERATION COMPLETE!")
         print("=" * 60)
         print(f"Successfully processed: {successful}/{total} papers")
-        print(f"Generated PDF with HTML table support and improved option images layout")
+        print("Standard 1-inch margins and aligned question blocks applied.")
         print(f"\nPDFs saved to: {OUTPUT_DIR}")
         print("All done!")
 
