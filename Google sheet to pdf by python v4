@@ -208,7 +208,7 @@ class PDFGenerator:
             
             # Put table markers back in a clean way
             for i, marker in enumerate(table_markers):
-                cleaned_text = cleaned_text.replace(marker, f"\n[Table {i+1}]\n")
+                cleaned_text = cleaned_text.replace(marker, "")
             
         except Exception as e:
             logging.debug(f"Failed to parse HTML with BeautifulSoup: {e}")
