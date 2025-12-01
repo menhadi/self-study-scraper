@@ -1109,7 +1109,7 @@ class PDFGenerator:
             story = []
 
             # Title
-            title = Paragraph(f"{paper_name} - Questions Only", title_style)
+            title = Paragraph(f"{paper_name}", title_style)
             story.append(title)
             story.append(Spacer(1, 30))
 
