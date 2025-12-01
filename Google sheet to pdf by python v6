@@ -1,0 +1,1642 @@
+import gspread
+from google.oauth2.service_account import Credentials
+from reportlab.lib.pagesizes import letter
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak, Table, TableStyle, Image
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+
+from reportlab.lib.units import inch
+from reportlab.lib import colors
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from googleapiclient.discovery import build
+import os
+import logging
+import pandas as pd
+import re
+import requests
+from io import BytesIO
+import urllib.parse
+from bs4 import BeautifulSoup  # For HTML parsing
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+
+# Google Sheets and Drive setup
+SCOPE = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+# Column names in Google Sheets
+COLUMN_FOLDER = 'Folder'
+COLUMN_SUB_FOLDER = 'Sub Folder'
+COLUMN_FILE_NAME = 'File Name'
+COLUMN_QUESTION_NO = 'Question No'
+COLUMN_QUESTION_TEXT = 'Question Text'
+COLUMN_INSTRUCTIONS = 'Instructions'
+COLUMN_OPTION_A = 'Option A'
+COLUMN_OPTION_B = 'Option B'
+COLUMN_OPTION_C = 'Option C'
+COLUMN_OPTION_D = 'Option D'
+COLUMN_QUESTION_IMAGE_URL = 'Question Image URL'
+COLUMN_OPTION_A_IMAGE_URL = 'Option A Image URL'
+COLUMN_OPTION_B_IMAGE_URL = 'Option B Image URL'
+COLUMN_OPTION_C_IMAGE_URL = 'Option C Image URL'
+COLUMN_OPTION_D_IMAGE_URL = 'Option D Image URL'
+COLUMN_CORRECT_OPTION = 'Correct Option'
+COLUMN_EXPLANATION = 'Explanation'
+COLUMN_CONTENT = 'Content'
+COLUMN_PDF_URLS = 'PDF urls'
+
+# -----------------------------------------------------------
+# ✅ UNICODE FONT PATH (YOUR EXACT LOCATION)
+# -----------------------------------------------------------
+FONT_DIR = r"C:\Users\menha\Downloads\dejavu-fonts-ttf-2.37\dejavu-fonts-ttf-2.37\ttf"
+UNICODE_FONT = "DejaVuSans"
+UNICODE_FONT_BOLD = "DejaVuSans-Bold"
+
+pdfmetrics.registerFont(TTFont(UNICODE_FONT, os.path.join(FONT_DIR, "DejaVuSans.ttf")))
+pdfmetrics.registerFont(TTFont(UNICODE_FONT_BOLD, os.path.join(FONT_DIR, "DejaVuSans-Bold.ttf")))
+
+logging.info("✅ DejaVu Unicode fonts loaded successfully.")
+
+
+class PDFGenerator:
+    def __init__(self, credentials_file):
+        self.credentials_file = credentials_file
+        self.sheets_client = None
+        self.drive_service = None
+        self.setup_clients()
+
+    def setup_clients(self):
+        """Initialize Google Sheets and Drive clients"""
+        try:
+            creds = Credentials.from_service_account_file(self.credentials_file, scopes=SCOPE)
+            self.sheets_client = gspread.authorize(creds)
+            self.drive_service = build('drive', 'v3', credentials=creds)
+            logging.info("Google Sheets and Drive clients initialized")
+        except Exception as e:
+            logging.error(f"Failed to initialize clients: {e}")
+            raise
+
+    def clean_name(self, name, default="Default"):
+        """Clean folder/file names to be filesystem-safe"""
+        if not name:
+            return default
+        name = str(name)
+        name = re.sub(r'https?://', '', name)
+        name = re.sub(r'[<>:"/\\|?*]', "_", name)
+        return name.strip().rstrip(".")
+
+    def load_data_from_sheets(self, spreadsheet_id, worksheet_name):
+        """Load data from Google Sheets"""
+        try:
+            spreadsheet = self.sheets_client.open_by_key(spreadsheet_id)
+            worksheet = spreadsheet.worksheet(worksheet_name)
+            data = worksheet.get_all_records()
+            logging.info(f"Loaded {len(data)} rows from Google Sheets")
+            return data
+        except Exception as e:
+            logging.error(f"Failed to load data from Google Sheets: {e}")
+            raise
+
+    def create_folder_structure(self, base_path, folder, sub_folder):
+        """Create folder structure for PDFs"""
+        safe_folder = self.clean_name(folder, "Folder")
+        safe_sub_folder = self.clean_name(sub_folder, "SubFolder")
+        path = os.path.join(base_path, safe_folder, safe_sub_folder)
+        os.makedirs(path, exist_ok=True)
+        return path
+
+    def extract_urls_from_text(self, text):
+        """Extract ALL URLs from text, including those in separate square brackets [url1] [url2]"""
+        if not text:
+            return []
+
+        text = str(text).strip()
+        urls = []
+
+        # Pattern to match URLs in separate square brackets: [url1] [url2] [url3]
+        bracket_pattern = r'\[(https?://[^\]]+)\]'
+        bracket_urls = re.findall(bracket_pattern, text)
+        urls.extend(bracket_urls)
+
+        # Also look for standalone URLs outside brackets
+        url_pattern = r'https?://[^\s<>"]+|www\.[^\s<>"]+'
+        standalone_urls = re.findall(url_pattern, text)
+        for url in standalone_urls:
+            if not url.startswith('http'):
+                url = 'https://' + url
+            # Only add if not already in bracket_urls (avoid duplicates)
+            if url not in urls:
+                urls.append(url)
+
+        return urls
+
+    def parse_html_table(self, html_content):
+        """Parse HTML table and convert to ReportLab table data"""
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+            tables = soup.find_all('table')
+
+            if not tables:
+                return None
+
+            table_data = []
+
+            for table in tables:
+                rows = table.find_all('tr')
+                table_rows = []
+
+                for row in rows:
+                    cells = row.find_all(['td', 'th'])
+                    row_data = []
+
+                    for cell in cells:
+                        # Clean cell content
+                        cell_text = cell.get_text(strip=True)
+                        # Remove extra whitespace but preserve line breaks for paragraphs
+                        cell_text = re.sub(r'\s+', ' ', cell_text)
+                        row_data.append(cell_text)
+
+                    if row_data:  # Only add non-empty rows
+                        table_rows.append(row_data)
+
+                if table_rows:  # Only add tables with data
+                    table_data.append(table_rows)
+
+            return table_data if table_data else None
+
+        except Exception as e:
+            logging.debug(f"Failed to parse HTML table: {e}")
+            return None
+
+    def clean_text_with_tables(self, text):
+        """Clean text by removing HTML tags but preserving table structure"""
+        if not text:
+            return text, None
+
+        text = str(text)
+
+        # First, extract any HTML tables
+        table_data = self.parse_html_table(text)
+
+        # Now clean the text (remove HTML tags but keep table markers)
+        cleaned_text = text
+
+        try:
+            soup = BeautifulSoup(text, 'html.parser')
+
+            # Find all tables and replace them with markers
+            tables = soup.find_all('table')
+            table_markers = []
+
+            for i, table in enumerate(tables):
+                marker = f"[[TABLE_{i}]]"
+                table_markers.append(marker)
+                table.replace_with(marker)
+
+            # Get the text with table markers
+            cleaned_text = soup.get_text()
+
+            # Clean up extra whitespace
+            cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+
+            # Remove markers (we keep tables separately)
+            for marker in table_markers:
+                cleaned_text = cleaned_text.replace(marker, "")
+
+        except Exception as e:
+            logging.debug(f"Failed to parse HTML with BeautifulSoup: {e}")
+            # Fallback: simple HTML tag removal
+            cleaned_text = re.sub(r'<[^>]+>', '', text)
+            cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
+
+        # Remove URLs in separate square brackets [url1] [url2]
+        cleaned_text = re.sub(r'\[https?://[^\]]+\]', '', cleaned_text)
+
+        # Remove standalone URLs
+        cleaned_text = re.sub(r'https?://[^\s<>"]+|www\.[^\s<>"]+', '', cleaned_text)
+
+        return cleaned_text.strip(), table_data
+
+    def create_table_from_html_data(self, table_rows, available_width):
+        """Convert parsed HTML table data to ReportLab Table"""
+        if not table_rows:
+            return None
+
+        try:
+            # Calculate column widths
+            num_cols = max(len(row) for row in table_rows)
+            col_width = available_width / num_cols
+
+            # Create the table
+            table = Table(table_rows, colWidths=[col_width] * num_cols)
+
+            # Apply table styling
+            table.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.lightgrey),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.black),
+                ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                ('FONTNAME', (0, 0), (-1, 0), UNICODE_FONT_BOLD),
+                ('FONTSIZE', (0, 0), (-1, -1), 10),
+                ('BOTTOMPADDING', (0, 0), (-1, 0), 6),
+                ('BACKGROUND', (0, 1), (-1, -1), colors.white),
+                ('FONTNAME', (0, 1), (-1, -1), UNICODE_FONT),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                ('LEFTPADDING', (0, 0), (-1, -1), 6),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+                ('TOPPADDING', (0, 0), (-1, -1), 4),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ]))
+
+            return table
+
+        except Exception as e:
+            logging.error(f"Failed to create table from HTML data: {e}")
+            return None
+
+    # ✅ IMPROVED IMAGE PARSING WITH MULTIPLE URL SUPPORT
+    def fetch_images_from_urls(self, urls, max_width=1.6 * inch):
+        """Fetch multiple images from URLs and return list of Image objects"""
+        images = []
+        for url in urls:
+            try:
+                if not url:
+                    continue
+
+                url = str(url).strip()
+                if not url.lower().startswith("http"):
+                    continue
+
+                resp = requests.get(url, timeout=15)
+                if resp.status_code != 200:
+                    continue
+
+                img_data = BytesIO(resp.content)
+                img = Image(img_data)
+
+                # Scale image proportionally to fit within max_width
+                if img.drawWidth > max_width:
+                    scale = max_width / img.drawWidth
+                    img.drawWidth = max_width
+                    img.drawHeight *= scale
+
+                # Maintain aspect ratio for very tall images
+                max_height = 2.0 * inch
+                if img.drawHeight > max_height:
+                    scale = max_height / img.drawHeight
+                    img.drawHeight = max_height
+                    img.drawWidth *= scale
+
+                img.hAlign = 'LEFT'
+                images.append(img)
+
+            except Exception as e:
+                logging.debug(f"Failed to fetch image from {url}: {e}")
+                continue
+
+        return images
+
+    def add_header_footer(self, canvas, doc, paper_name=None):
+        """Add header and footer to all pages - 80% width (no margins)"""
+        canvas.saveState()
+
+        # Calculate 80% width
+        page_width = doc.pagesize[0]
+        header_footer_width = page_width * 0.8
+        start_x = (page_width - header_footer_width) / 2
+
+        # Header line - 80% width centered
+        canvas.setStrokeColor(colors.black)
+        canvas.setLineWidth(0.5)
+        canvas.line(start_x, doc.pagesize[1] - 40, start_x + header_footer_width, doc.pagesize[1] - 40)
+
+        # Add paper name in header on right side
+        if paper_name:
+            canvas.setFont(UNICODE_FONT, 10)
+            canvas.setFillColor(colors.black)
+            canvas.drawRightString(page_width - 36, doc.pagesize[1] - 30, paper_name)
+
+        # Footer line - 80% width centered
+        canvas.setStrokeColor(colors.black)
+        canvas.setLineWidth(0.5)
+        canvas.line(start_x, 40, start_x + header_footer_width, 40)
+
+        # Page number only (centered at bottom)
+        canvas.setFont(UNICODE_FONT, 10)
+        canvas.setFillColor(colors.black)
+        canvas.drawCentredString(doc.pagesize[0] / 2, 25, str(canvas.getPageNumber()))
+
+        canvas.restoreState()
+
+    def should_use_single_column(self, option_a, option_b, option_c, option_d, doc_width):
+        """Check if options should be displayed in single column to avoid overlap"""
+        max_option_length = max(len(str(option_a)), len(str(option_b)), len(str(option_c)), len(str(option_d)))
+        available_width_per_option = (doc_width / 2) - 20  # Account for padding
+
+        estimated_char_width = 6  # Approximate width per character in points
+        estimated_text_width = max_option_length * estimated_char_width
+
+        return estimated_text_width > (available_width_per_option * 0.4)
+
+    def can_images_fit_two_per_row(self, images, available_width):
+        """Check if two images can fit side by side"""
+        if len(images) < 2:
+            return False
+
+        total_width = images[0].drawWidth + images[1].drawWidth + 20
+        result = total_width < available_width
+
+        logging.debug(
+            f"Can images fit side by side? Image1={images[0].drawWidth:.1f}, Image2={images[1].drawWidth:.1f}, "
+            f"Total={total_width:.1f}, Available={available_width:.1f}, Result={result}"
+        )
+
+        return result
+
+    def layout_images_for_option(self, images, available_width, left_indent):
+        """Layout images for a single option - small images side by side, large ones stacked"""
+        if not images:
+            return []
+
+        layout_items = []
+
+        # If only one image
+        if len(images) == 1:
+            img_table = Table([["", images[0]]],
+                              colWidths=[left_indent, available_width])
+            img_table.setStyle(TableStyle([
+                ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ]))
+            layout_items.append(img_table)
+            return layout_items
+
+        # Try to layout images intelligently
+        i = 0
+        while i < len(images):
+            if i + 1 < len(images) and self.can_images_fit_two_per_row([images[i], images[i + 1]], available_width):
+                img1_width = images[i].drawWidth
+                img2_width = images[i + 1].drawWidth
+
+                spacing = 15
+                available_img_width = available_width - spacing
+                total_img_width = img1_width + img2_width
+
+                col1_width = (img1_width / total_img_width) * available_img_width
+                col2_width = (img2_width / total_img_width) * available_img_width
+
+                min_col_width = available_width * 0.3
+                if col1_width < min_col_width:
+                    col1_width = min_col_width
+                if col2_width < min_col_width:
+                    col2_width = min_col_width
+
+                image_row_table = Table(
+                    [["", images[i], Spacer(spacing, 15), images[i + 1]]],
+                    colWidths=[left_indent, col1_width, spacing, col2_width]
+                )
+                image_row_table.setStyle(TableStyle([
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                ]))
+                layout_items.append(image_row_table)
+                i += 2
+            else:
+                img_table = Table([["", images[i]]],
+                                  colWidths=[left_indent, available_width])
+                img_table.setStyle(TableStyle([
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+                ]))
+                layout_items.append(img_table)
+                i += 1
+
+        return layout_items
+
+    # ---------- NEW HELPERS FOR SIDE-BY-SIDE OPTION IMAGES ----------
+
+    def can_show_options_as_image_grid(self, option_data, available_width):
+        """
+        Decide if we should lay out options (A,B,C,D) as an image grid:
+        - at least two options must have images
+        - each such option has exactly 1 image
+        - no HTML tables in options
+        - both images in a row together fit in available_width
+        """
+        opts_with_images = [opt for opt in option_data if opt['images']]
+
+        if len(opts_with_images) < 2:
+            return False  # not worth grid layout
+
+        for opt in opts_with_images:
+            if len(opt['images']) != 1:
+                return False
+            if opt['tables'] is not None:
+                return False
+
+        max_img_width = max(opt['images'][0].drawWidth for opt in opts_with_images)
+        return (2 * max_img_width + 30) <= available_width
+
+    def build_option_image_grid(self, option_data, doc_width, left_indent, option_style):
+        """
+        Build a 2-column grid where options (A,B,C,D) are shown as:
+
+        (A) [image A]    (B) [image B]
+        (C) [image C]    (D) [image D]
+        """
+        available_width = doc_width - left_indent
+        col_width = available_width / 2.0
+
+        rows = []
+        i = 0
+        while i < len(option_data):
+            row_cells = []
+
+            for j in range(2):  # two options per row
+                idx = i + j
+                if idx >= len(option_data):
+                    row_cells.append("")
+                    continue
+
+                opt = option_data[idx]
+
+                elements = []
+                label_text = f"({opt['letter']})"
+                if opt['text'].strip():
+                    label_text += f" {opt['text']}"
+                elements.append(Paragraph(label_text, option_style))
+
+                if opt['images']:
+                    img = opt['images'][0]
+                    if img.drawWidth > col_width - 10:
+                        scale = (col_width - 10) / float(img.drawWidth)
+                        img.drawWidth *= scale
+                        img.drawHeight *= scale
+                    elements.append(Spacer(1, 4))
+                    elements.append(img)
+
+                inner_table = Table([[e] for e in elements],
+                                    colWidths=[col_width])
+                inner_table.setStyle(TableStyle([
+                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                    ('TOPPADDING', (0, 0), (-1, -1), 0),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 0),
+                ]))
+
+                row_cells.append(inner_table)
+
+            rows.append(row_cells)
+            i += 2
+
+        grid_table = Table(
+            [["", r[0], "", r[1]] for r in rows],
+            colWidths=[left_indent, col_width, 10, col_width]
+        )
+        grid_table.setStyle(TableStyle([
+            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+            ('TOPPADDING', (0, 0), (-1, -1), 2),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+        ]))
+
+        return grid_table
+
+    # --------------------------------------------------------------
+    #                 MAIN PDF CREATION LOGIC
+    # --------------------------------------------------------------
+
+    def process_questions(self, data):
+        """Process questions and group by paper"""
+        papers = {}
+
+        for row in data:
+            try:
+                folder = self.clean_name(row.get(COLUMN_FOLDER, 'Default_Folder'))
+                sub_folder = self.clean_name(row.get(COLUMN_SUB_FOLDER, 'General'))
+                file_name = self.clean_name(row.get(COLUMN_FILE_NAME, 'Default_Paper'))
+
+                paper_key = f"{folder}_{sub_folder}_{file_name}"
+
+                if paper_key not in papers:
+                    papers[paper_key] = {
+                        'folder': folder,
+                        'sub_folder': sub_folder,
+                        'file_name': file_name,
+                        'questions': []
+                    }
+
+                question = {
+                    'question_no': row.get(COLUMN_QUESTION_NO, ''),
+                    'question_text': row.get(COLUMN_QUESTION_TEXT, ''),
+                    'instructions': row.get(COLUMN_INSTRUCTIONS, ''),
+                    'option_a': row.get(COLUMN_OPTION_A, ''),
+                    'option_b': row.get(COLUMN_OPTION_B, ''),
+                    'option_c': row.get(COLUMN_OPTION_C, ''),
+                    'option_d': row.get(COLUMN_OPTION_D, ''),
+                    'correct_option': row.get(COLUMN_CORRECT_OPTION, ''),
+                    'explanation': row.get(COLUMN_EXPLANATION, ''),
+                    'content': row.get(COLUMN_CONTENT, ''),
+                    'question_image_url': row.get(COLUMN_QUESTION_IMAGE_URL, ''),
+                    'option_a_image_url': row.get(COLUMN_OPTION_A_IMAGE_URL, ''),
+                    'option_b_image_url': row.get(COLUMN_OPTION_B_IMAGE_URL, ''),
+                    'option_c_image_url': row.get(COLUMN_OPTION_C_IMAGE_URL, ''),
+                    'option_d_image_url': row.get(COLUMN_OPTION_D_IMAGE_URL, '')
+                }
+
+                papers[paper_key]['questions'].append(question)
+
+            except Exception as e:
+                logging.warning(f"Error processing row: {e}")
+                continue
+
+        return papers
+
+    def create_complete_pdf(self, questions, output_path, paper_name):
+        """Create complete PDF with questions, options, answers and explanations"""
+        try:
+            # Standard 1-inch margins all sides on Letter
+            doc = SimpleDocTemplate(
+                output_path,
+                pagesize=letter,
+                rightMargin=72,
+                leftMargin=72,
+                topMargin=72,
+                bottomMargin=72
+            )
+
+            styles = getSampleStyleSheet()
+
+            # ✅ Single consistent indent for all content blocks under question
+            QUESTION_INDENT = 40
+            OPTION_IMAGE_INDENT = QUESTION_INDENT
+            QNUM_COL_WIDTH = QUESTION_INDENT
+
+            # Styles
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontName=UNICODE_FONT_BOLD,
+                fontSize=16,
+                spaceAfter=20,
+                alignment=1,
+                textColor=colors.black
+            )
+
+            question_number_style = ParagraphStyle(
+                'QuestionNumberStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT_BOLD,
+                fontSize=12,
+                spaceAfter=0,
+                leading=14,
+                textColor=colors.black,
+                leftIndent=0
+            )
+
+            question_text_style = ParagraphStyle(
+                'QuestionTextStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT_BOLD,
+                fontSize=12,
+                leftIndent=0,
+                spaceAfter=12,
+                leading=14,
+                textColor=colors.black
+            )
+
+            # For labels/text that we now place inside tables, leftIndent is 0
+            instruction_label_style = ParagraphStyle(
+                'InstructionLabelStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT_BOLD,
+                fontSize=12,
+                leftIndent=0,
+                spaceAfter=0,
+                leading=14,
+                textColor=colors.black
+            )
+
+            instruction_text_style = ParagraphStyle(
+                'InstructionTextStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT,
+                fontSize=12,
+                leftIndent=0,
+                spaceAfter=8,
+                leading=14,
+                textColor=colors.black
+            )
+
+            option_style = ParagraphStyle(
+                'OptionStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT,
+                fontSize=12,
+                leftIndent=0,
+                spaceAfter=3,
+                leading=14,
+                textColor=colors.black
+            )
+
+            correct_answer_style = ParagraphStyle(
+                'CorrectAnswerStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT_BOLD,
+                fontSize=12,
+                textColor=colors.black,
+                spaceAfter=8,
+                leading=14,
+                leftIndent=0   # we'll indent using a table
+            )
+
+            explanation_label_style = ParagraphStyle(
+                'ExplanationLabelStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT_BOLD,
+                fontSize=12,
+                textColor=colors.black,
+                spaceAfter=0,
+                leading=14,
+                leftIndent=0
+            )
+
+            explanation_text_style = ParagraphStyle(
+                'ExplanationTextStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT,
+                fontSize=12,
+                textColor=colors.black,
+                spaceAfter=15,
+                leading=14,
+                leftIndent=0
+            )
+
+            story = []
+
+            # Title
+            title = Paragraph(f"{paper_name}", title_style)
+            story.append(title)
+            story.append(Spacer(1, 30))
+
+            for i, question in enumerate(questions, 1):
+                actual_question_no = question.get('question_no', i)
+                if not actual_question_no or str(actual_question_no).strip() == '':
+                    actual_question_no = i
+
+                question_text, question_tables = self.clean_text_with_tables(question['question_text'])
+
+                # ---- Instructions (indented using tables for alignment) ----
+                if question.get('instructions'):
+                    instr_text, instr_tables = self.clean_text_with_tables(question['instructions'])
+                    if instr_text and instr_text.strip():
+                        instr_label_para = Paragraph("<b>Instruction:</b>", instruction_label_style)
+                        instr_label_tbl = Table(
+                            [["", instr_label_para]],
+                            colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                        )
+                        instr_label_tbl.setStyle(TableStyle([
+                            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                        ]))
+                        story.append(instr_label_tbl)
+
+                        instr_para = Paragraph(instr_text, instruction_text_style)
+                        instr_tbl = Table(
+                            [["", instr_para]],
+                            colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                        )
+                        instr_tbl.setStyle(TableStyle([
+                            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                        ]))
+                        story.append(instr_tbl)
+
+                        if instr_tables:
+                            story.append(Spacer(1, 4))
+                            for table_data in instr_tables:
+                                table = self.create_table_from_html_data(table_data, doc.width - QUESTION_INDENT)
+                                if table:
+                                    indented_table = Table(
+                                        [["", table]],
+                                        colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                                    )
+                                    indented_table.setStyle(TableStyle([
+                                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                                    ]))
+                                    story.append(indented_table)
+
+                        story.append(Spacer(1, 8))
+
+                # ---- Question number + text ----
+                q_number = Paragraph(f"Q.{actual_question_no}", question_number_style)
+                q_text = Paragraph(question_text, question_text_style)
+                question_table = Table(
+                    [[q_number, q_text]],
+                    colWidths=[QNUM_COL_WIDTH, doc.width - QNUM_COL_WIDTH]
+                )
+                question_table.setStyle(TableStyle([
+                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                ]))
+                story.append(question_table)
+                story.append(Spacer(1, 6))
+
+                # ---- Question tables ----
+                if question_tables:
+                    for table_data in question_tables:
+                        table = self.create_table_from_html_data(table_data, doc.width - QUESTION_INDENT)
+                        if table:
+                            indented_table = Table(
+                                [["", table]],
+                                colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                            )
+                            indented_table.setStyle(TableStyle([
+                                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                            ]))
+                            story.append(indented_table)
+                    story.append(Spacer(1, 6))
+
+                # ---- Question images (aligned to QUESTION_INDENT) ----
+                question_image_urls = []
+                if question.get('question_image_url'):
+                    question_image_urls.extend(self.extract_urls_from_text(question['question_image_url']))
+                question_image_urls.extend(self.extract_urls_from_text(question['question_text']))
+
+                seen = set()
+                unique_urls = []
+                for url in question_image_urls:
+                    if url not in seen:
+                        seen.add(url)
+                        unique_urls.append(url)
+
+                question_images = self.fetch_images_from_urls(unique_urls)
+                if question_images:
+                    available_width = doc.width - QUESTION_INDENT
+                    question_image_layout = self.layout_images_for_option(
+                        question_images,
+                        available_width,
+                        QUESTION_INDENT
+                    )
+                    for layout_item in question_image_layout:
+                        story.append(layout_item)
+                        story.append(Spacer(1, 4))
+
+                # ---- Options ----
+                option_data = []
+                for option_key in ['option_a', 'option_b', 'option_c', 'option_d']:
+                    raw_text = question[option_key]
+                    clean_text, option_tables = self.clean_text_with_tables(raw_text)
+
+                    image_urls = []
+                    dedicated_url_col = f"{option_key}_image_url"
+                    if question.get(dedicated_url_col):
+                        image_urls.extend(self.extract_urls_from_text(question[dedicated_url_col]))
+                    image_urls.extend(self.extract_urls_from_text(raw_text))
+
+                    seen = set()
+                    unique_urls = []
+                    for url in image_urls:
+                        if url not in seen:
+                            seen.add(url)
+                            unique_urls.append(url)
+
+                    images = self.fetch_images_from_urls(unique_urls)
+
+                    option_data.append({
+                        'letter': option_key[-1].upper(),
+                        'text': clean_text,
+                        'images': images,
+                        'tables': option_tables
+                    })
+
+                opt_a_data, opt_b_data, opt_c_data, opt_d_data = option_data
+
+                has_images = any(len(opt['images']) > 0 for opt in option_data)
+                has_tables = any(opt['tables'] is not None for opt in option_data)
+
+                use_single = has_images or has_tables or self.should_use_single_column(
+                    opt_a_data['text'], opt_b_data['text'], opt_c_data['text'], opt_d_data['text'], doc.width
+                )
+
+                available_option_width = doc.width - QUESTION_INDENT
+
+                if use_single:
+                    if self.can_show_options_as_image_grid(option_data, available_option_width):
+                        grid = self.build_option_image_grid(
+                            option_data,
+                            doc.width,
+                            QUESTION_INDENT,
+                            option_style
+                        )
+                        story.append(grid)
+                        story.append(Spacer(1, 8))
+                    else:
+                        # Single-column, each option aligned by QUESTION_INDENT
+                        for opt_data in option_data:
+                            opt_text = f"({opt_data['letter']}) {opt_data['text']}" if opt_data['text'].strip() else f"({opt_data['letter']})"
+                            if opt_text:
+                                opt_para = Paragraph(opt_text, option_style)
+                                opt_tbl = Table(
+                                    [["", opt_para]],
+                                    colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                                )
+                                opt_tbl.setStyle(TableStyle([
+                                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                                ]))
+                                story.append(opt_tbl)
+
+                            if opt_data['tables']:
+                                for table_data in opt_data['tables']:
+                                    table = self.create_table_from_html_data(table_data, doc.width - OPTION_IMAGE_INDENT)
+                                    if table:
+                                        indented_table = Table(
+                                            [["", table]],
+                                            colWidths=[OPTION_IMAGE_INDENT, doc.width - OPTION_IMAGE_INDENT]
+                                        )
+                                        indented_table.setStyle(TableStyle([
+                                            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                                        ]))
+                                        story.append(indented_table)
+
+                            if opt_data['images']:
+                                available_width = doc.width - OPTION_IMAGE_INDENT
+                                option_image_layout = self.layout_images_for_option(
+                                    opt_data['images'],
+                                    available_width,
+                                    OPTION_IMAGE_INDENT
+                                )
+                                for layout_item in option_image_layout:
+                                    story.append(layout_item)
+
+                            if opt_data != option_data[-1]:
+                                story.append(Spacer(1, 6))
+                else:
+                    # Two-column text-only layout (both columns respect QUESTION_INDENT)
+                    data = []
+                    for row_num in range(2):
+                        row = []
+                        for col in range(2):
+                            option_index = row_num * 2 + col
+                            if option_index < len(option_data):
+                                opt_data = option_data[option_index]
+                                opt_text = f"({opt_data['letter']}) {opt_data['text']}"
+                                opt_para = Paragraph(opt_text, option_style)
+                                opt_cell_tbl = Table(
+                                    [["", opt_para]],
+                                    colWidths=[QUESTION_INDENT, doc.width * 0.45 - QUESTION_INDENT]
+                                )
+                                opt_cell_tbl.setStyle(TableStyle([
+                                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                                ]))
+                                row.append(opt_cell_tbl)
+                                row.append("")
+                            else:
+                                row.extend(["", ""])
+                        data.append(row)
+
+                    tbl = Table(data, colWidths=[doc.width * 0.45, doc.width * 0.05] * 2)
+                    tbl.setStyle(TableStyle([
+                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                        ('TOPPADDING', (0, 0), (-1, -1), 2),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                    ]))
+                    story.append(tbl)
+
+                story.append(Spacer(1, 8))
+
+                # ---- Correct answer (indented, aligned) ----
+                correct_option = question['correct_option']
+                if correct_option:
+                    correct_para = Paragraph(f"Correct Answer: {correct_option}", correct_answer_style)
+                    correct_tbl = Table(
+                        [["", correct_para]],
+                        colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                    )
+                    correct_tbl.setStyle(TableStyle([
+                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                    ]))
+                    story.append(correct_tbl)
+
+                # ---- Explanation (label + text + tables, all aligned) ----
+                if question.get('explanation'):
+                    expl_text, expl_tables = self.clean_text_with_tables(question['explanation'])
+                    if expl_text and expl_text.strip():
+                        expl_label_para = Paragraph("Explanation:", explanation_label_style)
+                        expl_label_tbl = Table(
+                            [["", expl_label_para]],
+                            colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                        )
+                        expl_label_tbl.setStyle(TableStyle([
+                            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                        ]))
+                        story.append(expl_label_tbl)
+
+                        expl_para = Paragraph(expl_text, explanation_text_style)
+                        expl_tbl = Table(
+                            [["", expl_para]],
+                            colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                        )
+                        expl_tbl.setStyle(TableStyle([
+                            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                        ]))
+                        story.append(expl_tbl)
+
+                        if expl_tables:
+                            for table_data in expl_tables:
+                                table = self.create_table_from_html_data(table_data, doc.width - QUESTION_INDENT)
+                                if table:
+                                    indented_table = Table(
+                                        [["", table]],
+                                        colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                                    )
+                                    indented_table.setStyle(TableStyle([
+                                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                                    ]))
+                                    story.append(indented_table)
+
+                story.append(Spacer(1, 15))
+
+                # Page break after every 5 questions
+                if i % 5 == 0:
+                    story.append(PageBreak())
+
+            # Build PDF
+            doc.build(
+                story,
+                onFirstPage=lambda canvas, doc: self.add_header_footer(canvas, doc, paper_name),
+                onLaterPages=lambda canvas, doc: self.add_header_footer(canvas, doc, paper_name)
+            )
+            logging.info(f"Complete PDF created successfully: {output_path}")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to create complete PDF: {e}")
+            return False
+
+    def create_questions_only_pdf(self, questions, output_path, paper_name):
+        """Create PDF with questions only (no answers or explanations)"""
+        try:
+            # Standard 1-inch margins all sides on Letter
+            doc = SimpleDocTemplate(
+                output_path,
+                pagesize=letter,
+                rightMargin=72,
+                leftMargin=72,
+                topMargin=72,
+                bottomMargin=72
+            )
+
+            styles = getSampleStyleSheet()
+
+            # ✅ Single consistent indent for all content blocks under question
+            QUESTION_INDENT = 40
+            OPTION_IMAGE_INDENT = QUESTION_INDENT
+            QNUM_COL_WIDTH = QUESTION_INDENT
+
+            # Styles (similar to create_complete_pdf but without answer-related styles)
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontName=UNICODE_FONT_BOLD,
+                fontSize=16,
+                spaceAfter=20,
+                alignment=1,
+                textColor=colors.black
+            )
+
+            question_number_style = ParagraphStyle(
+                'QuestionNumberStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT_BOLD,
+                fontSize=12,
+                spaceAfter=0,
+                leading=14,
+                textColor=colors.black,
+                leftIndent=0
+            )
+
+            question_text_style = ParagraphStyle(
+                'QuestionTextStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT_BOLD,
+                fontSize=12,
+                leftIndent=0,
+                spaceAfter=12,
+                leading=14,
+                textColor=colors.black
+            )
+
+            instruction_label_style = ParagraphStyle(
+                'InstructionLabelStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT_BOLD,
+                fontSize=12,
+                leftIndent=0,
+                spaceAfter=0,
+                leading=14,
+                textColor=colors.black
+            )
+
+            instruction_text_style = ParagraphStyle(
+                'InstructionTextStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT,
+                fontSize=12,
+                leftIndent=0,
+                spaceAfter=8,
+                leading=14,
+                textColor=colors.black
+            )
+
+            option_style = ParagraphStyle(
+                'OptionStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT,
+                fontSize=12,
+                leftIndent=0,
+                spaceAfter=3,
+                leading=14,
+                textColor=colors.black
+            )
+
+            story = []
+
+            # Title
+            title = Paragraph(f"{paper_name} - Questions Only", title_style)
+            story.append(title)
+            story.append(Spacer(1, 30))
+
+            for i, question in enumerate(questions, 1):
+                actual_question_no = question.get('question_no', i)
+                if not actual_question_no or str(actual_question_no).strip() == '':
+                    actual_question_no = i
+
+                question_text, question_tables = self.clean_text_with_tables(question['question_text'])
+
+                # ---- Instructions ----
+                if question.get('instructions'):
+                    instr_text, instr_tables = self.clean_text_with_tables(question['instructions'])
+                    if instr_text and instr_text.strip():
+                        instr_label_para = Paragraph("<b>Instruction:</b>", instruction_label_style)
+                        instr_label_tbl = Table(
+                            [["", instr_label_para]],
+                            colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                        )
+                        instr_label_tbl.setStyle(TableStyle([
+                            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                        ]))
+                        story.append(instr_label_tbl)
+
+                        instr_para = Paragraph(instr_text, instruction_text_style)
+                        instr_tbl = Table(
+                            [["", instr_para]],
+                            colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                        )
+                        instr_tbl.setStyle(TableStyle([
+                            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                        ]))
+                        story.append(instr_tbl)
+
+                        if instr_tables:
+                            story.append(Spacer(1, 4))
+                            for table_data in instr_tables:
+                                table = self.create_table_from_html_data(table_data, doc.width - QUESTION_INDENT)
+                                if table:
+                                    indented_table = Table(
+                                        [["", table]],
+                                        colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                                    )
+                                    indented_table.setStyle(TableStyle([
+                                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                        ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                                    ]))
+                                    story.append(indented_table)
+
+                        story.append(Spacer(1, 8))
+
+                # ---- Question number + text ----
+                q_number = Paragraph(f"Q.{actual_question_no}", question_number_style)
+                q_text = Paragraph(question_text, question_text_style)
+                question_table = Table(
+                    [[q_number, q_text]],
+                    colWidths=[QNUM_COL_WIDTH, doc.width - QNUM_COL_WIDTH]
+                )
+                question_table.setStyle(TableStyle([
+                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                ]))
+                story.append(question_table)
+                story.append(Spacer(1, 6))
+
+                # ---- Question tables ----
+                if question_tables:
+                    for table_data in question_tables:
+                        table = self.create_table_from_html_data(table_data, doc.width - QUESTION_INDENT)
+                        if table:
+                            indented_table = Table(
+                                [["", table]],
+                                colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                            )
+                            indented_table.setStyle(TableStyle([
+                                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                            ]))
+                            story.append(indented_table)
+                    story.append(Spacer(1, 6))
+
+                # ---- Question images ----
+                question_image_urls = []
+                if question.get('question_image_url'):
+                    question_image_urls.extend(self.extract_urls_from_text(question['question_image_url']))
+                question_image_urls.extend(self.extract_urls_from_text(question['question_text']))
+
+                seen = set()
+                unique_urls = []
+                for url in question_image_urls:
+                    if url not in seen:
+                        seen.add(url)
+                        unique_urls.append(url)
+
+                question_images = self.fetch_images_from_urls(unique_urls)
+                if question_images:
+                    available_width = doc.width - QUESTION_INDENT
+                    question_image_layout = self.layout_images_for_option(
+                        question_images,
+                        available_width,
+                        QUESTION_INDENT
+                    )
+                    for layout_item in question_image_layout:
+                        story.append(layout_item)
+                        story.append(Spacer(1, 4))
+
+                # ---- Options ----
+                option_data = []
+                for option_key in ['option_a', 'option_b', 'option_c', 'option_d']:
+                    raw_text = question[option_key]
+                    clean_text, option_tables = self.clean_text_with_tables(raw_text)
+
+                    image_urls = []
+                    dedicated_url_col = f"{option_key}_image_url"
+                    if question.get(dedicated_url_col):
+                        image_urls.extend(self.extract_urls_from_text(question[dedicated_url_col]))
+                    image_urls.extend(self.extract_urls_from_text(raw_text))
+
+                    seen = set()
+                    unique_urls = []
+                    for url in image_urls:
+                        if url not in seen:
+                            seen.add(url)
+                            unique_urls.append(url)
+
+                    images = self.fetch_images_from_urls(unique_urls)
+
+                    option_data.append({
+                        'letter': option_key[-1].upper(),
+                        'text': clean_text,
+                        'images': images,
+                        'tables': option_tables
+                    })
+
+                opt_a_data, opt_b_data, opt_c_data, opt_d_data = option_data
+
+                has_images = any(len(opt['images']) > 0 for opt in option_data)
+                has_tables = any(opt['tables'] is not None for opt in option_data)
+
+                use_single = has_images or has_tables or self.should_use_single_column(
+                    opt_a_data['text'], opt_b_data['text'], opt_c_data['text'], opt_d_data['text'], doc.width
+                )
+
+                available_option_width = doc.width - QUESTION_INDENT
+
+                if use_single:
+                    if self.can_show_options_as_image_grid(option_data, available_option_width):
+                        grid = self.build_option_image_grid(
+                            option_data,
+                            doc.width,
+                            QUESTION_INDENT,
+                            option_style
+                        )
+                        story.append(grid)
+                        story.append(Spacer(1, 8))
+                    else:
+                        # Single-column, each option aligned by QUESTION_INDENT
+                        for opt_data in option_data:
+                            opt_text = f"({opt_data['letter']}) {opt_data['text']}" if opt_data['text'].strip() else f"({opt_data['letter']})"
+                            if opt_text:
+                                opt_para = Paragraph(opt_text, option_style)
+                                opt_tbl = Table(
+                                    [["", opt_para]],
+                                    colWidths=[QUESTION_INDENT, doc.width - QUESTION_INDENT]
+                                )
+                                opt_tbl.setStyle(TableStyle([
+                                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                                ]))
+                                story.append(opt_tbl)
+
+                            if opt_data['tables']:
+                                for table_data in opt_data['tables']:
+                                    table = self.create_table_from_html_data(table_data, doc.width - OPTION_IMAGE_INDENT)
+                                    if table:
+                                        indented_table = Table(
+                                            [["", table]],
+                                            colWidths=[OPTION_IMAGE_INDENT, doc.width - OPTION_IMAGE_INDENT]
+                                        )
+                                        indented_table.setStyle(TableStyle([
+                                            ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                            ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                            ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                                        ]))
+                                        story.append(indented_table)
+
+                            if opt_data['images']:
+                                available_width = doc.width - OPTION_IMAGE_INDENT
+                                option_image_layout = self.layout_images_for_option(
+                                    opt_data['images'],
+                                    available_width,
+                                    OPTION_IMAGE_INDENT
+                                )
+                                for layout_item in option_image_layout:
+                                    story.append(layout_item)
+
+                            if opt_data != option_data[-1]:
+                                story.append(Spacer(1, 6))
+                else:
+                    # Two-column text-only layout
+                    data = []
+                    for row_num in range(2):
+                        row = []
+                        for col in range(2):
+                            option_index = row_num * 2 + col
+                            if option_index < len(option_data):
+                                opt_data = option_data[option_index]
+                                opt_text = f"({opt_data['letter']}) {opt_data['text']}"
+                                opt_para = Paragraph(opt_text, option_style)
+                                opt_cell_tbl = Table(
+                                    [["", opt_para]],
+                                    colWidths=[QUESTION_INDENT, doc.width * 0.45 - QUESTION_INDENT]
+                                )
+                                opt_cell_tbl.setStyle(TableStyle([
+                                    ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                    ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                    ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                                ]))
+                                row.append(opt_cell_tbl)
+                                row.append("")
+                            else:
+                                row.extend(["", ""])
+                        data.append(row)
+
+                    tbl = Table(data, colWidths=[doc.width * 0.45, doc.width * 0.05] * 2)
+                    tbl.setStyle(TableStyle([
+                        ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                        ('ALIGN', (0, 0), (-1, -1), 'LEFT'),
+                        ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                        ('RIGHTPADDING', (0, 0), (-1, -1), 0),
+                        ('TOPPADDING', (0, 0), (-1, -1), 2),
+                        ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                    ]))
+                    story.append(tbl)
+
+                story.append(Spacer(1, 15))
+
+                # Page break after every 5 questions
+                if i % 5 == 0:
+                    story.append(PageBreak())
+
+            # Build PDF
+            doc.build(
+                story,
+                onFirstPage=lambda canvas, doc: self.add_header_footer(canvas, doc, f"{paper_name} - Questions"),
+                onLaterPages=lambda canvas, doc: self.add_header_footer(canvas, doc, f"{paper_name} - Questions")
+            )
+            logging.info(f"Questions Only PDF created successfully: {output_path}")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to create questions only PDF: {e}")
+            return False
+
+    def create_answers_only_pdf(self, questions, output_path, paper_name):
+        """Create PDF with correct answers only in 4-column table format"""
+        try:
+            # Standard 1-inch margins all sides on Letter
+            doc = SimpleDocTemplate(
+                output_path,
+                pagesize=letter,
+                rightMargin=72,
+                leftMargin=72,
+                topMargin=72,
+                bottomMargin=72
+            )
+
+            styles = getSampleStyleSheet()
+
+            # Styles
+            title_style = ParagraphStyle(
+                'CustomTitle',
+                parent=styles['Heading1'],
+                fontName=UNICODE_FONT_BOLD,
+                fontSize=16,
+                spaceAfter=20,
+                alignment=1,
+                textColor=colors.black
+            )
+
+            header_style = ParagraphStyle(
+                'HeaderStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT_BOLD,
+                fontSize=12,
+                textColor=colors.black,
+                alignment=1,
+                spaceAfter=6
+            )
+
+            cell_style = ParagraphStyle(
+                'CellStyle',
+                parent=styles['Normal'],
+                fontName=UNICODE_FONT,
+                fontSize=11,
+                textColor=colors.black,
+                alignment='LEFT',
+                leftIndent=4
+            )
+
+            story = []
+
+            # Title
+            title = Paragraph(f"{paper_name} - Correct Answers", title_style)
+            story.append(title)
+            story.append(Spacer(1, 20))
+
+            # Prepare data for the table
+            table_data = []
+            
+            # Add header row
+            header_row = ["Question", "Answer", "Question", "Answer", 
+                         "Question", "Answer", "Question", "Answer"]
+            table_data.append(header_row)
+            
+            # Group questions into rows of 4 questions each
+            num_questions = len(questions)
+            for i in range(0, num_questions, 4):
+                row = []
+                for j in range(4):
+                    question_idx = i + j
+                    if question_idx < num_questions:
+                        question = questions[question_idx]
+                        actual_question_no = question.get('question_no', question_idx + 1)
+                        if not actual_question_no or str(actual_question_no).strip() == '':
+                            actual_question_no = question_idx + 1
+                        
+                        correct_option = question.get('correct_option', '')
+                        if not correct_option:
+                            correct_option = 'N/A'
+                        
+                        # Add question number and correct option in pairs
+                        row.append(f"Q.{actual_question_no}")
+                        row.append(str(correct_option))
+                    else:
+                        # Empty cells for remaining columns
+                        row.append("")
+                        row.append("")
+                
+                table_data.append(row)
+
+            # Calculate column widths - 4 columns, each 25% width
+            total_width = doc.width
+            col_width = total_width / 8  # 8 columns because each question has 2 cells (Q.No and Answer)
+            col_widths = [col_width] * 8
+
+            # Create the table
+            table = Table(table_data, colWidths=col_widths)
+            
+            # Apply table styling
+            table.setStyle(TableStyle([
+                # Header row styling
+                ('BACKGROUND', (0, 0), (7, 0), colors.lightgrey),
+                ('TEXTCOLOR', (0, 0), (7, 0), colors.black),
+                ('ALIGN', (0, 0), (7, 0), 'CENTER'),
+                ('FONTNAME', (0, 0), (7, 0), UNICODE_FONT_BOLD),
+                ('FONTSIZE', (0, 0), (7, 0), 11),
+                ('BOTTOMPADDING', (0, 0), (7, 0), 8),
+                ('TOPPADDING', (0, 0), (7, 0), 8),
+                
+                # Alternating row colors
+                ('ROWBACKGROUNDS', (0, 1), (-1, -1), [colors.white, colors.whitesmoke]),
+                
+                # Grid lines
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.grey),
+                
+                # Cell alignment - Question numbers centered, answers left aligned
+                ('ALIGN', (0, 1), (-1, -1), 'CENTER'),  # All cells centered
+                ('ALIGN', (1, 1), (1, -1), 'CENTER'),   # Column 1 (answers) centered
+                ('ALIGN', (3, 1), (3, -1), 'CENTER'),   # Column 3 (answers) centered
+                ('ALIGN', (5, 1), (5, -1), 'CENTER'),   # Column 5 (answers) centered
+                ('ALIGN', (7, 1), (7, -1), 'CENTER'),   # Column 7 (answers) centered
+                
+                # Cell padding
+                ('LEFTPADDING', (0, 0), (-1, -1), 6),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+                
+                # Font for data cells
+                ('FONTNAME', (0, 1), (-1, -1), UNICODE_FONT),
+                ('FONTSIZE', (0, 1), (-1, -1), 10),
+            ]))
+
+            story.append(table)
+            story.append(Spacer(1, 20))
+
+            # Build PDF
+            doc.build(
+                story,
+                onFirstPage=lambda canvas, doc: self.add_header_footer(canvas, doc, f"{paper_name} - Answer Key"),
+                onLaterPages=lambda canvas, doc: self.add_header_footer(canvas, doc, f"{paper_name} - Answer Key")
+            )
+            logging.info(f"Answers Only PDF created successfully: {output_path}")
+            return True
+
+        except Exception as e:
+            logging.error(f"Failed to create answers only PDF: {e}")
+            return False
+
+
+def main():
+    # Configuration
+    CREDENTIALS_FILE = "service-account.json"
+    SPREADSHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+    WORKSHEET_NAME = "Sheet5"
+    OUTPUT_DIR = "Generated_PDFs"
+
+    os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+    try:
+        pdf_gen = PDFGenerator(CREDENTIALS_FILE)
+
+        data = pdf_gen.load_data_from_sheets(SPREADSHEET_ID, WORKSHEET_NAME)
+
+        papers = pdf_gen.process_questions(data)
+        logging.info(f"Found {len(papers)} papers to process")
+
+        results = []
+
+        for paper_key, paper_info in papers.items():
+            try:
+                paper_name = paper_info['file_name']
+                questions = paper_info['questions']
+                folder = paper_info['folder']
+                sub_folder = paper_info['sub_folder']
+
+                logging.info(f"Processing: {paper_name} ({len(questions)} questions)")
+
+                local_folder_path = pdf_gen.create_folder_structure(OUTPUT_DIR, folder, sub_folder)
+
+                safe_name = "".join(c for c in paper_name if c.isalnum() or c in (' ', '-', '_')).rstrip()
+
+                pdf_files = {
+                    'complete': os.path.join(local_folder_path, f"{safe_name}_Complete_Solutions.pdf"),
+                    'questions_only': os.path.join(local_folder_path, f"{safe_name}_Questions.pdf"),
+                    'answers_only': os.path.join(local_folder_path, f"{safe_name}_Correct_Answers.pdf")
+                }
+
+                pdf_results = {}
+
+                # Create Complete PDF
+                if pdf_gen.create_complete_pdf(questions, pdf_files['complete'], paper_name):
+                    pdf_results['complete'] = pdf_files['complete']
+                    logging.info(f"✓ Complete PDF created: {pdf_files['complete']}")
+                else:
+                    pdf_results['complete'] = None
+                    logging.error(f"✗ Failed to create complete PDF")
+
+                # Create Questions Only PDF
+                if pdf_gen.create_questions_only_pdf(questions, pdf_files['questions_only'], paper_name):
+                    pdf_results['questions_only'] = pdf_files['questions_only']
+                    logging.info(f"✓ Questions Only PDF created: {pdf_files['questions_only']}")
+                else:
+                    pdf_results['questions_only'] = None
+                    logging.error(f"✗ Failed to create questions only PDF")
+
+                # Create Answers Only PDF
+                if pdf_gen.create_answers_only_pdf(questions, pdf_files['answers_only'], paper_name):
+                    pdf_results['answers_only'] = pdf_files['answers_only']
+                    logging.info(f"✓ Answers Only PDF created: {pdf_files['answers_only']}")
+                else:
+                    pdf_results['answers_only'] = None
+                    logging.error(f"✗ Failed to create answers only PDF")
+
+                result = {
+                    'paper_name': paper_name,
+                    'folder': folder,
+                    'sub_folder': sub_folder,
+                    'questions_count': len(questions),
+                    'complete_pdf': pdf_results['complete'],
+                    'questions_pdf': pdf_results['questions_only'],
+                    'answers_pdf': pdf_results['answers_only'],
+                    'status': 'Success'
+                }
+                results.append(result)
+
+                logging.info(f"Successfully processed: {paper_name}")
+
+            except Exception as e:
+                logging.error(f"Failed to process paper {paper_key}: {e}")
+                result = {
+                    'paper_name': paper_key,
+                    'folder': '',
+                    'sub_folder': '',
+                    'questions_count': 0,
+                    'complete_pdf': '',
+                    'questions_pdf': '',
+                    'answers_pdf': '',
+                    'status': f'Failed - {str(e)}'
+                }
+                results.append(result)
+
+        report_df = pd.DataFrame(results)
+        report_path = os.path.join(OUTPUT_DIR, "Processing_Report.csv")
+        report_df.to_csv(report_path, index=False)
+        logging.info(f"Results saved to: {report_path}")
+
+        successful = len([r for r in results if r['status'] == 'Success'])
+        total = len(results)
+
+        print("\n" + "=" * 60)
+        print("PDF GENERATION COMPLETE!")
+        print("=" * 60)
+        print(f"Successfully processed: {successful}/{total} papers")
+        print("Standard 1-inch margins and aligned question blocks applied.")
+        print(f"\nPDFs saved to: {OUTPUT_DIR}")
+        print("All done!")
+
+    except Exception as e:
+        logging.error(f"Main process failed: {e}")
+        raise
+
+
+if __name__ == "__main__":
+    main()
