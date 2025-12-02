@@ -1,0 +1,375 @@
+import cv2
+import numpy as np
+import os
+import csv
+from collections import defaultdict
+import traceback
+
+# ======================================
+# ✅ CORRECT PATHS
+# ======================================
+INPUT_ROOT  = r"C:\Users\menha\Downloads\test\A\B"
+OUTPUT_ROOT = r"C:\Users\menha\Downloads\test\A\B\images1"
+CSV_PATH    = r"C:\Users\menha\Downloads\input.csv"
+DEBUG_DIR   = r"C:\Users\menha\Downloads\test\debug"
+
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+min_area = 3500
+
+def crop_header_footer(img):
+    h, w, _ = img.shape
+    top = int(0.06 * h)
+    bottom = int(0.95 * h)
+    return img[top:bottom, :]
+
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+    yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    union = boxA[2]*boxA[3] + boxB[2]*boxB[3] - inter
+    return inter / union if union != 0 else 0
+
+def non_max_suppression(boxes, thresh=0.45):
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: b[2]*b[3], reverse=True)
+    final = []
+    while boxes:
+        best = boxes.pop(0)
+        final.append(best)
+        boxes = [b for b in boxes if iou(best, b) < thresh]
+    return final
+
+def pad_box(x, y, w, h, img_w, img_h, pad_ratio=0.10):
+    px = int(w * pad_ratio)
+    py = int(h * pad_ratio)
+    x0 = max(0, x - px)
+    y0 = max(0, y - py)
+    x1 = min(img_w, x + w + px)
+    y1 = min(img_h, y + h + py)
+    return x0, y0, x1 - x0, y1 - y0
+
+def is_text_like(crop, threshold=0.20):
+    if crop.size == 0:
+        return True
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 60, 160)
+    density = np.sum(edges > 0) / edges.size
+    return density > threshold
+
+def visualize_page_detection(page_cropped, boxes, questions, page_no, save_dir):
+    """Visualize detected boxes and question positions for debugging"""
+    debug_img = page_cropped.copy()
+    
+    # Draw all detected boxes
+    for i, (x, y, w, h) in enumerate(boxes):
+        cv2.rectangle(debug_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        cv2.putText(debug_img, f"Box {i}", (x, y-10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    
+    # Draw estimated question positions
+    H, W = page_cropped.shape[:2]
+    for i, (question_num, _, _) in enumerate(questions):
+        estimated_y = int((H / len(questions)) * (i + 0.5))
+        cv2.line(debug_img, (0, estimated_y), (W, estimated_y), (255, 0, 0), 2)
+        cv2.putText(debug_img, f"Q{question_num}", (10, estimated_y-10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    
+    debug_path = os.path.join(save_dir, f"debug_page_{page_no}.png")
+    cv2.imwrite(debug_path, debug_img)
+    print(f"   📊 Debug visualization saved: {debug_path}")
+    return debug_path
+
+def extract_images_from_page(page_cropped, boxes, questions, save_dir, folder, subfolder, page_no):
+    """Extract images using improved matching logic"""
+    H, W = page_cropped.shape[:2]
+    questions_sorted = sorted(questions, key=lambda x: x[0])
+    boxes_sorted = sorted(boxes, key=lambda b: b[1])  # Sort by y-coordinate
+    
+    print(f"   📦 Processing {len(boxes_sorted)} boxes for {len(questions_sorted)} questions")
+    
+    # If we have exactly one box per question, use direct matching
+    if len(boxes_sorted) == len(questions_sorted):
+        print(f"   ✅ Direct 1:1 matching")
+        for i, ((_, question_no_str, image_name), box) in enumerate(zip(questions_sorted, boxes_sorted)):
+            x, y, w, h = box
+            crop = page_cropped[y:y + h, x:x + w]
+            
+            if is_text_like(crop):
+                print(f"   ⚠️  Box {i} for Q{question_no_str} looks like text")
+                continue
+            
+            if not os.path.splitext(image_name)[1]:
+                image_name += ".png"
+            
+            out_path = os.path.join(save_dir, image_name)
+            cv2.imwrite(out_path, crop)
+            print(f"   ✅ Q{question_no_str} → {image_name}")
+        return True
+    
+    # If we have more boxes than questions, we need to filter and match
+    print(f"   🔍 Need to match {len(boxes_sorted)} boxes to {len(questions_sorted)} questions")
+    
+    # First, filter out text-like boxes
+    image_boxes = []
+    for i, box in enumerate(boxes_sorted):
+        x, y, w, h = box
+        crop = page_cropped[y:y + h, x:x + w]
+        if not is_text_like(crop):
+            image_boxes.append((i, box, crop))
+    
+    print(f"   📊 After filtering text: {len(image_boxes)} image-like boxes")
+    
+    # If we still have more boxes than questions, use size and position heuristics
+    if len(image_boxes) >= len(questions_sorted):
+        # Sort boxes by size (largest first) and take top N
+        image_boxes_sorted = sorted(image_boxes, key=lambda b: b[1][2]*b[1][3], reverse=True)
+        top_boxes = image_boxes_sorted[:len(questions_sorted)]
+        
+        # Sort top boxes by y-coordinate
+        top_boxes_sorted = sorted(top_boxes, key=lambda b: b[1][1])
+        
+        for i, ((_, question_no_str, image_name), (orig_idx, box, _)) in enumerate(zip(questions_sorted, top_boxes_sorted)):
+            x, y, w, h = box
+            crop = page_cropped[y:y + h, x:x + w]
+            
+            if not os.path.splitext(image_name)[1]:
+                image_name += ".png"
+            
+            out_path = os.path.join(save_dir, image_name)
+            cv2.imwrite(out_path, crop)
+            print(f"   ✅ Q{question_no_str} → {image_name} (box {orig_idx})")
+        return True
+    
+    # If we have fewer image boxes than questions
+    print(f"   ⚠️  Only {len(image_boxes)} suitable image boxes found for {len(questions_sorted)} questions")
+    
+    # Match available boxes to questions based on position
+    for i, (orig_idx, box, _) in enumerate(image_boxes):
+        if i < len(questions_sorted):
+            _, question_no_str, image_name = questions_sorted[i]
+            x, y, w, h = box
+            crop = page_cropped[y:y + h, x:x + w]
+            
+            if not os.path.splitext(image_name)[1]:
+                image_name += ".png"
+            
+            out_path = os.path.join(save_dir, image_name)
+            cv2.imwrite(out_path, crop)
+            print(f"   ✅ Q{question_no_str} → {image_name} (box {orig_idx})")
+    
+    return len(image_boxes) > 0
+
+# ======================================
+# ✅ LOAD CSV - GROUP BY PAGE
+# ======================================
+page_groups = defaultdict(list)
+
+try:
+    with open(CSV_PATH, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        print("\n✅ CSV HEADERS FOUND:", reader.fieldnames)
+        
+        required_fields = ["folder", "sub_folder", "page_no", "question_no", "image name"]
+        if not all(field in reader.fieldnames for field in required_fields):
+            print(f"❌ Missing required fields in CSV")
+            print(f"   Required: {required_fields}")
+            print(f"   Found: {reader.fieldnames}")
+            exit(1)
+
+        for row_num, row in enumerate(reader, 1):
+            try:
+                key = (
+                    row["folder"].strip(),
+                    row["sub_folder"].strip(),
+                    row["page_no"].strip()
+                )
+                question_no = row["question_no"].strip()
+                image_name = row["image name"].strip()
+                
+                # Validate data
+                if not question_no or not image_name:
+                    print(f"⚠️  Row {row_num}: Missing question_no or image name")
+                    continue
+                    
+                # Convert question_no to integer for sorting, keep original for display
+                try:
+                    question_num = int(question_no)
+                except ValueError:
+                    print(f"⚠️  Row {row_num}: Invalid question number '{question_no}', using 999")
+                    question_num = 999
+                
+                page_groups[key].append((question_num, question_no, image_name))
+                
+            except Exception as e:
+                print(f"❌ Error processing row {row_num}: {e}")
+                continue
+
+except Exception as e:
+    print(f"❌ Error reading CSV: {e}")
+    traceback.print_exc()
+    exit(1)
+
+print(f"\n✅ Loaded {sum(len(v) for v in page_groups.values())} images from CSV")
+print(f"✅ Found {len(page_groups)} unique pages")
+
+# Sort pages by page number for consistent processing
+sorted_pages = sorted(page_groups.items(), key=lambda x: (
+    x[0][0],  # folder
+    x[0][1],  # subfolder
+    int(x[0][2]) if x[0][2].isdigit() else 999  # page_no as integer
+))
+
+# ======================================
+# ✅ PAGE FINDER
+# ======================================
+def find_page_image(folder_path, page_no):
+    page_no = str(page_no).strip().lstrip("0")
+    
+    # Try multiple naming patterns
+    patterns = [
+        f"page_{page_no}.png",
+        f"page_{page_no}.jpg",
+        f"page_{page_no}.jpeg",
+        f"Page_{page_no}.png",
+        f"page{page_no}.png",
+        f"{page_no}.png"
+    ]
+    
+    if not os.path.isdir(folder_path):
+        print(f"❌ Folder not found: {folder_path}")
+        return None
+    
+    files = os.listdir(folder_path)
+    
+    for pattern in patterns:
+        for fname in files:
+            if fname.lower() == pattern.lower():
+                return os.path.join(folder_path, fname)
+    
+    print(f"   🔍 Page {page_no} not found in {folder_path}")
+    print(f"   📂 Available files: {files[:10]}")  # Show first 10 files
+    return None
+
+# ======================================
+# ✅ MAIN EXTRACTION WITH ERROR HANDLING
+# ======================================
+successful_pages = 0
+failed_pages = []
+
+for (folder, subfolder, page_no_str), questions in sorted_pages:
+    print(f"\n{'='*60}")
+    print(f"📄 Processing: Folder={folder}, Sub={subfolder}, Page={page_no_str}")
+    print(f"   Questions: {[q[1] for q in sorted(questions, key=lambda x: x[0])]}")
+    
+    try:
+        page_file = find_page_image(INPUT_ROOT, page_no_str)
+        
+        if not page_file:
+            print(f"❌ Page not found")
+            failed_pages.append((folder, subfolder, page_no_str, "Page file not found"))
+            continue
+        
+        page = cv2.imread(page_file)
+        if page is None:
+            print(f"❌ Failed to load image: {page_file}")
+            failed_pages.append((folder, subfolder, page_no_str, "Failed to load image"))
+            continue
+        
+        print(f"   ✅ Loaded page: {os.path.basename(page_file)} ({page.shape[1]}x{page.shape[0]})")
+        
+        page_cropped = crop_header_footer(page)
+        H, W = page_cropped.shape[:2]
+        print(f"   📐 Cropped size: {W}x{H}")
+        
+        # Try multiple preprocessing methods
+        gray = cv2.cvtColor(page_cropped, cv2.COLOR_BGR2GRAY)
+        
+        # Method 1: Adaptive threshold
+        th1 = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            17, 3
+        )
+        
+        # Method 2: Canny edges
+        edges = cv2.Canny(gray, 60, 160)
+        
+        # Method 3: Simple threshold (for different image types)
+        _, th2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        # Combine methods
+        combined = cv2.bitwise_or(th1, edges)
+        combined = cv2.bitwise_or(combined, th2)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 4))
+        dilated = cv2.dilate(combined, kernel, iterations=2)
+        
+        # Try different contour retrieval modes
+        contours1, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours2, _ = cv2.findContours(dilated, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        
+        # Use the method that finds more contours
+        contours = contours1 if len(contours1) > len(contours2) else contours2
+        
+        print(f"   🔍 Found {len(contours)} contours")
+        
+        raw_boxes = []
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = w * h
+            aspect = w / h if h != 0 else 0
+            
+            # More lenient criteria for page 2
+            if page_no_str == "2":
+                if area > 2000 and 60 < w < 2500 and 60 < h < 1800 and 0.1 < aspect < 10.0:
+                    x, y, w, h = pad_box(x, y, w, h, W, H)
+                    raw_boxes.append((x, y, w, h))
+            else:
+                if area > min_area and 80 < w < 2200 and 80 < h < 1600 and 0.15 < aspect < 7.0:
+                    x, y, w, h = pad_box(x, y, w, h, W, H)
+                    raw_boxes.append((x, y, w, h))
+        
+        boxes = non_max_suppression(raw_boxes)
+        print(f"   📦 After NMS: {len(boxes)} boxes")
+        
+        # Create save directory
+        save_dir = os.path.join(OUTPUT_ROOT, folder, subfolder)
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Visualize for debugging
+        debug_path = visualize_page_detection(page_cropped, boxes, questions, page_no_str, DEBUG_DIR)
+        
+        # Extract images
+        success = extract_images_from_page(page_cropped, boxes, questions, save_dir, folder, subfolder, page_no_str)
+        
+        if success:
+            successful_pages += 1
+            print(f"   ✅ Page {page_no_str} processed successfully")
+        else:
+            failed_pages.append((folder, subfolder, page_no_str, "No images extracted"))
+            print(f"   ⚠️  No images extracted from page {page_no_str}")
+            
+    except Exception as e:
+        print(f"❌ Error processing page {page_no_str}: {e}")
+        traceback.print_exc()
+        failed_pages.append((folder, subfolder, page_no_str, f"Error: {str(e)}"))
+
+print(f"\n{'='*60}")
+print("🎯 EXTRACTION SUMMARY")
+print(f"{'='*60}")
+print(f"✅ Successful pages: {successful_pages}/{len(sorted_pages)}")
+print(f"❌ Failed pages: {len(failed_pages)}")
+
+if failed_pages:
+    print("\nFailed pages:")
+    for folder, subfolder, page, reason in failed_pages:
+        print(f"  - {folder}/{subfolder}/page {page}: {reason}")
+
+print(f"\n📂 Output base folder: {OUTPUT_ROOT}")
+print(f"🐛 Debug visualizations: {DEBUG_DIR}")
