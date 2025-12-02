@@ -1,0 +1,127 @@
+import re
+import csv
+import gspread
+from google.oauth2.service_account import Credentials
+
+# ============================================
+# GOOGLE SHEET DETAILS
+# ============================================
+SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+SHEET_NAME = "Sheet4"
+
+# ============================================
+# SERVICE ACCOUNT FILE
+# ============================================
+SERVICE_ACCOUNT_FILE = r"C:\Users\menha\Downloads\service-account.json"
+
+# ============================================
+# OUTPUT CSV (EXACT COPY OF UPDATED SHEET)
+# ============================================
+OUT_CSV = r"C:\Users\menha\Downloads\test\image_replaced_full_structure.csv"
+
+# ============================================
+# AUTH
+# ============================================
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+
+creds = Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE, scopes=SCOPES
+)
+client = gspread.authorize(creds)
+
+sheet = client.open_by_key(SHEET_ID)
+ws = sheet.worksheet(SHEET_NAME)
+rows = ws.get_all_values()
+
+if not rows:
+    raise SystemExit("❌ Sheet is empty")
+
+# ============================================
+# HEADER PARSING
+# ============================================
+headers = [h.strip().lower() for h in rows[0]]
+
+def col_idx(name: str) -> int:
+    name = name.strip().lower()
+    if name not in headers:
+        raise RuntimeError(f"❌ Column '{name}' not found in header")
+    return headers.index(name)
+
+idx_qno  = col_idx("question no")
+idx_link = col_idx("link")
+
+# ============================================
+# REGEX
+# ============================================
+page_pattern = re.compile(r"_page_(\d+)", re.IGNORECASE)
+
+# ============================================
+# PROCESS + UPDATE IN PLACE
+# ============================================
+updated_rows = [rows[0]]  # keep header as-is
+
+for sheet_row_index, row in enumerate(rows[1:], start=2):  # Google Sheet is 1-based
+    try:
+        if len(row) <= max(idx_qno, idx_link):
+            updated_rows.append(row)
+            continue
+
+        question_no = row[idx_qno].strip()
+        link = row[idx_link].strip()
+
+        page_match = page_pattern.search(link)
+        if not page_match:
+            updated_rows.append(row)
+            continue
+
+        page_no = page_match.group(1)
+
+        new_row = row.copy()
+        image_counter = 1
+
+        for col_index, cell in enumerate(row):
+            if "[IMAGE]" in cell:
+                count = cell.count("[IMAGE]")
+
+                # ✅ Build replacement text with line breaks
+                replacement_lines = []
+                for _ in range(count):
+                    replacement_lines.append(
+                        f"Page{page_no}_Q{question_no}_{image_counter}"
+                    )
+                    image_counter += 1
+
+                replacement_text = "\n".join(replacement_lines)
+
+                # ✅ Replace ONLY the [IMAGE] part, keep rest of the text if any
+                new_cell = cell.replace("[IMAGE]", "").strip()
+                if new_cell:
+                    new_cell = new_cell + "\n" + replacement_text
+                else:
+                    new_cell = replacement_text
+
+                new_row[col_index] = new_cell
+
+                # ✅ UPDATE GOOGLE SHEET LIVE
+                ws.update_cell(sheet_row_index, col_index + 1, new_cell)
+
+        updated_rows.append(new_row)
+
+    except Exception as e:
+        print("⚠️ Row skipped due to error:", row, e)
+        updated_rows.append(row)
+
+# ============================================
+# SAVE FULL UPDATED STRUCTURE TO CSV
+# ============================================
+with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
+    writer.writerows(updated_rows)
+
+print("\n✅ INLINE [IMAGE] REPLACED SUCCESSFULLY")
+print("✅ GOOGLE SHEET UPDATED")
+print(f"✅ CSV EXPORTED: {OUT_CSV}")
+print(f"📊 Total Rows Processed: {len(updated_rows) - 1}")
