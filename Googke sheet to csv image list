@@ -15,9 +15,9 @@ SHEET_NAME = "Sheet4"
 SERVICE_ACCOUNT_FILE = r"C:\Users\menha\Downloads\service-account.json"
 
 # ============================================
-# OUTPUT CSV (FOR IMAGE EXTRACTION PIPELINE)
+# OUTPUT CSV
 # ============================================
-OUT_CSV = r"C:\Users\menha\Downloads\test\FINAL_image_control.csv"
+OUT_CSV = r"C:\Users\menha\Downloads\test\page_question_pattern.csv"
 
 # ============================================
 # AUTH (READ ONLY)
@@ -52,49 +52,41 @@ idx_qno  = col_idx("question no")
 idx_link = col_idx("link")
 
 # ============================================
-# REGEX
+# REGEX FOR PAGE NUMBER
 # ============================================
-page_pattern   = re.compile(r"_page_(\d+)", re.IGNORECASE)
-image_pattern  = re.compile(r"\[\s*IMAGE\s*\]", re.IGNORECASE)
+page_pattern = re.compile(r"_page_(\d+)", re.IGNORECASE)
 
 # ============================================
-# BUILD FINAL CONTROL CSV
+# BUILD OUTPUT CSV
 # ============================================
-output = [["page_no", "question_no", "image_name"]]
+output = [["page_no", "question_no", "page_pattern"]]
 
 for row in rows[1:]:
+    try:
+        question_no = row[idx_qno].strip()
+        link = row[idx_link].strip()
 
-    question_no = row[idx_qno].strip()
-    link = row[idx_link].strip()
+        if not question_no:
+            continue
 
-    if not question_no:
-        continue
+        match = page_pattern.search(link)
+        if not match:
+            continue
 
-    match = page_pattern.search(link)
-    if not match:
-        continue
+        page_no = match.group(1)
+        pattern = f"Page{page_no}_Q{question_no}"
 
-    page_no = match.group(1)
+        output.append([page_no, question_no, pattern])
 
-    base_pattern = f"Page{page_no}_Q{question_no}"
-
-    # ✅ COUNT STRICT [IMAGE] ONLY
-    image_counter = 1
-
-    for cell in row:
-        matches = image_pattern.findall(cell)
-
-        for _ in matches:
-            img_name = f"{base_pattern}_{image_counter}"
-            output.append([page_no, question_no, img_name])
-            image_counter += 1
+    except Exception as e:
+        print("⚠️ Skipped row:", e)
 
 # ============================================
-# SAVE FINAL CSV
+# SAVE CSV
 # ============================================
 with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
     csv.writer(f).writerows(output)
 
-print("\n✅ FINAL IMAGE CONTROL CSV CREATED (CLEAN LOGIC)")
+print("\n✅ PAGE–QUESTION–PATTERN CSV CREATED")
 print(f"📄 Output: {OUT_CSV}")
-print(f"📊 Total Images Listed: {len(output) - 1}")
+print(f"📊 Total Rows Written: {len(output) - 1}")
