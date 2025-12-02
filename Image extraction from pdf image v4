@@ -1,0 +1,160 @@
+import cv2
+import numpy as np
+import os
+import csv
+
+# ======================================
+# ✅ CORRECT PATHS
+# ======================================
+INPUT_ROOT  = r"C:\Users\menha\Downloads\test\A\B"
+OUTPUT_ROOT = r"C:\Users\menha\Downloads\test\A\B\images1"
+CSV_PATH    = r"C:\Users\menha\Downloads\input.csv"
+
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
+
+min_area = 3500
+
+def crop_header_footer(img):
+    h, w, _ = img.shape
+    top = int(0.06 * h)
+    bottom = int(0.95 * h)
+    return img[top:bottom, :]
+
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+    yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    union = boxA[2]*boxA[3] + boxB[2]*boxB[3] - inter
+    return inter / union if union != 0 else 0
+
+def non_max_suppression(boxes, thresh=0.45):
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: b[2]*b[3], reverse=True)
+    final = []
+    while boxes:
+        best = boxes.pop(0)
+        final.append(best)
+        boxes = [b for b in boxes if iou(best, b) < thresh]
+    return final
+
+def pad_box(x, y, w, h, img_w, img_h, pad_ratio=0.10):
+    px = int(w * pad_ratio)
+    py = int(h * pad_ratio)
+    x0 = max(0, x - px)
+    y0 = max(0, y - py)
+    x1 = min(img_w, x + w + px)
+    y1 = min(img_h, y + h + py)
+    return x0, y0, x1 - x0, y1 - y0
+
+def is_text_like(crop):
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, 60, 160)
+    density = np.sum(edges > 0) / edges.size
+    return density > 0.20
+
+# ======================================
+# ✅ LOAD CSV
+# ======================================
+control_map = {}
+
+with open(CSV_PATH, newline="", encoding="utf-8") as f:
+    reader = csv.DictReader(f)
+    print("\n✅ CSV HEADERS FOUND:", reader.fieldnames)
+
+    for row in reader:
+        key = (
+            row["folder"].strip(),
+            row["sub_folder"].strip(),
+            row["page_no"].strip(),
+            row["question_no"].strip()
+        )
+        control_map.setdefault(key, []).append(row["image name"].strip())
+
+print(f"\n✅ Loaded {sum(len(v) for v in control_map.values())} images from CSV")
+
+# ======================================
+# ✅ PAGE FINDER
+# ======================================
+def find_page_image(folder_path, page_no):
+    page_no = str(page_no).strip().lstrip("0")
+    expected = f"page_{page_no}.png"
+
+    if not os.path.isdir(folder_path):
+        print(f"❌ Folder not found: {folder_path}")
+        return None
+
+    for fname in os.listdir(folder_path):
+        if fname.lower() == expected.lower():
+            return os.path.join(folder_path, fname)
+
+    print(f"   🔍 Looking for: {expected}")
+    print(f"   📂 Available files: {os.listdir(folder_path)}")
+    return None
+
+# ======================================
+# ✅ MAIN EXTRACTION
+# ======================================
+for (folder, subfolder, page_no, question_no), image_names in control_map.items():
+
+    page_file = find_page_image(INPUT_ROOT, page_no)
+
+    if not page_file:
+        print(f"❌ Page not found → Folder={folder}, Sub={subfolder}, Page={page_no}")
+        continue
+
+    page = cv2.imread(page_file)
+
+    save_dir = os.path.join(OUTPUT_ROOT, folder, subfolder)
+    os.makedirs(save_dir, exist_ok=True)
+
+    page_cropped = crop_header_footer(page)
+    H, W = page_cropped.shape[:2]
+    gray = cv2.cvtColor(page_cropped, cv2.COLOR_BGR2GRAY)
+
+    th = cv2.adaptiveThreshold(
+        gray, 255,
+        cv2.ADAPTIVE_THRESH_MEAN_C,
+        cv2.THRESH_BINARY_INV,
+        17, 3
+    )
+
+    edges = cv2.Canny(gray, 60, 160)
+    combined = cv2.bitwise_or(th, edges)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 4))
+    dilated = cv2.dilate(combined, kernel, iterations=2)
+
+    contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+    raw_boxes = []
+    for cnt in contours:
+        x, y, w, h = cv2.boundingRect(cnt)
+        area = w * h
+        aspect = w / h if h != 0 else 0
+
+        if area > min_area and 80 < w < 2200 and 80 < h < 1600 and 0.15 < aspect < 7.0:
+            x, y, w, h = pad_box(x, y, w, h, W, H)
+            raw_boxes.append((x, y, w, h))
+
+    boxes = non_max_suppression(raw_boxes)
+
+    for box, target_name in zip(boxes, image_names):
+        x, y, w, h = box
+        crop = page_cropped[y:y + h, x:x + w]
+
+        if is_text_like(crop):
+            continue
+
+        # ✅ ✅ ✅ FORCE VALID IMAGE EXTENSION
+        if not os.path.splitext(target_name)[1]:
+            target_name += ".png"
+
+        out_path = os.path.join(save_dir, target_name)
+        cv2.imwrite(out_path, crop)
+        print(f"   ✅ Saved {out_path}")
+
+print("\n🎯 CONTROLLED IMAGE EXTRACTION COMPLETE")
+print(f"📂 Output base folder: {OUTPUT_ROOT}")
