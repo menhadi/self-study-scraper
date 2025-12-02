@@ -1,0 +1,98 @@
+import re
+import csv
+import gspread
+from google.oauth2.service_account import Credentials
+
+# ============================================
+# GOOGLE SHEET DETAILS
+# ============================================
+SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+SHEET_NAME = "Sheet4"
+
+# ============================================
+# SERVICE ACCOUNT FILE
+# ============================================
+SERVICE_ACCOUNT_FILE = r"C:\Users\menha\Downloads\service-account.json"
+
+# ============================================
+# OUTPUT CSV
+# ============================================
+OUT_CSV = r"C:\Users\menha\Downloads\test\page_question_pattern.csv"
+
+# ============================================
+# AUTH (READ ONLY)
+# ============================================
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+
+creds = Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE, scopes=SCOPES
+)
+client = gspread.authorize(creds)
+
+ws = client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+rows = ws.get_all_values()
+
+if not rows:
+    raise SystemExit("❌ Sheet is empty")
+
+# ============================================
+# FIND REQUIRED COLUMNS
+# ============================================
+headers = [h.strip().lower() for h in rows[0]]
+
+def col_idx(name):
+    name = name.strip().lower()
+    if name not in headers:
+        raise SystemExit(f"❌ Column not found: {name}")
+    return headers.index(name)
+
+idx_folder = col_idx("folder")
+idx_sub    = col_idx("sub folder")  # header exactly as in sheet
+idx_qno    = col_idx("question no")
+idx_link   = col_idx("link")
+
+# ============================================
+# REGEX FOR PAGE NUMBER
+# ============================================
+page_pattern = re.compile(r"_page_(\d+)", re.IGNORECASE)
+
+# ============================================
+# BUILD OUTPUT CSV
+# ============================================
+# Col1 = folder, Col2 = subfolder, Col3 = page_no, Col4 = question_no, Col5 = page_pattern
+output = [["folder", "subfolder", "page_no", "question_no", "page_pattern"]]
+
+for row in rows[1:]:
+    try:
+        question_no = row[idx_qno].strip()
+        link        = row[idx_link].strip()
+        folder      = row[idx_folder].strip()
+        subfolder   = row[idx_sub].strip()
+
+        if not question_no:
+            continue
+
+        match = page_pattern.search(link)
+        if not match:
+            continue
+
+        page_no = match.group(1)
+        pattern = f"Page{page_no}_Q{question_no}"
+
+        output.append([folder, subfolder, page_no, question_no, pattern])
+
+    except Exception as e:
+        print("⚠️ Skipped row:", e)
+
+# ============================================
+# SAVE CSV
+# ============================================
+with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
+    csv.writer(f).writerows(output)
+
+print("\n✅ PAGE–QUESTION–PATTERN CSV CREATED")
+print(f"📄 Output: {OUT_CSV}")
+print(f"📊 Total Rows Written: {len(output) - 1}")
