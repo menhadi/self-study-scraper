@@ -1,0 +1,65 @@
+import os
+import fitz  # PyMuPDF
+from tqdm import tqdm
+
+# ==============================
+# ✅ BASE FOLDERS
+# ==============================
+PDF_BASE_DIR   = r"C:\Users\menha\Downloads\test"
+IMAGE_BASE_DIR = r"C:\Users\menha\Downloads\test1"
+
+os.makedirs(IMAGE_BASE_DIR, exist_ok=True)
+
+# ==============================
+# ✅ HIGH QUALITY SETTINGS (OCR)
+# ==============================
+ZOOM = 4.0   # ✅ Best for OCR (300–400 DPI equivalent)
+MAT = fitz.Matrix(ZOOM, ZOOM)
+
+# ==============================
+# ✅ FIND ALL PDFs
+# ==============================
+all_pdfs = []
+for root, _, files in os.walk(PDF_BASE_DIR):
+
+    # ❌ Skip Image output folder if script is rerun
+    if root.startswith(IMAGE_BASE_DIR):
+        continue
+
+    for f in files:
+        if f.lower().endswith(".pdf"):
+            all_pdfs.append(os.path.join(root, f))
+
+print(f"✅ Total PDFs Found: {len(all_pdfs)}")
+
+# ==============================
+# ✅ CONVERT ALL PDFs → IMAGES
+# ==============================
+for pdf_path in tqdm(all_pdfs, desc="Converting PDFs to Images"):
+    try:
+        # ✅ Maintain same folder structure
+        rel_folder = os.path.relpath(os.path.dirname(pdf_path), PDF_BASE_DIR)
+        image_output_dir = os.path.join(IMAGE_BASE_DIR, rel_folder)
+
+        os.makedirs(image_output_dir, exist_ok=True)
+
+        doc = fitz.open(pdf_path)
+
+        for page_num in range(len(doc)):
+            page = doc.load_page(page_num)
+            pix = page.get_pixmap(matrix=MAT)
+
+            # ✅ ONLY PAGE NUMBER — NO PDF NAME
+            image_name = f"page_{page_num+1}.png"
+            image_path = os.path.join(image_output_dir, image_name)
+
+            pix.save(image_path)
+
+        doc.close()
+
+    except Exception as e:
+        print(f"❌ Failed: {pdf_path}")
+        print(str(e))
+
+print("\n✅ ALL PDFs CONVERTED TO HIGH-QUALITY IMAGES")
+print(f"📁 Output Folder: {IMAGE_BASE_DIR}")
