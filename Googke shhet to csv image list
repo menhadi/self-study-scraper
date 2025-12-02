@@ -1,0 +1,100 @@
+import re
+import csv
+import gspread
+from google.oauth2.service_account import Credentials
+
+# ============================================
+# GOOGLE SHEET DETAILS
+# ============================================
+SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+SHEET_NAME = "Sheet4"
+
+# ============================================
+# SERVICE ACCOUNT FILE
+# ============================================
+SERVICE_ACCOUNT_FILE = r"C:\Users\menha\Downloads\service-account.json"
+
+# ============================================
+# OUTPUT CSV (FOR IMAGE EXTRACTION PIPELINE)
+# ============================================
+OUT_CSV = r"C:\Users\menha\Downloads\test\FINAL_image_control.csv"
+
+# ============================================
+# AUTH (READ ONLY)
+# ============================================
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets.readonly",
+    "https://www.googleapis.com/auth/drive.readonly",
+]
+
+creds = Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE, scopes=SCOPES
+)
+client = gspread.authorize(creds)
+
+ws = client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+rows = ws.get_all_values()
+
+if not rows:
+    raise SystemExit("❌ Sheet is empty")
+
+# ============================================
+# FIND REQUIRED COLUMNS
+# ============================================
+headers = [h.strip().lower() for h in rows[0]]
+
+def col_idx(name):
+    if name not in headers:
+        raise SystemExit(f"❌ Column not found: {name}")
+    return headers.index(name)
+
+idx_qno  = col_idx("question no")
+idx_link = col_idx("link")
+
+# ============================================
+# REGEX
+# ============================================
+page_pattern   = re.compile(r"_page_(\d+)", re.IGNORECASE)
+image_pattern  = re.compile(r"\[\s*IMAGE\s*\]", re.IGNORECASE)
+
+# ============================================
+# BUILD FINAL CONTROL CSV
+# ============================================
+output = [["page_no", "question_no", "image_name"]]
+
+for row in rows[1:]:
+
+    question_no = row[idx_qno].strip()
+    link = row[idx_link].strip()
+
+    if not question_no:
+        continue
+
+    match = page_pattern.search(link)
+    if not match:
+        continue
+
+    page_no = match.group(1)
+
+    base_pattern = f"Page{page_no}_Q{question_no}"
+
+    # ✅ COUNT STRICT [IMAGE] ONLY
+    image_counter = 1
+
+    for cell in row:
+        matches = image_pattern.findall(cell)
+
+        for _ in matches:
+            img_name = f"{base_pattern}_{image_counter}"
+            output.append([page_no, question_no, img_name])
+            image_counter += 1
+
+# ============================================
+# SAVE FINAL CSV
+# ============================================
+with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
+    csv.writer(f).writerows(output)
+
+print("\n✅ FINAL IMAGE CONTROL CSV CREATED (CLEAN LOGIC)")
+print(f"📄 Output: {OUT_CSV}")
+print(f"📊 Total Images Listed: {len(output) - 1}")
