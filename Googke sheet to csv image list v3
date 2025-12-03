@@ -1,0 +1,102 @@
+import gspread
+from google.oauth2.service_account import Credentials
+import re
+from urllib.parse import unquote
+import csv
+
+# ============================================
+# GOOGLE SHEET CONFIG
+# ============================================
+SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+SHEET_NAME = "Sheet4"
+
+# ============================================
+# SERVICE ACCOUNT FILE
+# ============================================
+SERVICE_ACCOUNT_FILE = r"C:\Users\menha\Downloads\service-account.json"
+
+# ============================================
+# OUTPUT CSV FILE ✅ CHANGED TO input.csv
+# ============================================
+OUTPUT_CSV = r"C:\Users\menha\Downloads\input.csv"
+
+# ============================================
+# AUTH & OPEN SHEET
+# ============================================
+scope = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scope)
+client = gspread.authorize(creds)
+
+sheet = client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+
+# ============================================
+# READ ALL DATA
+# ============================================
+data = sheet.get_all_values()
+
+# ============================================
+# TARGET COLUMNS
+# ============================================
+# D = 3 → question_no
+# E = 4 → LINK for split
+# G–K = 6–10 → IMAGE DATA
+TARGET_IMAGE_COLS = [6, 7, 8, 9, 10]
+
+# ✅ Capture ONLY text inside [ ]
+BRACKET_PATTERN = re.compile(r"\[([^\]]+)\]")
+
+# ============================================
+# CSV WRITE
+# ============================================
+with open(OUTPUT_CSV, "w", newline="", encoding="utf-8") as csvfile:
+    writer = csv.writer(csvfile)
+
+    # ✅ HEADER CHANGED ONLY FOR A–D, E KEPT
+    writer.writerow(["folder", "sub_folder", "file name", "question_no", "image_name"])
+
+    # ============================================
+    # PROCESS ROWS
+    # ============================================
+    for row_idx in range(1, len(data)):  # Skip header
+        row = data[row_idx]
+
+        if len(row) < 11:
+            continue
+
+        question_no = row[3].strip()   # ✅ COLUMN D
+        link_value = row[4].strip()    # ✅ COLUMN E
+
+        if "/" in link_value:
+            folder = link_value.split("/", 1)[0].strip()
+            filename_from_link = link_value.rsplit("/", 1)[-1].strip()
+        else:
+            folder = link_value
+            filename_from_link = ""
+
+        folder = unquote(folder)
+        filename_from_link = unquote(filename_from_link)
+
+        sub_folder = ""  # ✅ As per your rule
+
+        # ============================================
+        # EXTRACT ONLY [VALUE] FROM G–K
+        # ============================================
+        for col_idx in TARGET_IMAGE_COLS:
+            cell_text = row[col_idx]
+
+            matches = BRACKET_PATTERN.findall(cell_text)
+
+            for image_name in matches:
+                writer.writerow([
+                    folder,             # ✅ Column A
+                    sub_folder,         # ✅ Column B (blank)
+                    filename_from_link,# ✅ Column C (after /)
+                    question_no,        # ✅ Column D
+                    image_name          # ✅ Column E (kept, NOT removed)
+                ])
+
+print("\n✅ CSV EXPORT COMPLETED SUCCESSFULLY!")
+print(f"📄 File Saved As: {OUTPUT_CSV}")
