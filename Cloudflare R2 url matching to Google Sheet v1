@@ -1,0 +1,97 @@
+import os
+import re
+import csv
+import gspread
+from google.oauth2.service_account import Credentials
+
+# ============================================
+# GOOGLE SHEET CONFIG
+# ============================================
+SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+SHEET_NAME = "Sheet4"
+
+# ============================================
+# SERVICE ACCOUNT FILE
+# ============================================
+SERVICE_ACCOUNT_FILE = r"C:\Users\menha\Downloads\service-account.json"
+
+# ============================================
+# CSV FOLDER (SOURCE DATA)
+# ============================================
+CSV_FOLDER = r"D:\Vector Academy\Contents\PYQ\GATE\Image1"
+
+# ============================================
+# AUTH & OPEN GOOGLE SHEET
+# ============================================
+scope = ["https://www.googleapis.com/auth/spreadsheets"]
+creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scope)
+client = gspread.authorize(creds)
+
+sheet = client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+sheet_data = sheet.get_all_values()
+
+# ============================================
+# BUILD IMAGE NAME → PUBLIC URL MAP FROM CSV
+# ============================================
+image_map = {}
+
+for csv_file in os.listdir(CSV_FOLDER):
+    if not csv_file.lower().endswith(".csv"):
+        continue
+
+    csv_path = os.path.join(CSV_FOLDER, csv_file)
+
+    with open(csv_path, "r", encoding="utf-8", newline="") as f:
+        reader = csv.reader(f)
+        next(reader, None)  # Skip header
+
+        for row in reader:
+            if len(row) < 4:
+                continue
+
+            csv_col_a = row[0].strip()   # Image_File
+            csv_col_c = row[3].strip()   # Public_URL
+
+            filename = csv_col_a.split("/")[-1]
+            filename_no_ext = os.path.splitext(filename)[0]
+
+            if filename_no_ext and csv_col_c:
+                image_map[filename_no_ext] = csv_col_c
+
+print(f"✅ Total Image Mappings Loaded: {len(image_map)}")
+
+# ============================================
+# UPDATE GOOGLE SHEET (KEEP [ ])
+# ============================================
+updated_rows = 0
+
+for row_idx in range(len(sheet_data)):
+    row = sheet_data[row_idx]
+    new_row = []
+    row_changed = False
+
+    for cell in row:
+        if not isinstance(cell, str):
+            new_row.append(cell)
+            continue
+
+        original_cell = cell
+
+        for image_name, public_url in image_map.items():
+            # ✅ KEEP [ ] AND ONLY REPLACE INSIDE
+            pattern = rf"\[\s*{re.escape(image_name)}\s*\]"
+            replacement = f"[{public_url}]"
+
+            if re.search(pattern, cell):
+                cell = re.sub(pattern, replacement, cell)
+                row_changed = True
+
+        new_row.append(cell)
+
+    if row_changed:
+        sheet.update(f"A{row_idx+1}", [new_row])
+        updated_rows += 1
+        print(f"✅ Updated Row: {row_idx + 1}")
+
+print("\n✅ ✅ GOOGLE SHEET UPDATE COMPLETE")
+print(f"🔁 Total Rows Updated: {updated_rows}")
