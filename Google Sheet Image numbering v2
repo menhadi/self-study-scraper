@@ -1,0 +1,105 @@
+import gspread
+from google.oauth2.service_account import Credentials
+import re
+from urllib.parse import unquote
+
+# ============================================
+# GOOGLE SHEET CONFIG
+# ============================================
+SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+SHEET_NAME = "Sheet4"
+
+# ============================================
+# SERVICE ACCOUNT FILE
+# ============================================
+SERVICE_ACCOUNT_FILE = r"C:\Users\menha\Downloads\service-account.json"
+
+# ============================================
+# AUTH & OPEN SHEET
+# ============================================
+scope = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scope)
+client = gspread.authorize(creds)
+
+sheet = client.open_by_key(SHEET_ID).worksheet(SHEET_NAME)
+
+# ============================================
+# READ ALL DATA
+# ============================================
+data = sheet.get_all_values()
+
+# ============================================
+# GLOBAL IMAGE COUNTER (PER FILE)
+# ============================================
+image_counter = {}
+
+# Columns Index (0-based)
+# ✅ E = 4  → SOURCE LINK COLUMN
+# G = 6, H = 7, I = 8, J = 9, K = 10
+TARGET_COLS = [6, 7, 8, 9, 10]
+
+# ✅ Placeholder pattern with brackets CAPTURED
+PLACEHOLDER_PATTERN = re.compile(r"\[(IMAGE|MAGE)\]")
+
+# ============================================
+# HELPER: GET BASE NAME FROM COLUMN E URL
+# ============================================
+def get_base_name(url: str) -> str:
+    url = url.strip()
+    if not url:
+        return ""
+
+    last_part = url.rsplit("/", 1)[-1]
+    last_part = unquote(last_part)
+    last_part = last_part.split("?", 1)[0].strip()
+    last_part = re.sub(r"\.(png|jpg|jpeg|webp|gif)$", "", last_part, flags=re.IGNORECASE)
+
+    return last_part
+
+# ============================================
+# PROCESS EACH ROW
+# ============================================
+for row_idx in range(1, len(data)):  # Skip header
+    row = data[row_idx]
+
+    if len(row) <= 4:
+        continue
+
+    link_url = row[4]  # ✅ COLUMN E
+    base_name = get_base_name(link_url)
+
+    if not base_name:
+        continue
+
+    if base_name not in image_counter:
+        image_counter[base_name] = 0
+
+    # ============================================
+    # SCAN G TO K COLUMNS
+    # ============================================
+    for col_idx in TARGET_COLS:
+        if col_idx >= len(row):
+            continue
+
+        cell_text = row[col_idx]
+
+        if "[IMAGE]" not in cell_text and "[MAGE]" not in cell_text:
+            continue
+
+        def make_replacer(file_key):
+            def replacer(match):
+                image_counter[file_key] += 1
+                # ✅ BRACKETS PRESERVED
+                return f"[{file_key}_{image_counter[file_key]}]"
+            return replacer
+
+        new_text = PLACEHOLDER_PATTERN.sub(make_replacer(base_name), cell_text)
+
+        if new_text != cell_text:
+            sheet.update_cell(row_idx + 1, col_idx + 1, new_text)
+            print(f"✅ Updated Row {row_idx+1}, Column {col_idx+1}")
+
+print("\n🎯 ALL [IMAGE] / [MAGE] REPLACEMENTS COMPLETED — BRACKETS PRESERVED!")
