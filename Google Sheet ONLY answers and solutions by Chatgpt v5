@@ -1,0 +1,154 @@
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from openai import OpenAI
+import time
+import re
+
+# ================= CONFIG =================
+
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+CREDENTIALS_FILE = "service-account.json"
+SHEET_TAB = "Sheet4"
+
+OPENAI_API_KEY = "PASTE_YOUR_OPENAI_API_KEY_HERE"
+TEMPERATURE = 0
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ================= MODEL SWITCH =================
+
+def choose_model(text):
+    tech_words = [
+        "calculate", "solve", "integral", "derivative", "matrix",
+        "voltage", "current", "resistance", "probability",
+        "omega", "zeta", "frequency", "force", "acceleration"
+    ]
+    return "gpt-4.1" if any(w in text.lower() for w in tech_words) else "gpt-4o-mini"
+
+# ================= UNICODE SUB/SUPER CONVERTER =================
+
+SUPERSCRIPTS = str.maketrans("0123456789n", "⁰¹²³⁴⁵⁶⁷⁸⁹ⁿ")
+SUBSCRIPTS   = str.maketrans("0123456789n", "₀₁₂₃₄₅₆₇₈₉ₙ")
+
+def latex_to_unicode(text):
+    if not text:
+        return text
+
+    text = re.sub(r"\\frac\{([^}]*)\}\{([^}]*)\}", r"\1/\2", text)
+    text = re.sub(r"\^\{([^}]*)\}", lambda m: m.group(1).translate(SUPERSCRIPTS), text)
+    text = re.sub(r"_\{([^}]*)\}", lambda m: m.group(1).translate(SUBSCRIPTS), text)
+    text = re.sub(r"\^([0-9n])", lambda m: m.group(1).translate(SUPERSCRIPTS), text)
+    text = re.sub(r"_([0-9n])", lambda m: m.group(1).translate(SUBSCRIPTS), text)
+
+    greek = {
+        "\\alpha": "α", "\\beta": "β", "\\omega": "ω",
+        "\\zeta": "ζ", "\\theta": "θ", "\\pi": "π"
+    }
+    for k, v in greek.items():
+        text = text.replace(k, v)
+
+    text = text.replace("\\times", "×").replace("\\cdot", "·").replace("\\pm", "±")
+    text = re.sub(r"\\[a-zA-Z]+", "", text)
+
+    return text.replace("\\(", "").replace("\\)", "").replace("\\[", "").replace("\\]", "").strip()
+
+# ================= GOOGLE SHEET =================
+
+scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
+creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+sheet = gspread.authorize(creds).open_by_key(GOOGLE_SHEET_ID).worksheet(SHEET_TAB)
+
+data = sheet.get_all_values()
+headers = data[0]
+rows = data[1:]
+
+def col(name): 
+    return headers.index(name)
+
+IDX_TYPE     = col("Question Type")
+IDX_QTEXT    = col("Question Text")
+IDX_OPTA     = col("Option A")
+IDX_OPTB     = col("Option B")
+IDX_OPTC     = col("Option C")
+IDX_OPTD     = col("Option D")
+IDX_CORRECT  = col("Correct Option")
+IDX_SOLUTION = col("Solution")
+IDX_PENDING  = col("Pending")
+
+# ================= SMART HTML TABLE =================
+
+def smart_html_solution(raw):
+    raw = latex_to_unicode(raw)
+    if "|" in raw and "\n" in raw:
+        table_rows = ""
+        for r in raw.split("\n"):
+            cols = [c.strip() for c in r.split("|") if c.strip()]
+            if cols:
+                table_rows += "<tr>" + "".join(f"<td>{c}</td>" for c in cols) + "</tr>"
+        return f"<table border='1' cellpadding='6'>{table_rows}</table>"
+    return raw
+
+# ================= GPT SOLVER =================
+
+def solve_question(qtype, question, A, B, C, D):
+    model = choose_model(question)
+
+    if qtype.lower() == "mcq":
+        prompt = f"""
+Question: {question}
+
+A) {A}
+B) {B}
+C) {C}
+D) {D}
+
+Return:
+Correct Option: A/B/C/D
+Solution: Explanation (Unicode only)
+"""
+    else:
+        prompt = f"""
+Fill in the blank:
+{question}
+
+Return:
+Answer: VALUE ONLY
+Solution: Explanation (Unicode only)
+"""
+
+    res = client.chat.completions.create(
+        model=model,
+        temperature=TEMPERATURE,
+        messages=[{"role": "user", "content": prompt}]
+    )
+    return res.choices[0].message.content.strip()
+
+# ================= MAIN LOOP =================
+
+for i, row in enumerate(rows, start=2):
+
+    if row[IDX_PENDING].strip().lower() != "pending":
+        continue
+
+    qtype = row[IDX_TYPE]
+    qtext = row[IDX_QTEXT]
+    A, B, C, D = row[IDX_OPTA], row[IDX_OPTB], row[IDX_OPTC], row[IDX_OPTD]
+
+    result = solve_question(qtype, qtext, A, B, C, D)
+
+    if qtype.lower() == "mcq":
+        correct = latex_to_unicode(result.split("Correct Option:")[1].split("\n")[0].strip())
+        raw_solution = result.split("Solution:")[1].strip()
+    else:
+        correct = latex_to_unicode(result.split("Answer:")[1].split("\n")[0].strip())
+        raw_solution = result.split("Solution:")[1].strip()
+
+    solution = smart_html_solution(raw_solution)
+
+    sheet.update_cell(i, IDX_CORRECT + 1, correct)
+    sheet.update_cell(i, IDX_SOLUTION + 1, solution)
+    sheet.update_cell(i, IDX_PENDING + 1, "done")
+
+    time.sleep(1)
+
+print("✅ AUTO SOLVER COMPLETED WITH PERFECT UNICODE SUB/SUPERSCRIPT")
