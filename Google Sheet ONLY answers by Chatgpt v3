@@ -1,0 +1,192 @@
+import gspread
+from oauth2client.service_account import ServiceAccountCredentials
+from openai import OpenAI
+import time
+
+# ======================================
+# ✅ GOOGLE SHEET CONFIG (YOUR VALUES)
+# ======================================
+
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+CREDENTIALS_FILE = "service-account.json"
+SHEET_TAB = "Sheet4"
+
+# ======================================
+# ✅ OPENAI CONFIG
+# ======================================
+
+OPENAI_API_KEY = "PASTE_YOUR_OPENAI_API_KEY_HERE"
+MODEL_NAME = "gpt-4.1"
+TEMPERATURE = 0
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+# ======================================
+# ✅ GOOGLE SHEET CONNECTION
+# ======================================
+
+scope = [
+    "https://spreadsheets.google.com/feeds",
+    "https://www.googleapis.com/auth/drive"
+]
+
+creds = ServiceAccountCredentials.from_json_keyfile_name(CREDENTIALS_FILE, scope)
+gs_client = gspread.authorize(creds)
+
+sheet = gs_client.open_by_key(GOOGLE_SHEET_ID).worksheet(SHEET_TAB)
+
+all_data = sheet.get_all_values()
+headers = all_data[0]
+rows = all_data[1:]
+
+# ======================================
+# ✅ HEADER INDEX MAPPING (DYNAMIC)
+# ======================================
+
+def col(name):
+    return headers.index(name)
+
+IDX_TYPE        = col("Question Type")
+IDX_QTEXT       = col("Question Text")
+IDX_OPTA        = col("Option A")
+IDX_OPTB        = col("Option B")
+IDX_OPTC        = col("Option C")
+IDX_OPTD        = col("Option D")
+IDX_CORRECT     = col("Correct Option")
+IDX_SOLUTION    = col("Solution")
+IDX_PENDING     = col("Pending")
+
+# ======================================
+# ✅ GPT SOLVER FUNCTION
+# ======================================
+
+def solve_with_gpt(question_type, question, optA, optB, optC, optD):
+
+    if question_type.lower() == "mcq":
+        prompt = f"""
+You are an expert exam solver.
+
+Question:
+{question}
+
+Options:
+A) {optA}
+B) {optB}
+C) {optC}
+D) {optD}
+
+Rules:
+1. Select the correct option only as A, B, C or D.
+2. Give full step-by-step explanation in Unicode text only.
+3. Do NOT use LaTeX.
+
+Return strictly in this format:
+
+Correct Option: A/B/C/D
+Solution: Full explanation
+"""
+
+    else:  # Fill in the blank
+        prompt = f"""
+You are an expert exam solver.
+
+Fill in the blank Question:
+{question}
+
+Rules:
+1. Provide ONLY the final value as the answer.
+2. Give proper explanation (even for non-technical questions).
+3. Do NOT use LaTeX.
+
+Return strictly in this format:
+
+Answer: VALUE ONLY
+Solution: Full explanation
+"""
+
+    response = client.chat.completions.create(
+        model=MODEL_NAME,
+        temperature=TEMPERATURE,
+        messages=[{"role": "user", "content": prompt}]
+    )
+
+    return response.choices[0].message.content.strip()
+
+# ======================================
+# ✅ SMART TABLE AUTO-DETECTION FUNCTION
+# ======================================
+
+def smart_html_solution(raw_solution):
+    # ✅ Detect if AI returned a table-like structure
+    if "|" in raw_solution and "\n" in raw_solution:
+        rows = raw_solution.strip().split("\n")
+        html_rows = ""
+
+        for r in rows:
+            cols = [c.strip() for c in r.split("|") if c.strip()]
+            if cols:
+                html_rows += "<tr>" + "".join(f"<td>{c}</td>" for c in cols) + "</tr>"
+
+        return f"""
+<table border="1" cellpadding="6" cellspacing="0" width="100%">
+{html_rows}
+</table>
+"""
+    else:
+        # ✅ Normal explanation → keep as plain text
+        return raw_solution
+
+# ======================================
+# ✅ MAIN PROCESSING LOOP
+# ======================================
+
+for i, row in enumerate(rows, start=2):
+
+    pending_status = row[IDX_PENDING].strip().lower()
+
+    if pending_status != "pending":
+        print(f"Skipping row {i} (Already Done)")
+        continue
+
+    question_type = row[IDX_TYPE].strip()
+    question_text = row[IDX_QTEXT].strip()
+    optA = row[IDX_OPTA].strip()
+    optB = row[IDX_OPTB].strip()
+    optC = row[IDX_OPTC].strip()
+    optD = row[IDX_OPTD].strip()
+
+    print(f"✅ Solving Row {i}...")
+
+    try:
+        gpt_result = solve_with_gpt(
+            question_type,
+            question_text,
+            optA,
+            optB,
+            optC,
+            optD
+        )
+
+        if question_type.lower() == "mcq":
+            correct = gpt_result.split("Correct Option:")[1].split("\n")[0].strip()
+            raw_solution = gpt_result.split("Solution:")[1].strip()
+        else:
+            correct = gpt_result.split("Answer:")[1].split("\n")[0].strip()
+            raw_solution = gpt_result.split("Solution:")[1].strip()
+
+        # ✅ Smart HTML detection
+        solution = smart_html_solution(raw_solution)
+
+        # ✅ UPDATE GOOGLE SHEET
+        sheet.update_cell(i, IDX_CORRECT + 1, correct)
+        sheet.update_cell(i, IDX_SOLUTION + 1, solution)
+        sheet.update_cell(i, IDX_PENDING + 1, "done")
+
+        print(f"✅ Row {i} updated successfully\n")
+
+        time.sleep(1)
+
+    except Exception as e:
+        print(f"❌ Error on row {i}: {e}")
+
+print("\n✅✅ ALL PENDING QUESTIONS SOLVED SUCCESSFULLY ✅✅")
