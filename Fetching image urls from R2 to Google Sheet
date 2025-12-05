@@ -1,0 +1,163 @@
+import os
+import re
+import boto3
+import unicodedata
+
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+
+# ==============================
+# 🔧 CONFIGURATION (unchanged)
+# ==============================
+
+R2_ACCOUNT_ID   = "9c3a111cd1c8101060111b18f9dda444"
+R2_ACCESS_KEY   = "cd09fc348dc0e5ac72d04d7b301ae141"
+R2_SECRET_KEY   = "15c67f92b18a5b0dc5a4ce9f6b675e76367544a316aa21118ce0d737ab080d7a"
+R2_BUCKET_NAME  = "tech4learn"
+R2_CDN_BASE     = "https://cdn.tech4learn.com"
+
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+CREDENTIALS_FILE = "service-account.json"
+TARGET_SHEET = "Sheet4"
+
+# ==============================
+# 📌 Helper functions
+# ==============================
+
+def normalize(s):
+    return unicodedata.normalize("NFKD", str(s)).strip()
+
+def extract_year(path_parts):
+    """Extracts year if folder looks like YYYY."""
+    for p in path_parts:
+        if re.fullmatch(r"\d{4}", p):
+            return p
+    return ""
+
+_split_re = re.compile(r'(\d+)')
+
+def natural_key(s):
+    """
+    Key function for natural/human sorting:
+    Splits string into runs of digits and non-digits.
+    Digit runs -> int, else -> lowercase string.
+    Example: "page_10.png" -> ["page_", 10, ".png"]
+    """
+    parts = _split_re.split(s)
+    key = []
+    for p in parts:
+        if p.isdigit():
+            key.append(int(p))
+        else:
+            key.append(p.lower())
+    return key
+
+def get_sheet_service():
+    creds = Credentials.from_service_account_file(
+        CREDENTIALS_FILE,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return build("sheets", "v4", credentials=creds)
+
+
+# ==============================
+# 📌 SCAN R2 FOR IMAGES
+# ==============================
+def scan_r2_images():
+    session = boto3.session.Session()
+    client = session.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY,
+        aws_secret_access_key=R2_SECRET_KEY
+    )
+
+    paginator = client.get_paginator("list_objects_v2")
+    rows_by_folder = {}
+
+    print("📥 Scanning R2 bucket for images...")
+
+    for page in paginator.paginate(Bucket=R2_BUCKET_NAME):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+            key_lower = key.lower()
+
+            # Acceptable image types
+            if not (key_lower.endswith(".png") or key_lower.endswith(".jpg") or key_lower.endswith(".jpeg")):
+                continue
+
+            parts = key.split("/")
+            if len(parts) < 2:
+                continue
+
+            folder_path = "/".join(parts[:-1])   # e.g. "Aerospace Engineering (AE)/2007"
+            filename = parts[-1]
+            year = extract_year(parts)
+            file_url = f"{R2_CDN_BASE}/{key}"
+
+            rows_by_folder.setdefault(folder_path, []).append({
+                "folder_path": folder_path,
+                "file_url": file_url,
+                "filename": filename,
+                "year": year,
+                "notes": ""
+            })
+
+    # Now create final list, ensuring natural sort inside each folder
+    final_rows = []
+    for folder in sorted(rows_by_folder.keys(), key=lambda x: x.lower()):
+        items = rows_by_folder[folder]
+        # Sort by natural key of filename
+        items_sorted = sorted(items, key=lambda it: natural_key(it["filename"]))
+        for it in items_sorted:
+            final_rows.append([
+                it["folder_path"],
+                it["file_url"],
+                it["filename"],
+                it["year"],
+                it["notes"]
+            ])
+
+    return final_rows
+
+
+# ==============================
+# 📌 WRITE IMAGE INDEX TO GOOGLE SHEET
+# ==============================
+def write_to_sheet(service, rows):
+    header = [["Folder Path", "Image URL", "Filename", "Year", "Notes"]]
+
+    print("📤 Writing image index to Google Sheet...")
+
+    # clear existing
+    service.spreadsheets().values().clear(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{TARGET_SHEET}!A:Z"
+    ).execute()
+
+    # push new (header + rows)
+    service.spreadsheets().values().update(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{TARGET_SHEET}!A1",
+        valueInputOption="RAW",
+        body={"values": header + rows}
+    ).execute()
+
+
+# ==============================
+# 🚀 MAIN SCRIPT
+# ==============================
+if __name__ == "__main__":
+    print("🔄 Connecting to Google Sheets...")
+    service = get_sheet_service()
+
+    rows = scan_r2_images()
+
+    if not rows:
+        print("⚠️ No images found in R2 bucket!")
+    else:
+        print(f"📌 Found {len(rows)} image files.")
+
+    write_to_sheet(service, rows)
+
+    print("\n🎉 DONE! Image URLs + folder hierarchy written to Google Sheet.")
