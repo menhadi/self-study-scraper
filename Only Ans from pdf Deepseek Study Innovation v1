@@ -1,0 +1,1283 @@
+import requests
+import json
+import re
+import os
+import time
+import csv
+import PyPDF2
+import pdfplumber
+from typing import Dict, List, Tuple, Optional
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import io
+
+# ==============================
+#  CONFIGURATION
+# ==============================
+DEEPSEEK_API_KEY = "sk-467f5288c9ef40a4ae6ccec5978019ea"  # REPLACE WITH YOUR KEY
+EXTRACTION_MODEL = "deepseek-chat"
+BASE_URL = "https://api.deepseek.com/v1/chat/completions"
+
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+CREDENTIALS_FILE = "service-account.json"
+SHEET_TAB = "Sheet4"
+
+PROGRESS_FILE = "processed_solutions_part1.csv"
+UPDATE_BATCH_SIZE = 3
+
+# ==============================
+#  PDF TEXT EXTRACTOR WITH COLUMN HANDLING
+# ==============================
+class PDFTextExtractor:
+    def __init__(self):
+        pass
+    
+    def extract_text_with_columns(self, pdf_bytes: bytes) -> Tuple[str, List[Dict]]:
+        """Extract text handling multi-column layouts properly"""
+        text = ""
+        page_info = []
+        
+        try:
+            with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                for page_num, page in enumerate(pdf.pages, 1):
+                    try:
+                        # Get page dimensions
+                        width = page.width
+                        height = page.height
+                        
+                        # Check if page has multiple columns
+                        # Common column layouts: split at 50% width
+                        if width > height * 1.2:  # Landscape or wide page
+                            # Try to detect columns
+                            left_half = page.crop((0, 0, width/2, height))
+                            right_half = page.crop((width/2, 0, width, height))
+                            
+                            # Extract from both halves
+                            left_text = left_half.extract_text()
+                            right_text = right_half.extract_text()
+                            
+                            if left_text and right_text:
+                                # Combine reading order: left column then right column
+                                page_text = f"{left_text}\n{right_text}"
+                            else:
+                                page_text = page.extract_text()
+                        else:
+                            # Portrait page, try 2-column detection
+                            # Check if text is concentrated on left and right sides
+                            bbox = page.within_bbox((0, 0, width, height))
+                            words = bbox.extract_words()
+                            
+                            if words:
+                                # Analyze word distribution
+                                left_words = [w for w in words if w['x0'] < width/2]
+                                right_words = [w for w in words if w['x0'] >= width/2]
+                                
+                                if len(left_words) > 5 and len(right_words) > 5:
+                                    # Likely 2-column layout
+                                    left_bbox = page.crop((0, 0, width/2, height))
+                                    right_bbox = page.crop((width/2, 0, width, height))
+                                    left_text = left_bbox.extract_text() or ""
+                                    right_text = right_bbox.extract_text() or ""
+                                    page_text = f"{left_text}\n{right_text}"
+                                else:
+                                    page_text = page.extract_text()
+                            else:
+                                page_text = page.extract_text()
+                        
+                        if page_text and page_text.strip():
+                            page_text = self._clean_text(page_text)
+                            text += f"\n--- Page {page_num} ---\n{page_text}\n"
+                            page_info.append({
+                                'page': page_num,
+                                'text': page_text,
+                                'has_solutions': self._page_has_solutions(page_text),
+                                'char_count': len(page_text),
+                                'words': len(page_text.split())
+                            })
+                        
+                    except Exception as e:
+                        error_msg = str(e)[:100]
+                        print(f"Warning: Error on page {page_num}: {error_msg}")
+                        # Fallback to simple extraction
+                        try:
+                            page_text = page.extract_text()
+                            if page_text:
+                                page_text = self._clean_text(page_text)
+                                text += f"\n--- Page {page_num} ---\n{page_text}\n"
+                                page_info.append({
+                                    'page': page_num,
+                                    'text': page_text,
+                                    'has_solutions': self._page_has_solutions(page_text),
+                                    'char_count': len(page_text),
+                                    'words': len(page_text.split())
+                                })
+                        except:
+                            continue
+            
+            # If pdfplumber failed or extracted little text, try PyPDF2
+            if not text.strip() or len(text.strip()) < 100:
+                print("Trying PyPDF2 as fallback...")
+                try:
+                    reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+                    for page_num, page in enumerate(reader.pages, 1):
+                        try:
+                            page_text = page.extract_text()
+                            if page_text and page_text.strip():
+                                page_text = self._clean_text(page_text)
+                                text += f"\n--- Page {page_num} ---\n{page_text}\n"
+                                page_info.append({
+                                    'page': page_num,
+                                    'text': page_text,
+                                    'has_solutions': self._page_has_solutions(page_text),
+                                    'char_count': len(page_text),
+                                    'words': len(page_text.split())
+                                })
+                        except Exception as e:
+                            error_msg = str(e)[:100]
+                            print(f"Warning: Error on page {page_num} (PyPDF2): {error_msg}")
+                            continue
+                except Exception as e:
+                    error_msg = str(e)[:100]
+                    print(f"Error: PyPDF2 also failed: {error_msg}")
+            
+            return text, page_info
+            
+        except Exception as e:
+            print(f"Error: PDF extraction error: {str(e)}")
+            return "", []
+    
+    def _clean_text(self, text: str) -> str:
+        """Clean extracted PDF text"""
+        if not text:
+            return ""
+        
+        # Remove null bytes and special characters
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+        text = re.sub(r'\ufeff', '', text)
+        text = re.sub(r'�', '', text)
+        
+        # Fix spacing but preserve newlines for structure
+        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r'\n\s*\n\s*\n+', '\n\n', text)  # Reduce multiple blank lines
+        
+        return text.strip()
+    
+    def _page_has_solutions(self, page_text: str) -> bool:
+        """Check if page likely contains solutions"""
+        if not page_text or len(page_text) < 50:
+            return False
+        
+        # Look for solution patterns
+        patterns = [
+            r'\(\d+\)', r'^\d+\.',  # Numbered items
+            r'\[.*\]', r'\\[a-zA-Z]+',  # LaTeX
+            r'→', r'⇒', r'=',  # Math symbols
+            r'Ans[\.:]', r'Answer[\.:]',  # Answer indicators
+            r'Solution[\.:]', r'Explanation[\.:]',
+            r'H_2O', r'CO_2', r'CH_',  # Chemical
+            r'mmHg', r'atm', r'mol',
+            r'oxidation', r'enthalpy', r'equation'
+        ]
+        
+        for pattern in patterns:
+            if re.search(pattern, page_text, re.IGNORECASE):
+                return True
+        
+        return False
+
+# ==============================
+#  SOLUTION EXTRACTOR WITH PAGE CONTINUITY
+# ==============================
+class DeepSeekSolutionExtractor:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        self.pdf_extractor = PDFTextExtractor()
+        self.total_solutions = 0
+    
+    def download_pdf(self, pdf_url: str) -> Optional[bytes]:
+        """Download PDF from URL with retry logic"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                print(f"Downloading PDF (attempt {attempt + 1}/{max_retries})...")
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/pdf,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive'
+                }
+                
+                response = requests.get(pdf_url, headers=headers, timeout=60)
+                response.raise_for_status()
+                
+                pdf_bytes = response.content
+                
+                if len(pdf_bytes) < 100:
+                    print(f"Warning: PDF is very small ({len(pdf_bytes)} bytes)")
+                    return None
+                
+                print(f"Downloaded {len(pdf_bytes):,} bytes")
+                return pdf_bytes
+                
+            except Exception as e:
+                error_msg = str(e)[:200]
+                print(f"Download error (attempt {attempt + 1}): {error_msg}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                else:
+                    return None
+        
+        return None
+    
+    def _convert_latex_to_unicode(self, text: str) -> str:
+        """Convert LaTeX to Unicode"""
+        if not text:
+            return text
+        
+        # Chemical formulas
+        text = re.sub(r'H_2O', 'H₂O', text)
+        text = re.sub(r'CO_2', 'CO₂', text)
+        text = re.sub(r'H_2O_2', 'H₂O₂', text)
+        text = re.sub(r'CH_4', 'CH₄', text)
+        text = re.sub(r'NH_3', 'NH₃', text)
+        text = re.sub(r'SO_2', 'SO₂', text)
+        text = re.sub(r'NO_2', 'NO₂', text)
+        text = re.sub(r'O_2', 'O₂', text)
+        text = re.sub(r'N_2', 'N₂', text)
+        text = re.sub(r'Cl_2', 'Cl₂', text)
+        
+        # Subscripts
+        subscript_map = {'0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄',
+                        '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉'}
+        
+        def replace_subscript(match):
+            num = match.group(1)
+            return ''.join(subscript_map.get(d, d) for d in num)
+        
+        text = re.sub(r'_\{(\d+)\}', replace_subscript, text)
+        text = re.sub(r'_(\d+)', replace_subscript, text)
+        
+        # Superscripts
+        superscript_map = {'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
+                          '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹',
+                          '+': '⁺', '-': '⁻'}
+        
+        def replace_superscript(match):
+            chars = match.group(1)
+            return ''.join(superscript_map.get(c, c) for c in chars)
+        
+        text = re.sub(r'\^\{([^}]+)\}', replace_superscript, text)
+        text = re.sub(r'\^(\d|\+|\-)', lambda m: superscript_map.get(m.group(1), m.group(1)), text)
+        
+        # Greek letters
+        greek = {
+            r'\\alpha': 'α', r'\\beta': 'β', r'\\gamma': 'γ',
+            r'\\delta': 'δ', r'\\Delta': 'Δ', r'\\epsilon': 'ε',
+            r'\\theta': 'θ', r'\\lambda': 'λ', r'\\mu': 'μ',
+            r'\\pi': 'π', r'\\sigma': 'σ', r'\\phi': 'φ',
+            r'\\omega': 'ω'
+        }
+        
+        for latex, unicode in greek.items():
+            text = text.replace(latex, unicode)
+        
+        # Math operators
+        operators = {
+            r'\\times': '×', r'\\cdot': '·', r'\\div': '÷',
+            r'\\pm': '±', r'\\mp': '∓', r'\\leq': '≤',
+            r'\\geq': '≥', r'\\neq': '≠', r'\\approx': '≈',
+            r'\\propto': '∝', r'\\infty': '∞', r'\\partial': '∂',
+            r'\\nabla': '∇', r'\\int': '∫', r'\\sum': '∑',
+            r'\\prod': '∏', r'\\sqrt': '√'
+        }
+        
+        for latex, unicode in operators.items():
+            text = text.replace(latex, unicode)
+        
+        # Arrows
+        arrows = {
+            r'\\rightarrow': '→', r'\\Rightarrow': '⇒',
+            r'\\leftarrow': '←', r'\\Leftarrow': '⇐',
+            r'\\leftrightarrow': '↔', r'\\Leftrightarrow': '⇔',
+            r'\\mapsto': '↦'
+        }
+        
+        for latex, unicode in arrows.items():
+            text = text.replace(latex, unicode)
+        
+        # Remove LaTeX brackets and braces
+        text = re.sub(r'\[|\]', '', text)
+        text = re.sub(r'\{|\}', '', text)
+        
+        # Remove LaTeX commands
+        text = re.sub(r'\\[a-zA-Z]+\{.*?\}', '', text)
+        text = re.sub(r'\\[a-zA-Z]+', '', text)
+        
+        # Clean up
+        text = re.sub(r'\s+', ' ', text).strip()
+        
+        return text
+    
+    def extract_solutions_from_pdf(self, pdf_bytes: bytes, file_name: str) -> List[Dict]:
+        """Main extraction method with continuity handling"""
+        print(f"\nExtracting solutions from: {file_name}")
+        
+        # Extract text with column handling
+        text, page_info = self.pdf_extractor.extract_text_with_columns(pdf_bytes)
+        
+        if not text or len(text.strip()) < 200:
+            print(f"Insufficient text extracted")
+            return [{"error": "Insufficient text", "file_name": file_name}]
+        
+        print(f"Extracted {len(text):,} characters from {len(page_info)} pages")
+        
+        # Save debug file
+        safe_filename = file_name.replace('/', '_').replace('\\', '_')
+        debug_file = f"debug_{safe_filename}.txt"
+        with open(debug_file, 'w', encoding='utf-8') as f:
+            f.write(text[:10000])
+        print(f"Saved extracted text to: {debug_file}")
+        
+        # Get pages with solutions
+        solution_pages = [p for p in page_info if p.get('has_solutions')]
+        if not solution_pages:
+            print("No solution pages detected, processing all pages")
+            solution_pages = page_info
+        
+        print(f"Processing {len(solution_pages)} pages with solutions")
+        
+        # Process in logical chunks preserving continuity
+        all_solutions = []
+        
+        # Method 1: Process entire document with continuity awareness
+        print("\nMETHOD 1: Processing entire document with continuity...")
+        solutions_method1 = self._process_with_continuity(text, file_name)
+        if solutions_method1:
+            all_solutions.extend(solutions_method1)
+            print(f"Method 1 found {len(solutions_method1)} solutions")
+        
+        # Method 2: Process page by page with linking
+        if len(all_solutions) < len(solution_pages) * 0.5:  # If we got too few
+            print("\nMETHOD 2: Processing page-by-page with linking...")
+            solutions_method2 = self._process_page_by_page(page_info, file_name)
+            if solutions_method2:
+                all_solutions.extend(solutions_method2)
+                print(f"Method 2 found {len(solutions_method2)} solutions")
+        
+        # Remove duplicates and merge
+        unique_solutions = self._merge_and_deduplicate(all_solutions)
+        
+        # Verify and fix any issues
+        verified_solutions = self._verify_solutions(unique_solutions, text)
+        
+        self.total_solutions += len(verified_solutions)
+        print(f"\nTotal extracted: {len(verified_solutions)} verified solutions")
+        
+        # Quality check
+        self._quality_check(verified_solutions, len(page_info))
+        
+        return verified_solutions
+    
+    def _process_with_continuity(self, text: str, file_name: str) -> List[Dict]:
+        """Process entire text preserving solution continuity across pages"""
+        solutions = []
+        
+        # Split into chunks that preserve solution boundaries
+        chunks = self._split_preserving_continuity(text)
+        
+        for chunk_num, chunk in enumerate(chunks, 1):
+            print(f"Processing continuity chunk {chunk_num}/{len(chunks)}")
+            
+            chunk_solutions = self._extract_from_chunk(chunk, file_name, chunk_num)
+            if chunk_solutions:
+                solutions.extend(chunk_solutions)
+            
+            time.sleep(1)
+        
+        return solutions
+    
+    def _split_preserving_continuity(self, text: str) -> List[str]:
+        """Split text while preserving solution boundaries"""
+        chunks = []
+        max_chunk_size = 3500
+        
+        # Split at solution boundaries: (1), (2), etc.
+        solution_boundaries = []
+        
+        # Find all solution starts
+        patterns = [
+            r'\n\((\d+)\)\s',           # (1) with space
+            r'\n\((\d+)\)\.',           # (1).
+            r'\n(\d+)\.\s',             # 1. with space
+            r'\nQuestion\s+(\d+)[\.:]', # Question 1:
+            r'\nQ(\d+)[\.:]',           # Q1:
+        ]
+        
+        for pattern in patterns:
+            matches = re.finditer(pattern, text)
+            for match in matches:
+                position = match.start()
+                if position not in solution_boundaries:
+                    solution_boundaries.append(position)
+        
+        solution_boundaries.sort()
+        
+        if not solution_boundaries:
+            # No clear boundaries, split by size
+            for i in range(0, len(text), max_chunk_size):
+                chunks.append(text[i:i + max_chunk_size])
+            return chunks
+        
+        # Create chunks at solution boundaries
+        current_pos = 0
+        
+        for i, boundary in enumerate(solution_boundaries):
+            if boundary - current_pos > max_chunk_size:
+                # Need to split before reaching next boundary
+                if i > 0:
+                    # Split at previous boundary
+                    chunks.append(text[current_pos:solution_boundaries[i-1]])
+                    current_pos = solution_boundaries[i-1]
+                else:
+                    # First chunk too big, split by size
+                    chunks.append(text[current_pos:current_pos + max_chunk_size])
+                    current_pos += max_chunk_size
+        
+        # Add remaining text
+        if current_pos < len(text):
+            chunks.append(text[current_pos:])
+        
+        return chunks
+    
+    def _extract_from_chunk(self, chunk_text: str, file_name: str, chunk_num: int) -> List[Dict]:
+        """Extract solutions from a chunk with rigorous validation"""
+        prompt = f"""CRITICAL: Extract ALL solutions with EXACT question-answer matching.
+
+You are extracting from a SOLUTION KEY PDF. Each entry has:
+1. QUESTION NUMBER in parentheses: (1), (2), (3), etc.
+2. CORRECT OPTION in parentheses with dot: (1)., (2)., (3)., (4).
+3. SOLUTION TEXT explaining why that option is correct
+
+RULES:
+1. NEVER skip any question. Extract EVERY (X) you find.
+2. Question number and correct option MUST stay together.
+3. If a solution continues to next page/lines, include ALL of it.
+4. Convert LaTeX to Unicode:
+   - H_2O → H₂O, CO_2 → CO₂, N_2 → N₂
+   - _2 → ₂, _3 → ₃ (subscripts)
+   - ^0 → ⁰, ^+ → ⁺ (superscripts)
+   - \\times → ×, \\rightarrow → →
+   - \\alpha → α, \\beta → β, \\gamma → γ
+5. For images/diagrams: use [IMAGE]
+6. Output as JSON array
+
+FORMAT for EACH solution:
+{{
+  "question_number": "1",
+  "correct_option": "4",
+  "solution_text": "P_total = X_A × P_A⁰ + X_B × P_B⁰ = 0.5 × 400 + 0.5 × 600 = 500 mmHg..."
+}}
+
+IMPORTANT: If you see patterns like:
+(1)  
+[P_{{\\text{{total}}}} = X_A \\cdot P_A^0 + X_B \\cdot P_B^0]
+[= 0.5 \\times 400 + 0.5 \\times 600 = 500 \\, \\text{{mmHg}}]
+Now, mole fraction...
+
+Extract as: question_number=1, correct_option=(find it), solution_text=(everything after correct option)
+
+TEXT TO PROCESS:
+{chunk_text[:3000]}
+
+Extract EVERY solution. Return JSON array.
+"""
+        
+        payload = {
+            "model": EXTRACTION_MODEL,
+            "temperature": 0.1,
+            "messages": [
+                {
+                    "role": "system",
+                    "content": "You extract every solution from answer keys. Never skip questions. Maintain exact question-answer pairing. Convert all LaTeX."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 4000
+        }
+        
+        try:
+            response = requests.post(BASE_URL, headers=self.headers, json=payload, timeout=120)
+            
+            if response.status_code != 200:
+                return []
+            
+            data = response.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            
+            if not content:
+                return []
+            
+            # Parse JSON
+            try:
+                # Clean JSON
+                content = re.sub(r'```json|```', '', content)
+                content = re.sub(r'^\s*json\s*', '', content, flags=re.IGNORECASE)
+                
+                # Find JSON array
+                match = re.search(r'\[\s*\{.*?\}\s*\]', content, re.DOTALL)
+                if match:
+                    json_str = match.group(0)
+                    json_str = re.sub(r',\s*}', '}', json_str)
+                    json_str = re.sub(r',\s*]', ']', json_str)
+                    solutions = json.loads(json_str)
+                    
+                    # Add metadata
+                    for sol in solutions:
+                        sol['file_name'] = file_name
+                        sol['chunk'] = chunk_num
+                        # Convert LaTeX
+                        if 'solution_text' in sol:
+                            sol['solution_text'] = self._convert_latex_to_unicode(sol['solution_text'])
+                    
+                    return solutions
+            except:
+                pass
+            
+            # Fallback parsing
+            return self._robust_fallback_parsing(chunk_text, file_name, chunk_num)
+            
+        except Exception as e:
+            print(f"API error: {str(e)[:100]}")
+            return []
+    
+    def _process_page_by_page(self, page_info: List[Dict], file_name: str) -> List[Dict]:
+        """Process page by page, linking continued solutions"""
+        all_solutions = []
+        continuation_buffer = ""  # For solutions that span pages
+        
+        for page in page_info:
+            page_text = page.get('text', '')
+            page_num = page.get('page', 0)
+            
+            if not page_text:
+                continue
+            
+            print(f"Processing page {page_num}")
+            
+            # Combine with continuation buffer
+            text_to_process = continuation_buffer + "\n" + page_text if continuation_buffer else page_text
+            
+            # Extract solutions from this page
+            page_solutions = self._extract_from_page(text_to_process, file_name, page_num)
+            
+            # Check for continuations
+            if page_solutions:
+                # Check if last solution seems incomplete
+                last_solution = page_solutions[-1]
+                last_text = last_solution.get('solution_text', '')
+                
+                # Heuristics for incomplete solutions
+                is_incomplete = (
+                    len(last_text) < 50 or  # Very short
+                    last_text.endswith('...') or
+                    last_text.endswith('-') or  # Hyphenated word
+                    re.search(r'[a-z][,\-\s]*$', last_text)  # Ends mid-sentence
+                )
+                
+                if is_incomplete and len(page_solutions) > 0:
+                    # Store for continuation
+                    continuation_buffer = text_to_process
+                    # Remove the incomplete solution
+                    page_solutions = page_solutions[:-1]
+                else:
+                    # Clear buffer
+                    continuation_buffer = ""
+                
+                all_solutions.extend(page_solutions)
+            
+            time.sleep(0.5)
+        
+        # Process any remaining buffer
+        if continuation_buffer:
+            final_solutions = self._extract_from_page(continuation_buffer, file_name, "final")
+            all_solutions.extend(final_solutions)
+        
+        return all_solutions
+    
+    def _extract_from_page(self, page_text: str, file_name: str, page_num: int) -> List[Dict]:
+        """Extract solutions from a single page"""
+        solutions = []
+        
+        # Look for solution patterns
+        # Pattern: (1) then optional whitespace then (X). then solution text
+        pattern = r'\((\d+)\)\s*(?:.*?)(?:\((\d+)\)\.|(\d+)\.)\s*(.*?)(?=\(\d+\)|\n\(\d+\)|\Z)'
+        
+        matches = re.finditer(pattern, page_text, re.DOTALL)
+        
+        for match in matches:
+            question_num = match.group(1)
+            # Try different option patterns
+            correct_option = match.group(2) or match.group(3) or ""
+            solution_text = match.group(4).strip() if match.group(4) else ""
+            
+            if not correct_option:
+                # Try to find option in the text after question number
+                option_search = re.search(r'\((\d+)\)\.', match.group(0))
+                if option_search:
+                    correct_option = option_search.group(1)
+            
+            # Clean and convert solution text
+            if solution_text:
+                solution_text = self._clean_solution_text(solution_text)
+                solution_text = self._convert_latex_to_unicode(solution_text)
+            
+            if question_num:
+                solution = {
+                    "question_number": question_num,
+                    "correct_option": correct_option,
+                    "solution_text": solution_text,
+                    "file_name": file_name,
+                    "page": page_num,
+                    "extraction_method": "regex"
+                }
+                solutions.append(solution)
+        
+        return solutions
+    
+    def _clean_solution_text(self, text: str) -> str:
+        """Clean solution text"""
+        if not text:
+            return ""
+        
+        # Remove page markers
+        text = re.sub(r'--- Page \d+ ---', '', text)
+        
+        # Remove LaTeX commands
+        text = re.sub(r'\\[a-zA-Z]+\{.*?\}', '', text)
+        text = re.sub(r'\\[a-zA-Z]+', '', text)
+        
+        # Clean whitespace
+        text = re.sub(r'\s+', ' ', text)
+        
+        return text.strip()
+    
+    def _robust_fallback_parsing(self, text: str, file_name: str, chunk_num: int) -> List[Dict]:
+        """Robust fallback parsing when API fails"""
+        print(f"Using robust fallback parsing for chunk {chunk_num}")
+        
+        solutions = []
+        
+        # Multiple pattern attempts
+        patterns = [
+            # Standard pattern: (1) ... (4). solution
+            r'\((\d+)\)(?:.*?)(?:\((\d+)\)\.)\s*(.*?)(?=\(\d+\)|\Z)',
+            # Pattern without parentheses on option: (1) ... 4. solution
+            r'\((\d+)\)(?:.*?)(?:(\d+)\.)\s*(.*?)(?=\(\d+\)|\Z)',
+            # Pattern with Answer: prefix
+            r'\((\d+)\)(?:.*?)Answer[:\s]+(\d+)[\.\s]*(.*?)(?=\(\d+\)|\Z)',
+            # Very simple: (1) followed by text until next (X)
+            r'\((\d+)\)\s*(.*?)(?=\(\d+\)|\Z)',
+        ]
+        
+        for pattern in patterns:
+            matches = re.finditer(pattern, text, re.DOTALL | re.IGNORECASE)
+            
+            for match in matches:
+                question_num = match.group(1)
+                
+                # Try to extract option
+                correct_option = ""
+                solution_text = ""
+                
+                if len(match.groups()) >= 2:
+                    correct_option = match.group(2) or ""
+                if len(match.groups()) >= 3:
+                    solution_text = match.group(3) or ""
+                
+                # If no solution text captured, use everything after question number
+                if not solution_text and len(match.groups()) >= 2:
+                    solution_text = match.group(2) or ""
+                
+                # Clean solution text
+                solution_text = self._clean_solution_text(solution_text)
+                
+                # Try to find option in solution text if not found
+                if not correct_option and solution_text:
+                    option_match = re.search(r'\((\d+)\)\.', solution_text)
+                    if option_match:
+                        correct_option = option_match.group(1)
+                        # Remove option from solution text
+                        solution_text = solution_text[option_match.end():].strip()
+                
+                # Convert LaTeX
+                solution_text = self._convert_latex_to_unicode(solution_text)
+                
+                if question_num:
+                    solution = {
+                        "question_number": question_num,
+                        "correct_option": correct_option,
+                        "solution_text": solution_text,
+                        "file_name": file_name,
+                        "chunk": chunk_num,
+                        "extraction_method": "fallback"
+                    }
+                    
+                    # Check if this question already exists
+                    existing = [s for s in solutions if s.get('question_number') == question_num]
+                    if not existing:
+                        solutions.append(solution)
+        
+        return solutions
+    
+    def _merge_and_deduplicate(self, solutions: List[Dict]) -> List[Dict]:
+        """Merge and deduplicate solutions"""
+        merged = {}
+        
+        for sol in solutions:
+            if not isinstance(sol, dict):
+                continue
+            
+            q_num = sol.get('question_number')
+            if not q_num:
+                continue
+            
+            # Clean question number
+            q_num = re.sub(r'[^\d]', '', q_num)
+            if not q_num:
+                continue
+            
+            # If we already have this question, keep the one with more complete data
+            if q_num in merged:
+                existing = merged[q_num]
+                
+                # Prefer solution with correct option
+                if not existing.get('correct_option') and sol.get('correct_option'):
+                    merged[q_num] = sol
+                # Prefer longer solution text
+                elif len(sol.get('solution_text', '')) > len(existing.get('solution_text', '')):
+                    merged[q_num] = sol
+                # Prefer API extraction over fallback
+                elif sol.get('extraction_method') == 'api' and existing.get('extraction_method') != 'api':
+                    merged[q_num] = sol
+            else:
+                merged[q_num] = sol
+        
+        # Sort by question number
+        sorted_solutions = []
+        for q_num in sorted(merged.keys(), key=lambda x: int(x) if x.isdigit() else 9999):
+            sorted_solutions.append(merged[q_num])
+        
+        return sorted_solutions
+    
+    def _verify_solutions(self, solutions: List[Dict], original_text: str) -> List[Dict]:
+        """Verify solutions and fix missing/questionable ones"""
+        print(f"\nVerifying {len(solutions)} solutions...")
+        
+        verified = []
+        question_numbers = set()
+        
+        # First pass: validate existing solutions
+        for sol in solutions:
+            q_num = sol.get('question_number', '')
+            option = sol.get('correct_option', '')
+            text = sol.get('solution_text', '')
+            
+            # Basic validation
+            is_valid = (
+                q_num and q_num.isdigit() and
+                option and option in ['1', '2', '3', '4', 'A', 'B', 'C', 'D'] and
+                len(text) > 10
+            )
+            
+            if is_valid:
+                verified.append(sol)
+                question_numbers.add(int(q_num))
+            else:
+                print(f"  Question {q_num} flagged for review")
+                # Try to fix
+                fixed = self._try_fix_solution(sol, original_text)
+                if fixed:
+                    verified.append(fixed)
+                    question_numbers.add(int(fixed.get('question_number', 0)))
+        
+        # Check for missing questions
+        if question_numbers:
+            min_q = min(question_numbers)
+            max_q = max(question_numbers)
+            expected_range = set(range(min_q, max_q + 1))
+            missing = expected_range - question_numbers
+            
+            if missing:
+                print(f"  Missing questions: {sorted(missing)[:10]}...")
+                
+                # Try to find missing questions
+                for missing_q in missing:
+                    found = self._find_missing_question(missing_q, original_text, solutions[0].get('file_name') if solutions else "")
+                    if found:
+                        verified.append(found)
+                        question_numbers.add(missing_q)
+        
+        # Final sort
+        verified.sort(key=lambda x: int(x.get('question_number', 9999)))
+        
+        print(f"  After verification: {len(verified)} solutions")
+        return verified
+    
+    def _try_fix_solution(self, solution: Dict, original_text: str) -> Optional[Dict]:
+        """Try to fix a problematic solution"""
+        q_num = solution.get('question_number', '')
+        
+        if not q_num:
+            return None
+        
+        # Search for this question in original text
+        pattern = rf'\({re.escape(q_num)}\)(?:.*?)(?:\((\d+)\)\.|(\d+)\.)\s*(.*?)(?=\(\d+\)|\Z)'
+        match = re.search(pattern, original_text, re.DOTALL)
+        
+        if match:
+            option = match.group(1) or match.group(2) or ""
+            text = match.group(3) or ""
+            
+            if text:
+                text = self._clean_solution_text(text)
+                text = self._convert_latex_to_unicode(text)
+                
+                return {
+                    "question_number": q_num,
+                    "correct_option": option,
+                    "solution_text": text,
+                    "file_name": solution.get('file_name', ''),
+                    "extraction_method": "repaired"
+                }
+        
+        return None
+    
+    def _find_missing_question(self, q_num: int, text: str, file_name: str) -> Optional[Dict]:
+        """Find a missing question in the text"""
+        # Search for this specific question
+        patterns = [
+            rf'\({q_num}\)\s*(?:.*?)(?:\((\d+)\)\.)\s*(.*?)(?=\(\d+\)|\Z)',
+            rf'\({q_num}\)\s*(?:.*?)(?:(\d+)\.)\s*(.*?)(?=\(\d+\)|\Z)',
+            rf'Question\s+{q_num}[\.:]\s*(?:.*?)(?:Answer[:\s]+(\d+))[\.\s]*(.*?)(?=Question\s+\d+|\Z)',
+        ]
+        
+        for pattern in patterns:
+            match = re.search(pattern, text, re.DOTALL | re.IGNORECASE)
+            if match:
+                option = ""
+                solution_text = ""
+                
+                if len(match.groups()) >= 1:
+                    option = match.group(1) or ""
+                if len(match.groups()) >= 2:
+                    solution_text = match.group(2) or ""
+                
+                if solution_text:
+                    solution_text = self._clean_solution_text(solution_text)
+                    solution_text = self._convert_latex_to_unicode(solution_text)
+                    
+                    return {
+                        "question_number": str(q_num),
+                        "correct_option": option,
+                        "solution_text": solution_text,
+                        "file_name": file_name,
+                        "extraction_method": "recovered"
+                    }
+        
+        return None
+    
+    def _quality_check(self, solutions: List[Dict], total_pages: int):
+        """Perform quality check on extracted solutions"""
+        print(f"\nQUALITY CHECK:")
+        print(f"  Total solutions: {len(solutions)}")
+        
+        if not solutions:
+            print("  ⚠ No solutions extracted!")
+            return
+        
+        # Check for completeness
+        q_numbers = [int(s.get('question_number', 0)) for s in solutions if s.get('question_number', '').isdigit()]
+        
+        if q_numbers:
+            min_q = min(q_numbers)
+            max_q = max(q_numbers)
+            expected_count = max_q - min_q + 1
+            actual_count = len(set(q_numbers))
+            
+            print(f"  Question range: {min_q} to {max_q}")
+            print(f"  Expected solutions: {expected_count}")
+            print(f"  Actual unique solutions: {actual_count}")
+            
+            if actual_count < expected_count:
+                missing = expected_count - actual_count
+                print(f"  ⚠ Missing {missing} solutions ({missing/expected_count*100:.1f}%)")
+            else:
+                print(f"  ✓ Good coverage")
+        
+        # Check solution text quality
+        valid_solutions = 0
+        for sol in solutions:
+            text = sol.get('solution_text', '')
+            option = sol.get('correct_option', '')
+            
+            if len(text) > 20 and option:
+                valid_solutions += 1
+        
+        print(f"  Valid solutions (good text + option): {valid_solutions}/{len(solutions)} ({valid_solutions/len(solutions)*100:.1f}%)")
+        
+        # Check for LaTeX issues
+        latex_issues = sum(1 for s in solutions if '\\' in s.get('solution_text', ''))
+        if latex_issues:
+            print(f"  ⚠ {latex_issues} solutions have LaTeX issues")
+    
+    def process_pdf_batch(self, pdf_batch: List[Tuple[str, str]]) -> List[Dict]:
+        """Process a batch of PDFs"""
+        results = []
+        
+        for file_name, pdf_url in pdf_batch:
+            print(f"\n{'='*60}")
+            print(f"PROCESSING: {file_name}")
+            print(f"URL: {pdf_url[:100]}...")
+            print(f"{'='*60}")
+            
+            try:
+                # Download PDF
+                pdf_bytes = self.download_pdf(pdf_url)
+                if not pdf_bytes:
+                    results.append({"error": "Failed to download PDF", "file_name": file_name})
+                    continue
+                
+                # Extract solutions
+                solutions = self.extract_solutions_from_pdf(pdf_bytes, file_name)
+                results.extend(solutions)
+                
+                time.sleep(2)
+                
+            except Exception as e:
+                error_msg = f"Error processing {file_name}: {str(e)[:200]}"
+                print(f"{error_msg}")
+                results.append({"error": error_msg, "file_name": file_name})
+        
+        return results
+
+# ==============================
+#  GOOGLE SHEETS PROCESSOR
+# ==============================
+class GoogleSheetsSolutionProcessor:
+    def __init__(self, credentials_file: str, sheet_id: str, api_key: str, sheet_tab: str):
+        self.sheet_id = sheet_id
+        self.sheet_tab = sheet_tab
+        self.extractor = DeepSeekSolutionExtractor(api_key)
+        self.service = self._authenticate(credentials_file)
+        self.next_output_row = 2
+    
+    def _authenticate(self, credentials_file: str):
+        """Authenticate with Google Sheets API"""
+        try:
+            if not os.path.exists(credentials_file):
+                raise FileNotFoundError(f"Credentials file not found: {credentials_file}")
+            
+            scopes = ['https://www.googleapis.com/auth/spreadsheets']
+            creds = service_account.Credentials.from_service_account_file(
+                credentials_file, scopes=scopes)
+            return build('sheets', 'v4', credentials=creds)
+        except Exception as e:
+            print(f"Google Sheets authentication failed: {e}")
+            raise
+    
+    def read_sheet_data(self) -> List[List[str]]:
+        """Read file names and URLs from sheet"""
+        try:
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!A:B"
+            ).execute()
+            
+            values = result.get('values', [])
+            print(f"Read {len(values)} rows from sheet")
+            return values
+        except Exception as e:
+            print(f"Error reading sheet: {e}")
+            return []
+    
+    def load_processed_files(self) -> set:
+        """Load already processed files from CSV"""
+        processed_files = set()
+        
+        if os.path.exists(PROGRESS_FILE):
+            try:
+                with open(PROGRESS_FILE, 'r', newline='', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    for row in reader:
+                        if row and row[0]:
+                            processed_files.add(row[0])
+                print(f"Loaded {len(processed_files)} processed files")
+            except Exception as e:
+                print(f"Error reading progress file: {e}")
+        
+        return processed_files
+    
+    def save_processed_files(self, processed_files: set):
+        """Save processed files to CSV"""
+        try:
+            with open(PROGRESS_FILE, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                for file_name in sorted(processed_files):
+                    writer.writerow([file_name])
+            print(f"Saved {len(processed_files)} processed files")
+        except Exception as e:
+            print(f"Error saving progress file: {e}")
+    
+    def clear_output_columns(self):
+        """Clear columns C through E"""
+        try:
+            self.service.spreadsheets().values().clear(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!C:E"
+            ).execute()
+            print("Cleared previous output columns (C-E)")
+        except Exception as e:
+            print(f"Error clearing columns: {e}")
+    
+    def update_sheet_with_solutions(self, solutions_batch: List[Dict]):
+        """Update Google Sheets with solutions"""
+        if not solutions_batch:
+            return
+        
+        rows = []
+        for sol in solutions_batch:
+            if not isinstance(sol, dict):
+                continue
+            
+            if "error" in sol:
+                rows.append([
+                    "ERROR",
+                    sol.get("file_name", ""),
+                    sol.get("error", "")
+                ])
+            else:
+                rows.append([
+                    sol.get("question_number", ""),
+                    sol.get("correct_option", ""),
+                    sol.get("solution_text", "")
+                ])
+        
+        try:
+            if rows:
+                range_name = f"{self.sheet_tab}!C{self.next_output_row}"
+                body = {"values": rows}
+                
+                self.service.spreadsheets().values().update(
+                    spreadsheetId=self.sheet_id,
+                    range=range_name,
+                    valueInputOption="RAW",
+                    body=body
+                ).execute()
+                
+                print(f"Updated sheet with {len(rows)} solutions (row {self.next_output_row})")
+                self.next_output_row += len(rows)
+        except Exception as e:
+            print(f"Error updating sheet: {e}")
+    
+    def process_all_pdfs(self, batch_size: int = 1, resume: bool = True):
+        """Main processing function"""
+        print(f"\n{'='*80}")
+        print("STARTING PDF SOLUTION EXTRACTION")
+        print(f"{'='*80}")
+        
+        # Read sheet data
+        sheet_data = self.read_sheet_data()
+        if len(sheet_data) < 2:
+            print("No data found in sheet")
+            return
+        
+        # Load processed files
+        processed_files = self.load_processed_files()
+        
+        # Clear output if not resuming
+        if not resume or not processed_files:
+            self.clear_output_columns()
+            self.next_output_row = 2
+            print("Starting fresh processing")
+        else:
+            print(f"Resuming from previous progress ({len(processed_files)} files already processed)")
+        
+        # Prepare files to process
+        files_to_process = []
+        skipped_count = 0
+        
+        for i, row in enumerate(sheet_data[1:], start=2):
+            if len(row) < 2:
+                continue
+            
+            file_name = row[0].strip()
+            pdf_url = row[1].strip()
+            
+            if not pdf_url.startswith("http"):
+                continue
+            
+            if resume and file_name in processed_files:
+                skipped_count += 1
+                continue
+            
+            files_to_process.append((file_name, pdf_url))
+        
+        print(f"\nPROCESSING SUMMARY:")
+        print(f"  Total rows: {len(sheet_data) - 1}")
+        print(f"  Already processed: {skipped_count}")
+        print(f"  To process: {len(files_to_process)}")
+        
+        if not files_to_process:
+            print("\nAll PDFs already processed!")
+            return
+        
+        # Process in batches
+        all_solutions = []
+        
+        for i in range(0, len(files_to_process), batch_size):
+            batch = files_to_process[i:i + batch_size]
+            batch_num = i // batch_size + 1
+            
+            print(f"\n{'='*60}")
+            print(f"BATCH {batch_num}")
+            
+            # Process batch
+            batch_results = self.extractor.process_pdf_batch(batch)
+            
+            # Mark files as processed
+            for name, _ in batch:
+                processed_files.add(name)
+            
+            self.save_processed_files(processed_files)
+            
+            # Filter and add valid solutions
+            valid_solutions = [s for s in batch_results if isinstance(s, dict) and s.get("question_number")]
+            all_solutions.extend(valid_solutions)
+            
+            # Update sheet
+            if valid_solutions:
+                self.update_sheet_with_solutions(valid_solutions)
+            
+            # Rate limiting
+            if i + batch_size < len(files_to_process):
+                time.sleep(3)
+        
+        # Final summary
+        print(f"\n{'='*80}")
+        print("PROCESSING COMPLETE!")
+        print(f"{'='*80}")
+        print(f"Total files processed: {len(files_to_process)}")
+        print(f"Total solutions extracted: {len(all_solutions)}")
+        print(f"Solutions saved to: {self.sheet_tab}!C{2}:E{self.next_output_row-1}")
+        print(f"{'='*80}")
+
+# ==============================
+#  MAIN FUNCTION
+# ==============================
+def main():
+    print("\n" + "="*80)
+    print("   PDF SOLUTION EXTRACTION SYSTEM")
+    print("="*80)
+    
+    if DEEPSEEK_API_KEY == "your_deepseek_api_key_here":
+        print("ERROR: Please update your DeepSeek API key")
+        return
+    
+    if not os.path.exists(CREDENTIALS_FILE):
+        print(f"\nCredentials file not found: {CREDENTIALS_FILE}")
+        return
+    
+    # Configuration
+    BATCH_SIZE = 1
+    RESUME_MODE = True
+    
+    print(f"\nCONFIGURATION:")
+    print(f"  Model: {EXTRACTION_MODEL}")
+    print(f"  Sheet: {GOOGLE_SHEET_ID}")
+    print(f"  Tab: {SHEET_TAB}")
+    
+    try:
+        processor = GoogleSheetsSolutionProcessor(
+            credentials_file=CREDENTIALS_FILE,
+            sheet_id=GOOGLE_SHEET_ID,
+            api_key=DEEPSEEK_API_KEY,
+            sheet_tab=SHEET_TAB
+        )
+        
+        processor.process_all_pdfs(batch_size=BATCH_SIZE, resume=RESUME_MODE)
+        
+    except KeyboardInterrupt:
+        print("\n\nProcessing interrupted")
+    except Exception as e:
+        print(f"\nFatal error: {e}")
+        import traceback
+        traceback.print_exc()
+
+# ==============================
+#  TEST FUNCTION
+# ==============================
+def test_single_pdf():
+    """Test single PDF extraction"""
+    print("\n" + "="*80)
+    print("   TEST SINGLE PDF")
+    print("="*80)
+    
+    if DEEPSEEK_API_KEY == "your_deepseek_api_key_here":
+        print("Please update API key")
+        return
+    
+    print("\nEnter PDF URL:")
+    pdf_url = input().strip()
+    
+    if not pdf_url:
+        print("No URL provided")
+        return
+    
+    extractor = DeepSeekSolutionExtractor(DEEPSEEK_API_KEY)
+    
+    pdf_bytes = extractor.download_pdf(pdf_url)
+    if not pdf_bytes:
+        print("Failed to download")
+        return
+    
+    solutions = extractor.extract_solutions_from_pdf(pdf_bytes, "test.pdf")
+    
+    # Save results
+    output_file = "test_solutions.json"
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(solutions, f, indent=2, ensure_ascii=False)
+    
+    print(f"\nResults saved to: {output_file}")
+    print(f"\nExtracted {len([s for s in solutions if isinstance(s, dict)])} solutions")
+    
+    # Show samples
+    for i, sol in enumerate(solutions[:5]):
+        if isinstance(sol, dict):
+            print(f"\nSample {i+1}:")
+            print(f"  Question: {sol.get('question_number')}")
+            print(f"  Option: {sol.get('correct_option')}")
+            print(f"  Text length: {len(sol.get('solution_text', ''))} chars")
+            print(f"  Preview: {sol.get('solution_text', '')[:100]}...")
+
+# ==============================
+#  ENTRY POINT
+# ==============================
+if __name__ == "__main__":
+    print("Choose mode:")
+    print("1. Process solutions to Google Sheets")
+    print("2. Test single PDF")
+    print("3. Exit")
+    
+    choice = input("\nEnter choice (1/2/3): ").strip()
+    
+    if choice == "2":
+        test_single_pdf()
+    elif choice == "3":
+        print("Exiting...")
+    else:
+        main()
