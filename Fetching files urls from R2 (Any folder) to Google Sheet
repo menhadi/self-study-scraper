@@ -1,0 +1,158 @@
+import os
+import re
+import boto3
+import unicodedata
+
+from google.oauth2.service_account import Credentials
+from googleapiclient.discovery import build
+
+# ==============================
+# 🔧 CONFIGURATION
+# ==============================
+
+R2_ACCOUNT_ID   = "9c3a111cd1c8101060111b18f9dda444"
+R2_ACCESS_KEY   = "cd09fc348dc0e5ac72d04d7b301ae141"
+R2_SECRET_KEY   = "15c67f92b18a5b0dc5a4ce9f6b675e76367544a316aa21118ce0d737ab080d7a"
+R2_BUCKET_NAME  = "tech4learn"
+R2_CDN_BASE     = "https://cdn.tech4learn.com"
+
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+CREDENTIALS_FILE = "service-account.json"
+TARGET_SHEET = "Sheet4"
+
+# ✅ SCAN EVERYTHING UNDER THIS BASE FOLDER (ALL FILE TYPES)
+BASE_PREFIX = "Study Innovation/Foundation/"
+
+# ==============================
+# 📌 HELPERS
+# ==============================
+
+def extract_year(path_parts):
+    for p in path_parts:
+        if re.fullmatch(r"\d{4}", p):
+            return p
+    return ""
+
+_split_re = re.compile(r'(\d+)')
+
+def natural_key(s):
+    parts = _split_re.split(s)
+    key = []
+    for p in parts:
+        key.append(int(p) if p.isdigit() else p.lower())
+    return key
+
+def get_file_type(filename):
+    ext = os.path.splitext(filename)[1].lower()
+    return ext.replace(".", "") if ext else "unknown"
+
+def get_sheet_service():
+    creds = Credentials.from_service_account_file(
+        CREDENTIALS_FILE,
+        scopes=["https://www.googleapis.com/auth/spreadsheets"]
+    )
+    return build("sheets", "v4", credentials=creds)
+
+# ==============================
+# 📌 SCAN R2 (ALL FILE TYPES)
+# ==============================
+
+def scan_r2_files():
+    session = boto3.session.Session()
+    client = session.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY,
+        aws_secret_access_key=R2_SECRET_KEY
+    )
+
+    paginator = client.get_paginator("list_objects_v2")
+    rows_by_folder = {}
+
+    print("📥 Auto-scanning ALL FILE TYPES inside:")
+    print(BASE_PREFIX)
+
+    for page in paginator.paginate(
+        Bucket=R2_BUCKET_NAME,
+        Prefix=BASE_PREFIX
+    ):
+        for obj in page.get("Contents", []):
+            key = obj["Key"]
+
+            # ❌ Skip folder placeholders
+            if key.endswith("/"):
+                continue
+
+            parts = key.split("/")
+            if len(parts) < 2:
+                continue
+
+            folder_path = "/".join(parts[:-1])
+            filename = parts[-1]
+            year = extract_year(parts)
+            file_url = f"{R2_CDN_BASE}/{key}"
+            file_type = get_file_type(filename)
+
+            rows_by_folder.setdefault(folder_path, []).append({
+                "folder_path": folder_path,
+                "file_url": file_url,
+                "filename": filename,
+                "file_type": file_type,
+                "year": year,
+                "notes": ""
+            })
+
+    final_rows = []
+    for folder in sorted(rows_by_folder.keys(), key=str.lower):
+        items_sorted = sorted(rows_by_folder[folder], key=lambda it: natural_key(it["filename"]))
+        for it in items_sorted:
+            final_rows.append([
+                it["folder_path"],
+                it["file_url"],
+                it["filename"],
+                it["file_type"],
+                it["year"],
+                it["notes"]
+            ])
+
+    return final_rows
+
+# ==============================
+# 📌 WRITE TO GOOGLE SHEET
+# ==============================
+
+def write_to_sheet(service, rows):
+    header = [["Folder Path", "File URL", "Filename", "File Type", "Year", "Notes"]]
+
+    print("📤 Writing data to Google Sheet...")
+
+    service.spreadsheets().values().clear(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{TARGET_SHEET}!A:Z"
+    ).execute()
+
+    service.spreadsheets().values().update(
+        spreadsheetId=GOOGLE_SHEET_ID,
+        range=f"{TARGET_SHEET}!A1",
+        valueInputOption="RAW",
+        body={"values": header + rows}
+    ).execute()
+
+# ==============================
+# 🚀 MAIN
+# ==============================
+
+if __name__ == "__main__":
+    print("🔄 Connecting to Google Sheets...")
+    service = get_sheet_service()
+
+    rows = scan_r2_files()
+
+    if not rows:
+        print("⚠️ No files found in selected folder.")
+    else:
+        print(f"✅ Total files found: {len(rows)}")
+
+    write_to_sheet(service, rows)
+
+    print("\n🎉 DONE! ALL FILE TYPES synced successfully.")
