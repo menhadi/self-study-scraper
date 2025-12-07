@@ -1,0 +1,111 @@
+import os
+import boto3
+import re
+from tqdm import tqdm
+from botocore.client import Config
+from datetime import datetime
+
+# ==============================
+# ✅ R2 CONFIGURATION
+# ==============================
+R2_ACCOUNT_ID   = "9c3a111cd1c8101060111b18f9dda444"
+R2_ACCESS_KEY   = "cd09fc348dc0e5ac72d04d7b301ae141"
+R2_SECRET_KEY   = "15c67f92b18a5b0dc5a4ce9f6b675e76367544a316aa21118ce0d737ab080d7a"
+R2_BUCKET_NAME  = "tech4learn"
+R2_CDN_BASE     = "https://cdn.tech4learn.com"
+
+# ==============================
+# ✅ PDF BASE FOLDER (INPUT)
+# ==============================
+PDF_BASE_DIR = r"D:\Vector Academy\Contents\PYQ\GATE\Image"
+
+# ==============================
+# ✅ OUTPUT LOG FILES
+# ==============================
+TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+LOG_FILE     = os.path.join(PDF_BASE_DIR, f"pdf_upload_log_{TIMESTAMP}.csv")
+URL_FILE     = os.path.join(PDF_BASE_DIR, f"pdf_uploaded_urls_{TIMESTAMP}.txt")
+MAPPING_FILE = os.path.join(PDF_BASE_DIR, f"pdf_uploaded_mapping_{TIMESTAMP}.txt")
+
+# ==============================
+# ✅ CONNECT TO R2
+# ==============================
+endpoint_url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
+s3 = boto3.client(
+    "s3",
+    endpoint_url=endpoint_url,
+    aws_access_key_id=R2_ACCESS_KEY,
+    aws_secret_access_key=R2_SECRET_KEY,
+    config=Config(signature_version="s3v4"),
+    region_name="auto"
+)
+
+# ==============================
+# ✅ NATURAL NUMERIC SORT FIX
+# ==============================
+def natural_sort_key(path):
+    filename = os.path.basename(path)
+    return [int(text) if text.isdigit() else text.lower()
+            for text in re.split(r'(\d+)', filename)]
+
+# ==============================
+# ✅ FIND ONLY PDF FILES
+# ==============================
+all_pdfs = []
+
+for root, _, files in os.walk(PDF_BASE_DIR):
+    for f in files:
+        if f.lower().endswith(".pdf"):
+            all_pdfs.append(os.path.join(root, f))
+
+# ✅ SORT PROPERLY
+all_pdfs.sort(key=natural_sort_key)
+
+print(f"✅ Total PDFs Found: {len(all_pdfs)}")
+
+# ==============================
+# ✅ OUTPUT HOLDERS
+# ==============================
+log_lines = ["PDF_File,Status,Message,Public_URL"]
+url_lines = []
+mapping_lines = ["PDF_File,Public_URL"]
+
+# ==============================
+# ✅ MAIN UPLOAD LOOP (PDF ONLY)
+# ==============================
+for pdf_path in tqdm(all_pdfs, desc="Uploading PDFs to R2"):
+    try:
+        rel_path = os.path.relpath(pdf_path, PDF_BASE_DIR).replace("\\", "/")
+
+        s3.upload_file(pdf_path, R2_BUCKET_NAME, rel_path)
+
+        public_url = f"{R2_CDN_BASE}/{rel_path}"
+
+        log_lines.append(f"{rel_path},OK,Uploaded,{public_url}")
+        url_lines.append(public_url)
+        mapping_lines.append(f"{rel_path},{public_url}")
+
+        print(f"✅ Uploaded: {rel_path}")
+
+    except Exception as e:
+        log_lines.append(f"{pdf_path},FAIL,{str(e)},")
+        print(f"❌ Upload failed: {pdf_path}")
+
+# ==============================
+# ✅ SAVE OUTPUT FILES
+# ==============================
+with open(LOG_FILE, "w", encoding="utf-8") as f:
+    f.write("\n".join(log_lines))
+
+with open(URL_FILE, "w", encoding="utf-8") as f:
+    f.write("\n".join(url_lines))
+
+with open(MAPPING_FILE, "w", encoding="utf-8") as f:
+    f.write("\n".join(mapping_lines))
+
+print("\n✅ ALL PDFs UPLOADED SUCCESSFULLY!")
+print(f"📋 Log File    : {LOG_FILE}")
+print(f"🌐 URL File    : {URL_FILE}")
+print(f"🔗 Mapping File: {MAPPING_FILE}")
