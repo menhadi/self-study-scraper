@@ -1,0 +1,1640 @@
+import requests
+import json
+import re
+import os
+import time
+import csv
+import PyPDF2
+import pdfplumber
+from typing import Dict, List, Tuple, Optional
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import io
+
+# ==============================
+#  CONFIGURATION
+# ==============================
+DEEPSEEK_API_KEY = "sk-467f5288c9ef40a4ae6ccec5978019ea"  # REPLACE WITH YOUR KEY
+EXTRACTION_MODEL = "deepseek-chat"
+BASE_URL = "https://api.deepseek.com/v1/chat/completions"
+
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+CREDENTIALS_FILE = "service-account.json"
+SHEET_TAB = "Sheet4"
+
+PROGRESS_FILE = "processed_pdfs_part1.csv"
+UPDATE_BATCH_SIZE = 3
+SKIP_PATTERNS = ['cover', 'title_page', 'instruction_only', 'answer_key', 'solution_manual']
+
+# ==============================
+#  PDF TEXT EXTRACTOR (IMPROVED)
+# ==============================
+class PDFTextExtractor:
+    def __init__(self):
+        pass
+    
+    def extract_text_from_pdf(self, pdf_bytes: bytes) -> Tuple[str, List[Dict]]:
+        """Extract text from digital PDF with page information"""
+        text = ""
+        page_info = []
+        
+        try:
+            # Try pdfplumber first (better for digital PDFs)
+            try:
+                with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+                    for page_num, page in enumerate(pdf.pages, 1):
+                        try:
+                            page_text = page.extract_text()
+                            if page_text and page_text.strip():
+                                page_text = self._clean_text(page_text)
+                                text += f"\n--- Page {page_num} ---\n{page_text}\n"
+                                page_info.append({
+                                    'page': page_num,
+                                    'text': page_text,
+                                    'has_questions': self._page_has_questions(page_text),
+                                    'char_count': len(page_text)
+                                })
+                        except Exception as e:
+                            error_msg = str(e)[:100]
+                            print(f"Warning: Error on page {page_num} (pdfplumber): {error_msg}")
+                            continue
+            except Exception as e:
+                error_msg = str(e)[:100]
+                print(f"Warning: pdfplumber failed: {error_msg}")
+            
+            # If pdfplumber didn't extract enough text, try PyPDF2
+            if not text.strip() or len(text.strip()) < 100:
+                print("Trying PyPDF2 as fallback...")
+                try:
+                    reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+                    for page_num, page in enumerate(reader.pages, 1):
+                        try:
+                            page_text = page.extract_text()
+                            if page_text and page_text.strip():
+                                page_text = self._clean_text(page_text)
+                                text += f"\n--- Page {page_num} ---\n{page_text}\n"
+                                page_info.append({
+                                    'page': page_num,
+                                    'text': page_text,
+                                    'has_questions': self._page_has_questions(page_text),
+                                    'char_count': len(page_text)
+                                })
+                        except Exception as e:
+                            error_msg = str(e)[:100]
+                            print(f"Warning: Error on page {page_num} (PyPDF2): {error_msg}")
+                            continue
+                except Exception as e:
+                    error_msg = str(e)[:100]
+                    print(f"Error: PyPDF2 also failed: {error_msg}")
+            
+            return text, page_info
+            
+        except Exception as e:
+            print(f"Error: PDF extraction error: {str(e)}")
+            return "", []
+    
+    def _clean_text(self, text: str) -> str:
+        """Clean extracted PDF text"""
+        if not text:
+            return ""
+        
+        # Remove null bytes and special characters
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]', '', text)
+        text = re.sub(r'\ufeff', '', text)  # Remove BOM
+        text = re.sub(r'�', '', text)  # Remove replacement characters
+        
+        # Fix common PDF extraction issues
+        text = re.sub(r'\s+', ' ', text)  # Replace multiple spaces/newlines with single space
+        text = re.sub(r'\s*\.\s*', '. ', text)  # Fix spacing around periods
+        text = re.sub(r'\s*,\s*', ', ', text)  # Fix spacing around commas
+        
+        # Remove page numbers and headers/footers
+        text = re.sub(r'Page\s+\d+\s+of\s+\d+', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\d+\s*/\s*\d+', '', text)  # Remove fractions like 1/10
+        
+        return text.strip()
+    
+    def _page_has_questions(self, page_text: str) -> bool:
+        """Check if page likely contains questions"""
+        if not page_text or len(page_text) < 50:
+            return False
+        
+        page_lower = page_text.lower()
+        
+        # Comprehensive question patterns
+        question_indicators = [
+            # Numbered questions
+            r'q\.?\s*\d+', r'\d+\.\s+[a-z]', r'question\s+\d+', r'\(?\d+\)',
+            # Multiple choice indicators
+            r'\(a\)', r'\(b\)', r'\(c\)', r'\(d\)',
+            r'[a-d]\)\s', r'[a-d]\.\s',
+            # Question marks
+            r'\?', r'which of the following', r'choose the correct',
+            # Fill in blank
+            r'blank', r'fill in', r'_____', r'_{3,}',
+            # Instructions
+            r'instruction:', r'direction:', r'read the following',
+            # Exam keywords
+            r'multiple choice', r'mcq', r'true or false',
+            r'select the', r'choose the', r'what is', r'which is'
+        ]
+        
+        for pattern in question_indicators:
+            if re.search(pattern, page_lower, re.IGNORECASE):
+                return True
+        
+        # Check for question-like sentences
+        sentences = re.split(r'[.!?]', page_text)
+        for sentence in sentences:
+            if len(sentence.split()) >= 5 and len(sentence.split()) <= 50:
+                words = sentence.lower().split()
+                if any(word in ['what', 'which', 'why', 'how', 'when', 'where', 'who'] for word in words[:3]):
+                    return True
+        
+        return False
+    
+    def get_question_pages(self, page_info: List[Dict]) -> List[int]:
+        """Get list of page numbers that likely contain questions"""
+        return [page['page'] for page in page_info if page.get('has_questions', False)]
+
+# ==============================
+#  DEEPSEEK PDF QUESTION EXTRACTOR (ROBUST)
+# ==============================
+class DeepSeekPDFQuestionExtractor:
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {api_key}"
+        }
+        self.pdf_extractor = PDFTextExtractor()
+        self.total_questions = 0
+        self.total_pages = 0
+    
+    def download_pdf(self, pdf_url: str) -> Optional[bytes]:
+        """Download PDF from URL with retry logic"""
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                print(f"Downloading PDF (attempt {attempt + 1}/{max_retries})...")
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/pdf,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                    'Accept-Language': 'en-US,en;q=0.5',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Connection': 'keep-alive',
+                    'Upgrade-Insecure-Requests': '1'
+                }
+                
+                response = requests.get(pdf_url, headers=headers, timeout=60, stream=True)
+                response.raise_for_status()
+                
+                # Check if it's a PDF
+                content_type = response.headers.get('content-type', '').lower()
+                if 'pdf' not in content_type and 'octet-stream' not in content_type:
+                    print(f"Warning: Content-Type is {content_type}, not PDF")
+                
+                pdf_bytes = response.content
+                
+                if len(pdf_bytes) < 100:
+                    print(f"Warning: PDF is very small ({len(pdf_bytes)} bytes)")
+                    return None
+                
+                print(f"Downloaded {len(pdf_bytes):,} bytes")
+                return pdf_bytes
+                
+            except requests.exceptions.Timeout:
+                print(f"Timeout on attempt {attempt + 1}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                else:
+                    print("All download attempts failed due to timeout")
+                    return None
+            except requests.exceptions.RequestException as e:
+                error_msg = str(e)[:200]
+                print(f"Download error: {error_msg}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+                else:
+                    return None
+            except Exception as e:
+                print(f"Unexpected error: {str(e)}")
+                return None
+        
+        return None
+    
+    def contains_questions(self, pdf_bytes: bytes, file_name: str) -> bool:
+        """Detect if PDF contains exam questions"""
+        print(f"Checking if PDF contains questions...")
+        
+        # Quick filename check
+        file_lower = file_name.lower()
+        if any(pattern in file_lower for pattern in SKIP_PATTERNS):
+            print(f"Skipped by filename pattern")
+            return False
+        
+        try:
+            # Extract text from first few pages only (for speed)
+            text, page_info = self.pdf_extractor.extract_text_from_pdf(pdf_bytes)
+            
+            if not text or len(text.strip()) < 100:
+                print(f"PDF appears empty or unreadable")
+                return False
+            
+            # Check text statistics
+            words = len(text.split())
+            print(f"PDF contains {words:,} words, {len(page_info)} pages")
+            
+            # Look for question pages
+            question_pages = self.pdf_extractor.get_question_pages(page_info)
+            
+            if question_pages:
+                print(f"Found {len(question_pages)} pages with question patterns")
+                return True
+            else:
+                # Use DeepSeek for final verification
+                print(f"Using DeepSeek to verify...")
+                return self._deepseek_detection(text[:3000], file_name)
+                
+        except Exception as e:
+            error_msg = str(e)[:200]
+            print(f"Detection error: {error_msg}")
+            return True  # When in doubt, process it
+    
+    def _deepseek_detection(self, text_sample: str, file_name: str) -> bool:
+        """Use DeepSeek to detect if text contains questions"""
+        prompt = f"""Analyze this text sample from "{file_name}". Does it contain ANY exam questions?
+
+Look for:
+1. Numbered questions: Q1, 1., Question 1, etc.
+2. Multiple choice options: (A), (B), (C), (D) or A), B), C), D)
+3. Questions ending with "?"
+4. Fill-in-blank patterns: "_____", "blank", "Fill in"
+5. Instructions for answering questions
+6. Mathematical problems or equations
+7. Chemistry/science formulas or reactions
+
+If you see ANY question patterns or exam content, answer YES.
+If it's only a cover page, table of contents, or blank, answer NO.
+
+Text sample:
+{text_sample[:2500]}
+
+Answer ONLY "YES" or "NO".
+"""
+        
+        payload = {
+            "model": EXTRACTION_MODEL,
+            "temperature": 0.0,
+            "messages": [
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 10
+        }
+        
+        try:
+            response = requests.post(BASE_URL, headers=self.headers, json=payload, timeout=30)
+            
+            if response.status_code == 200:
+                data = response.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                if isinstance(content, str):
+                    content = content.strip().upper()
+                    result = "YES" in content
+                    print(f"DeepSeek detection: {'QUESTIONS FOUND' if result else 'NO QUESTIONS'}")
+                    return result
+            return True  # Default to processing if API fails
+        except Exception as e:
+            error_msg = str(e)[:100]
+            print(f"Detection API error: {error_msg}")
+            return True
+    
+    def _convert_latex_to_unicode(self, text: str) -> str:
+        """Convert LaTeX notation to Unicode characters"""
+        if not text:
+            return text
+        
+        # Comprehensive LaTeX to Unicode mapping
+        latex_map = {
+            # Subscripts
+            r'_{0}': '₀', r'_0': '₀', r'_{1}': '₁', r'_1': '₁',
+            r'_{2}': '₂', r'_2': '₂', r'_{3}': '₃', r'_3': '₃',
+            r'_{4}': '₄', r'_4': '₄', r'_{5}': '₅', r'_5': '₅',
+            r'_{6}': '₆', r'_6': '₆', r'_{7}': '₇', r'_7': '₇',
+            r'_{8}': '₈', r'_8': '₈', r'_{9}': '₉', r'_9': '₉',
+            r'_{10}': '₁₀', r'_{11}': '₁₁', r'_{12}': '₁₂',
+            
+            # Superscripts
+            r'^{0}': '⁰', r'^0': '⁰', r'^{1}': '¹', r'^1': '¹',
+            r'^{2}': '²', r'^2': '²', r'^{3}': '³', r'^3': '³',
+            r'^{4}': '⁴', r'^4': '⁴', r'^{5}': '⁵', r'^5': '⁵',
+            r'^{6}': '⁶', r'^6': '⁶', r'^{7}': '⁷', r'^7': '⁷',
+            r'^{8}': '⁸', r'^8': '⁸', r'^{9}': '⁹', r'^9': '⁹',
+            r'^{+}': '⁺', r'^+': '⁺', r'^{-}': '⁻', r'^-': '⁻',
+            
+            # Greek letters
+            r'\\alpha': 'α', r'\\beta': 'β', r'\\gamma': 'γ', r'\\Gamma': 'Γ',
+            r'\\delta': 'δ', r'\\Delta': 'Δ', r'\\epsilon': 'ε', r'\\varepsilon': 'ε',
+            r'\\zeta': 'ζ', r'\\eta': 'η', r'\\theta': 'θ', r'\\Theta': 'Θ',
+            r'\\iota': 'ι', r'\\kappa': 'κ', r'\\lambda': 'λ', r'\\Lambda': 'Λ',
+            r'\\mu': 'μ', r'\\nu': 'ν', r'\\xi': 'ξ', r'\\Xi': 'Ξ',
+            r'\\pi': 'π', r'\\Pi': 'Π', r'\\rho': 'ρ', r'\\sigma': 'σ',
+            r'\\Sigma': 'Σ', r'\\tau': 'τ', r'\\upsilon': 'υ', r'\\Upsilon': 'Υ',
+            r'\\phi': 'φ', r'\\Phi': 'Φ', r'\\chi': 'χ', r'\\psi': 'ψ',
+            r'\\Psi': 'Ψ', r'\\omega': 'ω', r'\\Omega': 'Ω',
+            
+            # Math operators
+            r'\\times': '×', r'\\div': '÷', r'\\pm': '±', r'\\mp': '∓',
+            r'\\cdot': '·', r'\\ast': '*', r'\\star': '⋆',
+            r'\\leq': '≤', r'\\geq': '≥', r'\\neq': '≠', r'\\approx': '≈',
+            r'\\sim': '∼', r'\\propto': '∝', r'\\infty': '∞',
+            r'\\partial': '∂', r'\\nabla': '∇', r'\\forall': '∀',
+            r'\\exists': '∃', r'\\in': '∈', r'\\notin': '∉',
+            r'\\subset': '⊂', r'\\subseteq': '⊆', r'\\supset': '⊃',
+            r'\\supseteq': '⊇', r'\\cup': '∪', r'\\cap': '∩',
+            r'\\wedge': '∧', r'\\vee': '∨', r'\\neg': '¬',
+            
+            # Arrows
+            r'\\rightarrow': '→', r'\\Rightarrow': '⇒', r'\\longrightarrow': '⟶',
+            r'\\leftarrow': '←', r'\\Leftarrow': '⇐', r'\\longleftarrow': '⟵',
+            r'\\leftrightarrow': '↔', r'\\Leftrightarrow': '⇔', r'\\longleftrightarrow': '⟷',
+            r'\\mapsto': '↦', r'\\to': '→', r'\\gets': '←',
+            
+            # Chemical notation
+            r'->': '→', r'<->': '↔', r'<=>': '⇌',
+            r'\\ce{': '', r'\\chem{': '',  # Remove chemistry package commands
+            
+            # Common functions
+            r'\\sin': 'sin', r'\\cos': 'cos', r'\\tan': 'tan',
+            r'\\log': 'log', r'\\ln': 'ln', r'\\exp': 'exp',
+            r'\\lim': 'lim', r'\\sum': '∑', r'\\prod': '∏',
+            r'\\int': '∫', r'\\oint': '∮',
+            
+            # Fractions
+            r'\\frac{1}{2}': '½', r'\\frac{1}{3}': '⅓', r'\\frac{2}{3}': '⅔',
+            r'\\frac{1}{4}': '¼', r'\\frac{3}{4}': '¾', r'\\frac{1}{5}': '⅕',
+            r'\\frac{2}{5}': '⅖', r'\\frac{3}{5}': '⅗', r'\\frac{4}{5}': '⅘',
+            
+            # Other symbols
+            r'\\circ': '°', r'\\degree': '°', r'\\angstrom': 'Å',
+            r'\\hbar': 'ħ', r'\\ell': 'ℓ',
+        }
+        
+        # Apply direct substitutions
+        converted = text
+        for latex, unicode_char in latex_map.items():
+            converted = converted.replace(latex, unicode_char)
+        
+        # Handle generic subscripts: H_2O → H₂O, CH_3 → CH₃
+        def replace_subscript(match):
+            num = match.group(1)
+            subscript_map = {'0': '₀', '1': '₁', '2': '₂', '3': '₃', '4': '₄', 
+                           '5': '₅', '6': '₆', '7': '₇', '8': '₈', '9': '₉'}
+            return ''.join(subscript_map.get(d, d) for d in num)
+        
+        converted = re.sub(r'_\{(\d+)\}', replace_subscript, converted)
+        converted = re.sub(r'_(\d+)', replace_subscript, converted)
+        
+        # Handle generic superscripts: x^2 → x²
+        def replace_superscript(match):
+            num = match.group(1)
+            superscript_map = {'0': '⁰', '1': '¹', '2': '²', '3': '³', '4': '⁴',
+                             '5': '⁵', '6': '⁶', '7': '⁷', '8': '⁸', '9': '⁹',
+                             '+': '⁺', '-': '⁻'}
+            return ''.join(superscript_map.get(d, d) for d in num)
+        
+        converted = re.sub(r'\^\{([^}]+)\}', replace_superscript, converted)
+        converted = re.sub(r'\^([^\\s{]+)', replace_superscript, converted)
+        
+        # Remove any remaining LaTeX commands
+        converted = re.sub(r'\\[a-zA-Z]+\{.*?\}', '', converted)
+        converted = re.sub(r'\\[a-zA-Z]+', '', converted)
+        converted = re.sub(r'\{|\}', '', converted)
+        
+        return converted
+    
+    def extract_questions_from_pdf(self, pdf_bytes: bytes, file_name: str) -> List[Dict]:
+        """Extract questions from PDF using DeepSeek - IMPROVED VERSION"""
+        print(f"\nExtracting questions from: {file_name}")
+        
+        # Extract text from PDF
+        text, page_info = self.pdf_extractor.extract_text_from_pdf(pdf_bytes)
+        self.total_pages += len(page_info)
+        
+        if not text or len(text.strip()) < 200:
+            print(f"Insufficient text extracted")
+            return [{"error": "Insufficient text extracted from PDF", "file_name": file_name}]
+        
+        print(f"Extracted {len(text):,} characters, {len(text.split()):,} words")
+        
+        # Save extracted text for debugging
+        safe_filename = file_name.replace('/', '_').replace('\\', '_')
+        debug_file = f"debug_{safe_filename}_text.txt"
+        with open(debug_file, 'w', encoding='utf-8') as f:
+            f.write(text[:10000])  # First 10K chars
+        print(f"Saved extracted text to: {debug_file}")
+        
+        # Get all pages with questions
+        all_pages_with_questions = self.pdf_extractor.get_question_pages(page_info)
+        if not all_pages_with_questions:
+            print(f"No question pages detected, analyzing first 15 pages")
+            all_pages_with_questions = list(range(1, min(16, len(page_info) + 1)))
+        
+        print(f"Total pages with questions: {len(all_pages_with_questions)}")
+        
+        # Use ENHANCED chunking method - process ALL question pages
+        chunks = self._split_text_into_comprehensive_chunks(text, page_info, all_pages_with_questions)
+        print(f"Split into {len(chunks)} comprehensive chunks")
+        
+        # Process each chunk with DeepSeek
+        all_questions = []
+        for chunk_num, (chunk_text, pages) in enumerate(chunks, 1):
+            print(f"\nProcessing chunk {chunk_num}/{len(chunks)} (pages {pages}) - {len(chunk_text):,} chars")
+            
+            questions = self._process_text_chunk_with_enhanced_deepseek(chunk_text, file_name, chunk_num, pages)
+            if questions:
+                all_questions.extend(questions)
+                print(f"Found {len(questions)} questions in this chunk")
+            
+            # Rate limiting
+            time.sleep(2)
+        
+        # If no questions found with primary method, try alternative
+        if not all_questions:
+            print(f"\nNo questions found with primary method, trying alternative approach...")
+            all_questions = self._extract_questions_alternative_method(text, file_name)
+        
+        # Process and clean the questions
+        processed_questions = self._process_extracted_questions_enhanced(all_questions, file_name)
+        
+        # Verify no missing options
+        processed_questions = self._verify_and_fix_missing_options(processed_questions, text)
+        
+        self.total_questions += len(processed_questions)
+        print(f"\nTotal extracted from {file_name}: {len(processed_questions)} questions")
+        
+        # Print verification stats
+        self._print_extraction_stats(processed_questions)
+        
+        return processed_questions
+    
+    def _split_text_into_comprehensive_chunks(self, text: str, page_info: List[Dict], question_pages: List[int]) -> List[Tuple[str, List[int]]]:
+        """Split text into comprehensive chunks that capture ALL content"""
+        chunks = []
+        
+        # Find page markers
+        page_markers = re.finditer(r'--- Page (\d+) ---', text)
+        page_positions = []
+        
+        for match in page_markers:
+            page_num = int(match.group(1))
+            position = match.start()
+            page_positions.append((page_num, position))
+        
+        if not page_positions:
+            # If no page markers, split by size
+            chunk_size = 3500
+            for i in range(0, len(text), chunk_size):
+                chunks.append((text[i:i+chunk_size], [1]))
+            return chunks
+        
+        # Process in larger chunks to ensure we capture everything
+        chunk_size_pages = 3  # Process 3 pages at a time
+        for i in range(0, len(question_pages), chunk_size_pages):
+            page_group = question_pages[i:i + chunk_size_pages]
+            chunk_text = ""
+            chunk_pages = []
+            
+            for page_num in page_group:
+                for j, (p_num, position) in enumerate(page_positions):
+                    if p_num == page_num:
+                        start_pos = position
+                        if j + 1 < len(page_positions):
+                            end_pos = page_positions[j + 1][1]
+                        else:
+                            end_pos = len(text)
+                        
+                        page_text = text[start_pos:end_pos]
+                        
+                        if chunk_text:
+                            chunk_text += "\n" + page_text
+                        else:
+                            chunk_text = page_text
+                        chunk_pages.append(page_num)
+                        break
+            
+            if chunk_text and len(chunk_text) > 100:
+                # If chunk is too large, split at question boundaries
+                if len(chunk_text) > 4000:
+                    split_chunks = self._split_at_question_boundaries(chunk_text, chunk_pages)
+                    chunks.extend(split_chunks)
+                else:
+                    chunks.append((chunk_text, chunk_pages.copy()))
+        
+        return chunks
+    
+    def _split_at_question_boundaries(self, chunk_text: str, chunk_pages: List[int]) -> List[Tuple[str, List[int]]]:
+        """Split large chunk at question boundaries"""
+        chunks = []
+        
+        # Find all question starts in the chunk
+        question_patterns = [
+            r'(Q\d+[\.:]?)',
+            r'(\d+\.\s+[A-Z])',
+            r'(Question\s+\d+[\.:]?)',
+            r'(\n\d+\.\s+)',
+            r'(\nQ\.?\s*\d+)'
+        ]
+        
+        question_starts = []
+        for pattern in question_patterns:
+            matches = re.finditer(pattern, chunk_text, re.IGNORECASE)
+            for match in matches:
+                if match.start() not in question_starts:
+                    question_starts.append(match.start())
+        
+        question_starts.sort()
+        
+        if len(question_starts) <= 1:
+            # Can't split meaningfully, return as is
+            return [(chunk_text, chunk_pages)]
+        
+        # Create chunks at question boundaries
+        for i in range(len(question_starts)):
+            start_pos = question_starts[i]
+            end_pos = question_starts[i + 1] if i + 1 < len(question_starts) else len(chunk_text)
+            
+            sub_chunk = chunk_text[start_pos:end_pos]
+            if len(sub_chunk) > 100:  # Minimum size
+                chunks.append((sub_chunk, chunk_pages.copy()))
+        
+        return chunks
+    
+    def _process_text_chunk_with_enhanced_deepseek(self, chunk_text: str, file_name: str, 
+                                                  chunk_num: int, pages: List[int]) -> List[Dict]:
+        """Call DeepSeek API with ENHANCED instructions"""
+        prompt = f"""You are an expert at extracting structured exam questions from text. Extract ALL questions from the following text.
+
+CRITICAL INSTRUCTIONS - READ CAREFULLY:
+1. Extract EVERY SINGLE QUESTION - DO NOT MISS ANY
+2. For EACH question, you MUST extract ALL 4 options (A, B, C, D) even if blank
+3. If tables or matching questions exist, format them as HTML tables
+4. For matching questions, use type: "MATCHING" and format as HTML table
+5. Distinguish between:
+   - Numbered statements IN the question (1., 2., 3., 4.) → Part of question text
+   - Options labeled with letters (A, B, C, D) or Roman (i, ii, iii, iv) → Options
+
+EXTRACTION RULES:
+1. Question number: Extract from Q98, 98., Question 98, etc.
+2. Question text: Include ALL text until options start
+3. Options: MUST have ALL 4 (A, B, C, D). If fewer in text, leave extras blank
+4. Answer: From "Ans:" or "Answer:" 
+5. Explanation: From "Explanation:" 
+6. Tables: Convert to HTML <table> format
+7. NEVER skip any question content
+
+FORMATTING EXAMPLES:
+- For tables: <table><tr><td>Column1</td><td>Column2</td></tr>...</table>
+- For matching: Use "MATCHING" type with HTML table in question text
+- For options with diagrams: Use "[DIAGRAM]" placeholder
+
+CONVERT LaTeX: H_2O → H₂O, CO_2 → CO₂, → to arrow, etc.
+
+TEXT FROM "{file_name}" (Pages {pages}):
+{chunk_text[:3800]}
+
+RESPONSE FORMAT (JSON array) - MUST include ALL questions:
+[
+  {{
+    "number": "Q98",
+    "type": "MCQ",
+    "text": "Sodium hydrogen carbonate when added to acetic acid evolves a gas. Which of the following statements are true about the gas evolved? 1. It turns lime water milky. 2. It extinguishes a burning splinter. 3. It dissolves in a solution of sodium hydro. 4. It has a pungent odour.",
+    "option_a": "(i) and (ii)",
+    "option_b": "(i), (ii) and (iii)", 
+    "option_c": "(ii), (iii) and (iv)",
+    "option_d": "(i) and (iv)",
+    "instructions": "",
+    "answer": "B. (i), (ii) and (iii)",
+    "explanation": "Reaction of sodium hydrogen carbonate with acetic acid forms sodium acetate and water with carbon dioxide CO₂ gas. NaHCO₃ + CH₃COOH → CH₃COONa + CO₂ + H₂O"
+  }},
+  {{
+    "number": "Q121",
+    "type": "MCQ", 
+    "text": "In one of the industrial processes used for manufacture of sodium hydroxide...",
+    "option_a": "H₂ and NaHCO₃, respectively.",
+    "option_b": "CO₂ and CaOCl₂ respectively.",
+    "option_c": "Cl₂ and CaOCl₂ respectively.",
+    "option_d": "Cl₂ and NaHCO₃ respectively.",
+    "instructions": "",
+    "answer": "C. Cl₂ and CaOCl₂ respectively.",
+    "explanation": ""
+  }},
+  {{
+    "number": "Q999",
+    "type": "MATCHING",
+    "text": "<table><tr><th>Column A</th><th>Column B</th></tr><tr><td>1. Acid</td><td>A. Turns blue litmus red</td></tr><tr><td>2. Base</td><td>B. Turns red litmus blue</td></tr></table>",
+    "option_a": "",
+    "option_b": "",
+    "option_c": "",
+    "option_d": "",
+    "instructions": "Match Column A with Column B",
+    "answer": "1-A, 2-B",
+    "explanation": ""
+  }}
+]
+
+IMPORTANT: You MUST return ALL questions found. DO NOT skip any.
+"""
+        
+        payload = {
+            "model": EXTRACTION_MODEL,
+            "temperature": 0.1,
+            "messages": [
+                {
+                    "role": "system", 
+                    "content": "You are a meticulous exam question extractor. You NEVER skip questions. You ALWAYS extract ALL 4 options. You format tables as HTML. You are thorough and complete."
+                },
+                {"role": "user", "content": prompt}
+            ],
+            "max_tokens": 4500
+        }
+        
+        try:
+            print(f"Calling DeepSeek API for enhanced extraction...")
+            start_time = time.time()
+            response = requests.post(BASE_URL, headers=self.headers, json=payload, timeout=120)
+            api_time = time.time() - start_time
+            
+            if response.status_code != 200:
+                error_msg = f"API Error {response.status_code}"
+                print(f"{error_msg}: {response.text[:200]}")
+                return []
+            
+            data = response.json()
+            content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+            
+            if not content or not isinstance(content, str):
+                print("Empty or invalid response from API")
+                return []
+            
+            print(f"API response received in {api_time:.1f}s, {len(content)} characters")
+            
+            # Try to parse JSON
+            questions = self._parse_json_response_enhanced(content)
+            if questions:
+                print(f"Successfully parsed {len(questions)} questions")
+                return questions
+            else:
+                print("JSON parsing failed, trying comprehensive fallback...")
+                return self._comprehensive_fallback_parse(content, chunk_text, file_name, chunk_num)
+                
+        except requests.exceptions.Timeout:
+            print("API timeout")
+            return []
+        except Exception as e:
+            error_msg = str(e)[:200]
+            print(f"API error: {error_msg}")
+            return []
+    
+    def _parse_json_response_enhanced(self, text: str) -> List[Dict]:
+        """Enhanced JSON parsing with better error handling"""
+        text = text.strip()
+        
+        # Clean the text
+        text = re.sub(r'```json|```', '', text)
+        text = re.sub(r'^\s*json\s*', '', text, flags=re.IGNORECASE)
+        
+        # Multiple attempts to parse JSON
+        attempts = [
+            # Try direct parse
+            lambda t: json.loads(t) if t.startswith('[') and t.endswith(']') else None,
+            
+            # Try to find JSON array
+            lambda t: self._extract_json_array(t),
+            
+            # Try to fix and parse
+            lambda t: self._fix_and_parse_json(t),
+            
+            # Last resort: extract JSON objects manually
+            lambda t: self._extract_json_objects_manually(t)
+        ]
+        
+        for attempt in attempts:
+            try:
+                result = attempt(text)
+                if result and isinstance(result, list) and len(result) > 0:
+                    return result
+            except Exception as e:
+                continue
+        
+        return []
+    
+    def _extract_json_array(self, text: str):
+        """Extract JSON array from text"""
+        # Look for JSON array pattern
+        pattern = r'\[\s*\{.*?\}\s*\]'
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+            # Fix common JSON issues
+            json_str = re.sub(r',\s*\}', '}', json_str)
+            json_str = re.sub(r',\s*\]', ']', json_str)
+            return json.loads(json_str)
+        return None
+    
+    def _fix_and_parse_json(self, text: str):
+        """Fix common JSON issues and parse"""
+        # Fix missing quotes on keys
+        text = re.sub(r'(\w+)\s*:', r'"\1":', text)
+        
+        # Fix single quotes
+        text = text.replace("'", '"')
+        
+        # Remove trailing commas
+        text = re.sub(r',\s*}', '}', text)
+        text = re.sub(r',\s*]', ']', text)
+        
+        return json.loads(text)
+    
+    def _extract_json_objects_manually(self, text: str) -> List[Dict]:
+        """Manually extract JSON objects from text"""
+        objects = []
+        lines = text.split('\n')
+        
+        current_obj = {}
+        in_object = False
+        brace_count = 0
+        
+        for line in lines:
+            if '{' in line and not in_object:
+                in_object = True
+                current_obj = {}
+                brace_count = line.count('{') - line.count('}')
+            
+            if in_object:
+                # Extract key-value pairs
+                kv_match = re.search(r'"([^"]+)"\s*:\s*"([^"]*)"', line)
+                if kv_match:
+                    key = kv_match.group(1)
+                    value = kv_match.group(2)
+                    current_obj[key] = value
+                
+                # Update brace count
+                brace_count += line.count('{') - line.count('}')
+                
+                if brace_count <= 0 and '}' in line:
+                    in_object = False
+                    if current_obj:
+                        objects.append(current_obj)
+        
+        return objects if objects else None
+    
+    def _comprehensive_fallback_parse(self, api_response: str, original_text: str, 
+                                     file_name: str, chunk_num: int) -> List[Dict]:
+        """Comprehensive fallback parsing when JSON fails"""
+        print(f"Using comprehensive fallback parser")
+        
+        questions = []
+        
+        # Method 1: Try to extract questions from API response
+        questions_from_api = self._extract_questions_from_api_response(api_response, file_name)
+        if questions_from_api:
+            questions.extend(questions_from_api)
+        
+        # Method 2: Extract directly from original text
+        if len(questions) < 3:  # If we got too few questions
+            questions_from_text = self._extract_questions_direct_from_text(original_text, file_name, chunk_num)
+            questions.extend(questions_from_text)
+        
+        # Remove duplicates
+        unique_questions = []
+        seen_numbers = set()
+        
+        for q in questions:
+            if q.get('number') and q.get('number') not in seen_numbers:
+                seen_numbers.add(q.get('number'))
+                unique_questions.append(q)
+        
+        return unique_questions
+    
+    def _extract_questions_from_api_response(self, text: str, file_name: str) -> List[Dict]:
+        """Extract questions from API response text"""
+        questions = []
+        
+        # Look for question blocks in the response
+        lines = text.split('\n')
+        current_question = None
+        
+        for line in lines:
+            line = line.strip()
+            
+            # Look for question start indicators
+            if re.match(r'^"?number"?\s*[:=]', line, re.IGNORECASE) or \
+               re.match(r'^Q\d+', line, re.IGNORECASE) or \
+               re.match(r'^\d+\.', line):
+                
+                if current_question:
+                    questions.append(current_question)
+                
+                # Extract question number
+                q_num = "Q1"
+                num_match = re.search(r'(\d+)', line)
+                if num_match:
+                    q_num = f"Q{num_match.group(1)}"
+                
+                current_question = {
+                    "number": q_num,
+                    "type": "MCQ",
+                    "text": "",
+                    "option_a": "", "option_b": "", "option_c": "", "option_d": "",
+                    "instructions": "",
+                    "answer": "",
+                    "explanation": "",
+                    "file_name": file_name
+                }
+            
+            # Extract fields
+            if current_question:
+                # Question text
+                if re.match(r'^"?text"?\s*[:=]', line, re.IGNORECASE):
+                    text_match = re.search(r'[:=]\s*(.+)', line)
+                    if text_match:
+                        current_question["text"] = text_match.group(1).strip('" ')
+                
+                # Options
+                for opt in ['a', 'b', 'c', 'd']:
+                    pattern = rf'^"?option_{opt}"?\s*[:=]'
+                    if re.match(pattern, line, re.IGNORECASE):
+                        opt_match = re.search(r'[:=]\s*(.+)', line)
+                        if opt_match:
+                            current_question[f"option_{opt}"] = opt_match.group(1).strip('" ')
+                
+                # Answer
+                if re.match(r'^"?answer"?\s*[:=]', line, re.IGNORECASE):
+                    ans_match = re.search(r'[:=]\s*(.+)', line)
+                    if ans_match:
+                        current_question["answer"] = ans_match.group(1).strip('" ')
+                
+                # Explanation
+                if re.match(r'^"?explanation"?\s*[:=]', line, re.IGNORECASE):
+                    exp_match = re.search(r'[:=]\s*(.+)', line)
+                    if exp_match:
+                        current_question["explanation"] = exp_match.group(1).strip('" ')
+        
+        # Add the last question
+        if current_question:
+            questions.append(current_question)
+        
+        return questions
+    
+    def _extract_questions_direct_from_text(self, text: str, file_name: str, chunk_num: int) -> List[Dict]:
+        """Extract questions directly from text using pattern matching"""
+        questions = []
+        
+        # Split text into potential question blocks
+        # Look for patterns like Q1, Q2, etc.
+        question_patterns = [
+            r'(Q\d+[\.:]?\s+.+?)(?=Q\d+|\Z)',
+            r'(\d+\.\s+[A-Z].+?)(?=\d+\.\s+[A-Z]|\Z)',
+            r'(Question\s+\d+[\.:]?.+?)(?=Question\s+\d+|\Z)'
+        ]
+        
+        for pattern in question_patterns:
+            matches = re.finditer(pattern, text, re.DOTALL | re.IGNORECASE)
+            for match_num, match in enumerate(matches):
+                block = match.group(1).strip()
+                if len(block) < 50:  # Too short, skip
+                    continue
+                
+                # Extract question number
+                q_num_match = re.search(r'(\d+)', block[:100])
+                q_number = f"Q{q_num_match.group(1)}" if q_num_match else f"Q{chunk_num}.{match_num+1}"
+                
+                # Extract question text (before options)
+                question_text = block
+                options = {"a": "", "b": "", "c": "", "d": ""}
+                
+                # Try to find options
+                option_patterns = [
+                    r'([A-D])[\.\)]\s*(.+?)(?=[A-D][\.\)]|\Z)',
+                    r'\(([A-D])\)\s*(.+?)(?=\([A-D]\)|\Z)'
+                ]
+                
+                for opt_pattern in option_patterns:
+                    opt_matches = re.findall(opt_pattern, block, re.DOTALL)
+                    for letter, opt_text in opt_matches:
+                        key = letter.lower()
+                        if key in options:
+                            options[key] = opt_text.strip()
+                
+                # Extract answer if present
+                answer = ""
+                ans_match = re.search(r'Ans[\.:]?\s*(.+)', block, re.IGNORECASE)
+                if ans_match:
+                    answer = ans_match.group(1).strip()
+                
+                # Extract explanation if present
+                explanation = ""
+                exp_match = re.search(r'Explanation[\.:]?\s*(.+)', block, re.IGNORECASE)
+                if exp_match:
+                    explanation = exp_match.group(1).strip()
+                
+                question = {
+                    "number": q_number,
+                    "type": "MCQ",
+                    "text": question_text,
+                    "option_a": options["a"],
+                    "option_b": options["b"],
+                    "option_c": options["c"],
+                    "option_d": options["d"],
+                    "instructions": "",
+                    "answer": answer,
+                    "explanation": explanation,
+                    "file_name": file_name
+                }
+                
+                questions.append(question)
+        
+        return questions
+    
+    def _extract_questions_alternative_method(self, text: str, file_name: str) -> List[Dict]:
+        """Alternative method for extracting questions"""
+        print(f"Using alternative extraction method")
+        
+        questions = []
+        
+        # Simple but robust pattern matching
+        lines = text.split('\n')
+        current_question = None
+        question_num = 0
+        
+        for i, line in enumerate(lines):
+            line = line.strip()
+            if not line:
+                continue
+            
+            # Check for question start
+            is_question_start = False
+            q_number = ""
+            
+            # Pattern 1: Q98
+            q_match = re.match(r'Q(\d+)[\.:]?\s*(.+)', line, re.IGNORECASE)
+            if q_match:
+                is_question_start = True
+                q_number = f"Q{q_match.group(1)}"
+                question_text = q_match.group(2)
+            
+            # Pattern 2: 98.
+            num_match = re.match(r'(\d+)\.\s+([A-Z].+)', line)
+            if num_match and not is_question_start:
+                is_question_start = True
+                q_number = f"Q{num_match.group(1)}"
+                question_text = num_match.group(2)
+            
+            if is_question_start:
+                question_num += 1
+                
+                if current_question:
+                    questions.append(current_question)
+                
+                current_question = {
+                    "number": q_number,
+                    "type": "MCQ",
+                    "text": question_text,
+                    "option_a": "", "option_b": "", "option_c": "", "option_d": "",
+                    "instructions": "",
+                    "answer": "",
+                    "explanation": "",
+                    "file_name": file_name
+                }
+                continue
+            
+            # If we're in a question, process lines
+            if current_question:
+                # Check for options
+                option_match = re.match(r'^([A-D])[\.\)]\s*(.+)', line)
+                if option_match:
+                    letter = option_match.group(1).lower()
+                    option_text = option_match.group(2)
+                    current_question[f"option_{letter}"] = option_text
+                    continue
+                
+                # Check for answer
+                ans_match = re.match(r'^Ans[\.:]?\s*(.+)', line, re.IGNORECASE)
+                if ans_match:
+                    current_question["answer"] = ans_match.group(1)
+                    continue
+                
+                # Check for explanation
+                exp_match = re.match(r'^Explanation[\.:]?\s*(.+)', line, re.IGNORECASE)
+                if exp_match:
+                    current_question["explanation"] = exp_match.group(1)
+                    continue
+                
+                # Otherwise, add to question text if it's not too long
+                if len(current_question["text"]) < 1500:
+                    current_question["text"] += " " + line
+        
+        # Add the last question
+        if current_question:
+            questions.append(current_question)
+        
+        return questions
+    
+    def _process_extracted_questions_enhanced(self, questions: List[Dict], file_name: str) -> List[Dict]:
+        """Enhanced processing of extracted questions"""
+        processed = []
+        
+        for i, q in enumerate(questions):
+            if not isinstance(q, dict):
+                continue
+            
+            # Ensure ALL required fields exist
+            q.setdefault("number", f"Q{i+1}")
+            q.setdefault("type", "MCQ")
+            q.setdefault("text", "")
+            q.setdefault("option_a", "")
+            q.setdefault("option_b", "")
+            q.setdefault("option_c", "")
+            q.setdefault("option_d", "")
+            q.setdefault("instructions", "")
+            q.setdefault("answer", "")
+            q.setdefault("explanation", "")
+            q.setdefault("file_name", file_name)
+            
+            # Convert LaTeX to Unicode
+            for field in ["text", "option_a", "option_b", "option_c", "option_d", 
+                         "instructions", "answer", "explanation"]:
+                if field in q and q[field]:
+                    q[field] = self._convert_latex_to_unicode(q[field])
+            
+            # Clean and normalize text
+            for field in ["text", "option_a", "option_b", "option_c", "option_d", 
+                         "answer", "explanation"]:
+                if field in q and q[field]:
+                    # Remove extra whitespace
+                    q[field] = re.sub(r'\s+', ' ', q[field]).strip()
+                    # Remove leading/trailing quotes
+                    q[field] = q[field].strip('"\'').strip()
+            
+            # Determine question type
+            if q["type"] not in ["MCQ", "FILL_IN_BLANK", "MATCHING"]:
+                # Check for table/matching patterns
+                if re.search(r'<table>|Column A.*Column B|match.*column', q["text"], re.IGNORECASE):
+                    q["type"] = "MATCHING"
+                elif re.search(r'_{3,}|_____|blank', q["text"], re.IGNORECASE):
+                    q["type"] = "FILL_IN_BLANK"
+                elif any(q[f"option_{opt}"] for opt in ['a', 'b', 'c', 'd']):
+                    q["type"] = "MCQ"
+                else:
+                    q["type"] = "MCQ"
+            
+            # Clean answer field
+            if q.get("answer"):
+                q["answer"] = re.sub(r'^Ans(?:wer)?\s*[:\-\.]\s*', '', q["answer"], flags=re.IGNORECASE)
+                q["answer"] = q["answer"].strip()
+            
+            # Clean explanation field
+            if q.get("explanation"):
+                q["explanation"] = re.sub(r'^Explanation\s*[:\-\.]\s*', '', q["explanation"], flags=re.IGNORECASE)
+                q["explanation"] = q["explanation"].strip()
+            
+            processed.append(q)
+        
+        return processed
+    
+    def _verify_and_fix_missing_options(self, questions: List[Dict], original_text: str) -> List[Dict]:
+        """Verify that all questions have all options, fix if missing"""
+        print(f"Verifying options completeness...")
+        
+        for i, q in enumerate(questions):
+            # Check if any option is missing
+            missing_options = []
+            for opt in ['a', 'b', 'c', 'd']:
+                if not q.get(f"option_{opt}") or q.get(f"option_{opt}") == "":
+                    missing_options.append(opt.upper())
+            
+            if missing_options:
+                print(f"Question {q.get('number')} missing options: {missing_options}")
+                
+                # Try to find missing options in original text
+                q_number = q.get('number', '').lower()
+                if q_number:
+                    # Search for this question in original text
+                    search_pattern = re.escape(q_number.replace('q', ''))
+                    pattern = rf'{search_pattern}[\.:].+?(?=Q\d+|\d+\.|\Z)'
+                    match = re.search(pattern, original_text, re.DOTALL | re.IGNORECASE)
+                    
+                    if match:
+                        question_block = match.group(0)
+                        # Try to extract options from this block
+                        for opt in missing_options:
+                            opt_lower = opt.lower()
+                            # Look for option pattern
+                            opt_pattern = rf'{opt}[\.\)]\s*(.+?)(?=[A-D][\.\)]|\Z)'
+                            opt_match = re.search(opt_pattern, question_block, re.DOTALL)
+                            if opt_match:
+                                q[f"option_{opt_lower}"] = opt_match.group(1).strip()
+                                print(f"  Found missing option {opt}")
+        
+        return questions
+    
+    def _print_extraction_stats(self, questions: List[Dict]):
+        """Print statistics about extraction quality"""
+        total_questions = len(questions)
+        if total_questions == 0:
+            return
+        
+        # Count questions with all options
+        complete_questions = 0
+        questions_with_answer = 0
+        questions_with_explanation = 0
+        
+        for q in questions:
+            # Check if all options are present
+            has_all_options = all(q.get(f"option_{opt}") for opt in ['a', 'b', 'c', 'd'])
+            if has_all_options:
+                complete_questions += 1
+            
+            if q.get("answer"):
+                questions_with_answer += 1
+            
+            if q.get("explanation"):
+                questions_with_explanation += 1
+        
+        print(f"\nEXTRACTION QUALITY STATS:")
+        print(f"  Total questions: {total_questions}")
+        print(f"  Questions with all 4 options: {complete_questions} ({complete_questions/total_questions*100:.1f}%)")
+        print(f"  Questions with answer: {questions_with_answer} ({questions_with_answer/total_questions*100:.1f}%)")
+        print(f"  Questions with explanation: {questions_with_explanation} ({questions_with_explanation/total_questions*100:.1f}%)")
+        
+        # List questions with missing options
+        for q in questions:
+            missing = []
+            for opt in ['a', 'b', 'c', 'd']:
+                if not q.get(f"option_{opt}"):
+                    missing.append(opt.upper())
+            if missing:
+                print(f"  WARNING: Question {q.get('number')} missing options: {missing}")
+    
+    def process_pdf_batch(self, pdf_batch: List[Tuple[str, str]]) -> List[Dict]:
+        """Process a batch of PDFs"""
+        results = []
+        
+        for file_name, pdf_url in pdf_batch:
+            print(f"\n{'='*60}")
+            print(f"PROCESSING: {file_name}")
+            print(f"URL: {pdf_url[:100]}...")
+            print(f"{'='*60}")
+            
+            try:
+                # Download PDF
+                pdf_bytes = self.download_pdf(pdf_url)
+                if not pdf_bytes:
+                    results.append({"error": "Failed to download PDF", "file_name": file_name})
+                    continue
+                
+                # Check if PDF contains questions
+                if not self.contains_questions(pdf_bytes, file_name):
+                    print(f"Skipping {file_name} - no questions found")
+                    results.append({"info": "No questions found", "file_name": file_name})
+                    continue
+                
+                # Extract questions
+                questions = self.extract_questions_from_pdf(pdf_bytes, file_name)
+                results.extend(questions)
+                
+                # Rate limiting between PDFs
+                time.sleep(3)
+                
+            except Exception as e:
+                error_msg = f"Error processing {file_name}: {str(e)[:200]}"
+                print(f"{error_msg}")
+                results.append({"error": error_msg, "file_name": file_name})
+        
+        return results
+    
+    def print_statistics(self):
+        """Print processing statistics"""
+        print(f"\n{'='*60}")
+        print("PROCESSING STATISTICS")
+        print(f"{'='*60}")
+        print(f"Total questions extracted: {self.total_questions}")
+        print(f"Total pages processed: {self.total_pages}")
+        if self.total_pages > 0:
+            print(f"Average questions per page: {self.total_questions/self.total_pages:.2f}")
+
+# ==============================
+#  GOOGLE SHEETS PROCESSOR
+# ==============================
+class GoogleSheetsPDFProcessor:
+    def __init__(self, credentials_file: str, sheet_id: str, api_key: str, sheet_tab: str):
+        self.sheet_id = sheet_id
+        self.sheet_tab = sheet_tab
+        self.extractor = DeepSeekPDFQuestionExtractor(api_key)
+        self.service = self._authenticate(credentials_file)
+        self.next_output_row = 2
+    
+    def _authenticate(self, credentials_file: str):
+        """Authenticate with Google Sheets API"""
+        try:
+            if not os.path.exists(credentials_file):
+                raise FileNotFoundError(f"Credentials file not found: {credentials_file}")
+            
+            scopes = ['https://www.googleapis.com/auth/spreadsheets']
+            creds = service_account.Credentials.from_service_account_file(
+                credentials_file, scopes=scopes)
+            return build('sheets', 'v4', credentials=creds)
+        except Exception as e:
+            print(f"Google Sheets authentication failed: {e}")
+            raise
+    
+    def read_sheet_data(self) -> List[List[str]]:
+        """Read file names and URLs from sheet"""
+        try:
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!A:B"
+            ).execute()
+            
+            values = result.get('values', [])
+            print(f"Read {len(values)} rows from sheet")
+            return values
+        except Exception as e:
+            print(f"Error reading sheet: {e}")
+            return []
+    
+    def load_processed_files(self) -> set:
+        """Load already processed files from CSV"""
+        processed_files = set()
+        
+        if os.path.exists(PROGRESS_FILE):
+            try:
+                with open(PROGRESS_FILE, 'r', newline='', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    for row in reader:
+                        if row and row[0]:
+                            processed_files.add(row[0])
+                print(f"Loaded {len(processed_files)} processed files from {PROGRESS_FILE}")
+            except Exception as e:
+                print(f"Error reading progress file: {e}")
+        
+        return processed_files
+    
+    def save_processed_files(self, processed_files: set):
+        """Save processed files to CSV"""
+        try:
+            with open(PROGRESS_FILE, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                for file_name in sorted(processed_files):
+                    writer.writerow([file_name])
+            print(f"Saved {len(processed_files)} processed files")
+        except Exception as e:
+            print(f"Error saving progress file: {e}")
+    
+    def clear_output_columns(self):
+        """Clear columns C through M"""
+        try:
+            self.service.spreadsheets().values().clear(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!C:M"
+            ).execute()
+            print("Cleared previous output columns (C-M)")
+        except Exception as e:
+            print(f"Error clearing columns: {e}")
+    
+    def update_sheet_with_questions(self, questions_batch: List[Dict]):
+        """Update Google Sheets with extracted questions including answer and explanation"""
+        if not questions_batch:
+            return
+        
+        rows = []
+        for q in questions_batch:
+            if not isinstance(q, dict):
+                continue
+            
+            if "error" in q:
+                rows.append([
+                    "ERROR",                    # C: Type
+                    "",                         # D: Number
+                    q.get("file_name", ""),     # E: File Name
+                    "",                         # F: Instructions
+                    q.get("error", ""),         # G: Text
+                    "", "", "", "", "", "", ""  # H-M: Options, Answer, Explanation
+                ])
+            elif "info" in q:
+                rows.append([
+                    "INFO",                     # C: Type
+                    "",                         # D: Number
+                    q.get("file_name", ""),     # E: File Name
+                    "",                         # F: Instructions
+                    q.get("info", ""),          # G: Text
+                    "", "", "", "", "", "", ""  # H-M: Options, Answer, Explanation
+                ])
+            else:
+                rows.append([
+                    q.get("type", ""),          # C: Type
+                    q.get("number", ""),        # D: Number
+                    q.get("file_name", ""),     # E: File Name
+                    q.get("instructions", ""),  # F: Instructions
+                    q.get("text", ""),          # G: Text
+                    q.get("option_a", ""),      # H: Option A
+                    q.get("option_b", ""),      # I: Option B
+                    q.get("option_c", ""),      # J: Option C
+                    q.get("option_d", ""),      # K: Option D
+                    q.get("answer", ""),        # L: Answer
+                    q.get("explanation", "")    # M: Explanation
+                ])
+        
+        try:
+            if rows:
+                range_name = f"{self.sheet_tab}!C{self.next_output_row}"
+                body = {"values": rows}
+                
+                self.service.spreadsheets().values().update(
+                    spreadsheetId=self.sheet_id,
+                    range=range_name,
+                    valueInputOption="RAW",
+                    body=body
+                ).execute()
+                
+                print(f"Updated sheet with {len(rows)} rows (starting at row {self.next_output_row})")
+                self.next_output_row += len(rows)
+        except Exception as e:
+            print(f"Error updating sheet: {e}")
+    
+    def process_all_pdfs(self, batch_size: int = 1, resume: bool = True):
+        """Main processing function"""
+        print(f"\n{'='*80}")
+        print("STARTING PDF QUESTION EXTRACTION")
+        print(f"{'='*80}")
+        
+        # Read sheet data
+        sheet_data = self.read_sheet_data()
+        if len(sheet_data) < 2:
+            print("No data found in sheet (need at least header + 1 row)")
+            return
+        
+        # Load processed files
+        processed_files = self.load_processed_files()
+        
+        # Clear output if not resuming or no progress file
+        if not resume or not processed_files:
+            self.clear_output_columns()
+            self.next_output_row = 2
+            print("Starting fresh processing")
+        else:
+            print(f"Resuming from previous progress ({len(processed_files)} files already processed)")
+        
+        # Prepare files to process
+        files_to_process = []
+        skipped_count = 0
+        
+        for i, row in enumerate(sheet_data[1:], start=2):  # Skip header
+            if len(row) < 2:
+                print(f"Row {i}: Insufficient data")
+                continue
+            
+            file_name = row[0].strip()
+            pdf_url = row[1].strip()
+            
+            if not pdf_url.startswith("http"):
+                print(f"Row {i}: Invalid URL for {file_name}")
+                continue
+            
+            # Check if file is already processed
+            if resume and file_name in processed_files:
+                skipped_count += 1
+                continue
+            
+            files_to_process.append((file_name, pdf_url))
+        
+        print(f"\nPROCESSING SUMMARY:")
+        print(f"   Total rows in sheet: {len(sheet_data) - 1}")
+        print(f"   Already processed: {skipped_count}")
+        print(f"   To process: {len(files_to_process)}")
+        print(f"   Batch size: {batch_size}")
+        
+        if not files_to_process:
+            print("\nAll PDFs already processed!")
+            return
+        
+        # Process in batches
+        all_questions = []
+        pending_questions = []
+        
+        for batch_start in range(0, len(files_to_process), batch_size):
+            batch_end = min(batch_start + batch_size, len(files_to_process))
+            current_batch = files_to_process[batch_start:batch_end]
+            
+            batch_num = (batch_start // batch_size) + 1
+            total_batches = (len(files_to_process) - 1) // batch_size + 1
+            
+            print(f"\n{'='*60}")
+            print(f"BATCH {batch_num}/{total_batches}")
+            print(f"{'='*60}")
+            print(f"Files in this batch:")
+            for name, _ in current_batch:
+                print(f"  • {name}")
+            
+            # Process batch
+            batch_results = self.extractor.process_pdf_batch(current_batch)
+            
+            # Mark files as processed
+            for name, _ in current_batch:
+                processed_files.add(name)
+            
+            # Save progress
+            self.save_processed_files(processed_files)
+            
+            # Filter valid questions
+            valid_questions = [q for q in batch_results if isinstance(q, dict) and q.get("text")]
+            all_questions.extend(valid_questions)
+            pending_questions.extend(valid_questions)
+            
+            # Update sheet if we have enough questions
+            if len(pending_questions) >= UPDATE_BATCH_SIZE:
+                print(f"\nUpdating sheet with {len(pending_questions)} questions...")
+                self.update_sheet_with_questions(pending_questions)
+                pending_questions = []
+            
+            # Rate limiting between batches
+            if batch_end < len(files_to_process):
+                print(f"\nWaiting 5 seconds before next batch...")
+                time.sleep(5)
+        
+        # Final update for remaining questions
+        if pending_questions:
+            print(f"\nFinal update with {len(pending_questions)} remaining questions...")
+            self.update_sheet_with_questions(pending_questions)
+        
+        # Print statistics
+        self.extractor.print_statistics()
+        
+        # Final summary
+        print(f"\n{'='*80}")
+        print("PROCESSING COMPLETE!")
+        print(f"{'='*80}")
+        print(f"Total files processed: {len(files_to_process)}")
+        print(f"Total questions extracted: {len(all_questions)}")
+        print(f"Questions saved to: {self.sheet_tab}!C{2}:M{self.next_output_row-1}")
+        print(f"Columns: Type, Number, File, Instructions, Text, A, B, C, D, Answer, Explanation")
+        print(f"Progress saved to: {PROGRESS_FILE}")
+        print(f"{'='*80}")
+
+# ==============================
+#  INSTALLATION CHECK
+# ==============================
+def check_installations():
+    """Check if required packages are installed"""
+    required_packages = [
+        ('requests', 'requests'),
+        ('PyPDF2', 'PyPDF2'),
+        ('pdfplumber', 'pdfplumber'),
+        ('google-auth', 'google.oauth2'),
+    ]
+    
+    missing_packages = []
+    
+    for package_name, import_name in required_packages:
+        try:
+            __import__(import_name)
+            print(f"{package_name}")
+        except ImportError:
+            print(f"{package_name} - MISSING")
+            missing_packages.append(package_name)
+    
+    return missing_packages
+
+# ==============================
+#  MAIN FUNCTION
+# ==============================
+def main():
+    print("\n" + "="*80)
+    print("   DEEPSEEK PDF QUESTION EXTRACTION SYSTEM")
+    print("="*80)
+    
+    # Check API key
+    if DEEPSEEK_API_KEY == "your_deepseek_api_key_here":
+        print("ERROR: Please replace 'your_deepseek_api_key_here' with your actual DeepSeek API key")
+        print("Get your key from: https://platform.deepseek.com/api_keys")
+        print("\nOnce you have your API key, edit the script and replace the placeholder.")
+        return
+    
+    # Check installations
+    print("\nChecking required packages...")
+    missing = check_installations()
+    
+    if missing:
+        print(f"\nMissing packages detected. Install with:")
+        print(f"pip install {' '.join(missing)}")
+        return
+    
+    print("\nAll required packages are installed")
+    
+    # Check credentials file
+    if not os.path.exists(CREDENTIALS_FILE):
+        print(f"\nCredentials file not found: {CREDENTIALS_FILE}")
+        print("Make sure you have downloaded your Google Service Account JSON file.")
+        return
+    
+    # Configuration
+    BATCH_SIZE = 1  # Process one PDF at a time for reliability
+    RESUME_MODE = True
+    
+    print(f"\nCONFIGURATION:")
+    print(f"   DeepSeek Model: {EXTRACTION_MODEL}")
+    print(f"   Google Sheet: {GOOGLE_SHEET_ID}")
+    print(f"   Sheet Tab: {SHEET_TAB}")
+    print(f"   Batch Size: {BATCH_SIZE}")
+    print(f"   Resume Mode: {'Yes' if RESUME_MODE else 'No'}")
+    
+    # Start processing
+    try:
+        processor = GoogleSheetsPDFProcessor(
+            credentials_file=CREDENTIALS_FILE,
+            sheet_id=GOOGLE_SHEET_ID,
+            api_key=DEEPSEEK_API_KEY,
+            sheet_tab=SHEET_TAB
+        )
+        
+        processor.process_all_pdfs(batch_size=BATCH_SIZE, resume=RESUME_MODE)
+        
+    except KeyboardInterrupt:
+        print("\n\nProcessing interrupted by user")
+    except Exception as e:
+        print(f"\nFatal error: {e}")
+        import traceback
+        traceback.print_exc()
+
+# ==============================
+#  STANDALONE TEST FUNCTION
+# ==============================
+def test_single_pdf():
+    """Test function for single PDF without Google Sheets"""
+    print("\n" + "="*80)
+    print("   TEST SINGLE PDF EXTRACTION")
+    print("="*80)
+    
+    if DEEPSEEK_API_KEY == "your_deepseek_api_key_here":
+        print("Please update API key first")
+        return
+    
+    print("\nEnter PDF URL (or press Enter for test URL):")
+    pdf_url = input().strip()
+    
+    if not pdf_url:
+        pdf_url = "https://www.w3.org/WAI/ER/tests/xhtml/testfiles/resources/pdf/dummy.pdf"
+        print(f"Using test URL: {pdf_url}")
+    
+    print(f"\nProcessing: {pdf_url}")
+    
+    extractor = DeepSeekPDFQuestionExtractor(DEEPSEEK_API_KEY)
+    
+    # Download PDF
+    pdf_bytes = extractor.download_pdf(pdf_url)
+    if not pdf_bytes:
+        print("Failed to download PDF")
+        return
+    
+    # Extract questions
+    questions = extractor.extract_questions_from_pdf(pdf_bytes, "test.pdf")
+    
+    # Save results
+    output_file = "test_results.json"
+    with open(output_file, 'w', encoding='utf-8') as f:
+        json.dump(questions, f, indent=2, ensure_ascii=False)
+    
+    print(f"\nResults saved to: {output_file}")
+    print(f"\nSummary: {len([q for q in questions if isinstance(q, dict) and q.get('text')])} questions extracted")
+    
+    # Print sample with answer and explanation
+    for i, q in enumerate(questions[:3]):
+        if isinstance(q, dict) and q.get('text'):
+            print(f"\nSample Question {i+1}:")
+            print(f"  Number: {q.get('number', 'N/A')}")
+            print(f"  Type: {q.get('type', 'N/A')}")
+            print(f"  Has all options: {all(q.get(f'option_{opt}', '') for opt in ['a', 'b', 'c', 'd'])}")
+            print(f"  Answer: {q.get('answer', 'No answer extracted')}")
+            print(f"  Explanation: {q.get('explanation', 'No explanation extracted')[:100]}...")
+
+# ==============================
+#  ENTRY POINT
+# ==============================
+if __name__ == "__main__":
+    print("Choose mode:")
+    print("1. Full Google Sheets processing (main)")
+    print("2. Test single PDF extraction")
+    print("3. Check installations")
+    print("4. Exit")
+    
+    choice = input("\nEnter choice (1/2/3/4): ").strip()
+    
+    if choice == "2":
+        test_single_pdf()
+    elif choice == "3":
+        check_installations()
+    elif choice == "4":
+        print("Exiting...")
+    else:
+        main()
