@@ -1,0 +1,1223 @@
+import requests
+import json
+import re
+import os
+import time
+import csv
+import PyPDF2
+import pdfplumber
+from typing import Dict, List, Tuple, Optional, Any
+from google.oauth2 import service_account
+from googleapiclient.discovery import build
+import io
+
+# ==============================
+#  CONFIGURATION
+# ==============================
+DEEPSEEK_API_KEY = "sk-467f5288c9ef40a4ae6ccec5978019ea"  # For extraction
+OPENAI_API_KEY = "your_openai_api_key_here"  # For detection and OCR fallback
+EXTRACTION_MODEL = "deepseek-chat"  # Primary model
+EXTRACTION_MODEL_FALLBACK = "gpt-4o"  # Fallback model for difficult PDFs
+DETECTION_MODEL = "gpt-4o-mini"  # For page detection
+DEEPSEEK_BASE_URL = "https://api.deepseek.com/v1/chat/completions"
+OPENAI_BASE_URL = "https://api.openai.com/v1/chat/completions"
+
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+CREDENTIALS_FILE = "service-account.json"
+SHEET_TAB = "Sheet4"
+
+PROGRESS_FILE = "processed_pdfs_part1.csv"
+UPDATE_BATCH_SIZE = 20  # Update Google Sheets every 20 questions
+
+# ==============================
+#  ENHANCED INSTRUCTION/COVER PAGE DETECTOR
+# ==============================
+class InstructionPageDetector:
+    def __init__(self):
+        self.instruction_keywords = [
+            'instructions:', 'important instructions', 'general instructions',
+            'test booklet', 'answer sheet', 'duration:', 'hours', 'minutes',
+            'marks:', 'maximum marks', 'roll no.', 'admit card', 'invigilator',
+            'superintendent', 'examination hall', 'rough work', 'blue/black',
+            'ball point pen', 'do not open', 'test booklet code',
+            'this booklet contains', 'page', 'pages', 'no.', 'code:',
+            'candidate', 'candidates', 'examination', 'test',
+            'multiple-choice questions', 'single correct answer',
+            'physics', 'chemistry', 'biology', 'botany', 'zoology',
+            'correct response', 'incorrect response', 'deducted',
+            'total scores', 'folded', 'stray marks', 'white fluid',
+            'electronic calculator', 'manual calculator', 'unfair means',
+            'rules and regulations', 'attendance sheet', 'centre',
+            'test duration', 'booklet', 'answer', 'sheet'
+        ]
+        
+        self.question_patterns = [
+            r'^\d+\.\s+[A-Z]',
+            r'\(1\)\s+', r'\(2\)\s+', r'\(3\)\s+', r'\(4\)\s+',
+            r'[a-d]\)\s+', r'[a-d]\.\s+',
+            r'\?',
+            r'Consider\s+', r'What\s+', r'Which\s+', r'Why\s+', r'How\s+',
+            r'\[.*?\]',
+            r'\$\$.*?\$\$', r'\$.*?\$',
+        ]
+        
+        self.cover_page_patterns = [
+            r'test\s+booklet\s+code',
+            r'booklet\s+code\s*\d+',
+            r'^\s*\d+\s*$',
+            r'page\s+\d+\s+of\s+\d+',
+            r'^\s*[a-z]+\s*\n\s*\d+\s*$',
+            r'this\s+booklet\s+contains\s+\d+\s+pages',
+            r'do\s+not\s+open',
+            r'important\s+instructions',
+            r'general\s+instructions',
+            r'instructions\s+to\s+candidates',
+        ]
+    
+    def is_instruction_page(self, text: str) -> bool:
+        if not text or len(text.strip()) < 30:
+            return True
+        
+        text_lower = text.lower()
+        
+        # Check for multiple choice options
+        option_patterns = [r'\(1\)', r'\(2\)', r'\(3\)', r'\(4\)', r'[a-d]\)', r'[a-d]\.']
+        option_count = 0
+        for pattern in option_patterns:
+            option_count += len(re.findall(pattern, text_lower))
+        
+        if option_count >= 2:
+            return False
+        
+        # Check for question marks
+        question_mark_count = text.count('?')
+        if question_mark_count >= 1:
+            if not self._is_question_in_instructions(text_lower):
+                return False
+        
+        # Check for numbered questions
+        numbered_questions = re.findall(r'^\d+\.\s+[A-Z]', text, re.MULTILINE)
+        if len(numbered_questions) >= 1:
+            return False
+        
+        # Check instruction keywords
+        instruction_word_count = 0
+        total_words = len(text_lower.split())
+        
+        if total_words < 50:
+            return True
+        
+        for keyword in self.instruction_keywords:
+            if keyword in text_lower:
+                instruction_word_count += 1
+        
+        if instruction_word_count / total_words > 0.4:
+            return True
+        
+        # Check instruction item patterns
+        if re.search(r'\d+\.\s+(the|this|please|use|do not|candidate|answer sheet|invigilator)', 
+                    text_lower, re.IGNORECASE):
+            instruction_items = re.findall(r'\d+\.\s+[a-z]', text_lower)
+            if len(instruction_items) > 2:
+                return True
+        
+        return False
+    
+    def _is_question_in_instructions(self, text_lower: str) -> bool:
+        instruction_contexts = [
+            r'question\s+carries',
+            r'question\s+paper',
+            r'each\s+question',
+            r'for\s+each\s+question',
+            r'total\s+questions',
+            r'number\s+of\s+questions',
+            r'multiple-choice\s+questions',
+            r'all\s+questions',
+            r'question\s+number',
+            r'answer\s+to\s+the\s+question',
+        ]
+        
+        for pattern in instruction_contexts:
+            if re.search(pattern, text_lower):
+                return True
+        
+        return False
+
+# ==============================
+#  ENHANCED PDF TEXT EXTRACTOR
+# ==============================
+class EnhancedPDFTextExtractor:
+    def __init__(self):
+        self.min_page_words = 20
+        self.instruction_detector = InstructionPageDetector()
+    
+    def extract_all_text_from_pdf(self, pdf_bytes: bytes) -> Tuple[str, List[Dict]]:
+        """Extract ALL text from ALL pages of PDF"""
+        print("  Extracting text from ALL pages...")
+        
+        text = ""
+        page_info = []
+        
+        try:
+            # Use PyPDF2 for better reliability
+            text, page_info = self._extract_with_pypdf2(pdf_bytes)
+            
+        except Exception as e:
+            print(f"  PDF extraction error: {str(e)[:200]}")
+            return "", []
+        
+        # Mark instruction pages
+        for page in page_info:
+            if page['has_content']:
+                page['is_instruction'] = self.instruction_detector.is_instruction_page(page['text'])
+        
+        non_instruction_pages = [p for p in page_info if p['has_content'] and not p['is_instruction']]
+        print(f"  Successfully extracted {len(non_instruction_pages)}/{len(page_info)} non-instruction pages")
+        
+        return text, page_info
+    
+    def _extract_with_pypdf2(self, pdf_bytes: bytes) -> Tuple[str, List[Dict]]:
+        """Extract text using PyPDF2 (more reliable)"""
+        text = ""
+        page_info = []
+        
+        try:
+            # First close any existing PDF objects
+            import gc
+            gc.collect()
+            
+            reader = PyPDF2.PdfReader(io.BytesIO(pdf_bytes))
+            total_pages = len(reader.pages)
+            print(f"  PDF has {total_pages} pages")
+            
+            for page_num in range(1, total_pages + 1):
+                try:
+                    page = reader.pages[page_num - 1]
+                    page_text = page.extract_text()
+                    
+                    if page_text and len(page_text.strip().split()) >= 5:
+                        clean_text = self._clean_page_text(page_text)
+                        text += f"\n--- Page {page_num} ---\n{clean_text}\n"
+                        
+                        page_info.append({
+                            'page': page_num,
+                            'text': clean_text,
+                            'char_count': len(clean_text),
+                            'word_count': len(clean_text.split()),
+                            'has_content': True,
+                            'is_instruction': False
+                        })
+                        
+                        if page_num % 10 == 0:
+                            print(f"    Extracted page {page_num}/{total_pages}")
+                    else:
+                        page_info.append({
+                            'page': page_num,
+                            'text': '',
+                            'char_count': 0,
+                            'word_count': 0,
+                            'has_content': False,
+                            'is_instruction': True
+                        })
+                        
+                except Exception as e:
+                    page_info.append({
+                        'page': page_num,
+                        'text': '',
+                        'char_count': 0,
+                        'word_count': 0,
+                        'has_content': False,
+                        'is_instruction': True
+                    })
+                    continue
+            
+            # Clean up to prevent memory leaks
+            reader = None
+            gc.collect()
+            
+            return text, page_info
+            
+        except Exception as e:
+            print(f"  PyPDF2 extraction failed: {str(e)[:200]}")
+            return "", []
+    
+    def _clean_page_text(self, text: str) -> str:
+        if not text:
+            return ""
+        
+        text = re.sub(r'[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]', '', text)
+        text = re.sub(r'\ufeff', '', text)
+        text = re.sub(r'�+', '', text)
+        text = re.sub(r'\s+', ' ', text)
+        text = re.sub(r'\s*\.\s*', '. ', text)
+        text = re.sub(r'\s*,\s*', ', ', text)
+        
+        return text.strip()
+    
+    def analyze_pages_for_questions(self, page_info: List[Dict]) -> List[int]:
+        question_pages = []
+        
+        for page in page_info:
+            if not page['has_content'] or page['is_instruction']:
+                continue
+            
+            page_text = page['text']
+            if len(page_text.split()) < 30:
+                continue
+            
+            if self._has_question_indicators(page_text):
+                question_pages.append(page['page'])
+        
+        return question_pages
+    
+    def _has_question_indicators(self, text: str) -> bool:
+        text_lower = text.lower()
+        
+        strong_patterns = [
+            r'^\d+\.\s+[A-Z]',
+            r'\(1\)\s+[A-Z]', r'\(2\)\s+[A-Z]', r'\(3\)\s+[A-Z]', r'\(4\)\s+[A-Z]',
+            r'[a-d]\)\s+[A-Z]', r'[a-d]\.\s+[A-Z]',
+            r'\?',
+            r'Consider\s+', r'What\s+', r'Which\s+', r'Why\s+', r'How\s+',
+            r'_____+', r'_{3,}',
+            r'match\s+list', r'column\s+a.*column\s+b',
+            r'true\s+or\s+false', r'multiple\s+choice',
+        ]
+        
+        for pattern in strong_patterns:
+            if re.search(pattern, text, re.MULTILINE | re.IGNORECASE):
+                return True
+        
+        option_patterns = [r'\(1\)', r'\(2\)', r'\(3\)', r'\(4\)', r'[a-d]\)', r'[a-d]\.']
+        option_count = 0
+        for pattern in option_patterns:
+            option_count += len(re.findall(pattern, text_lower))
+        
+        if option_count >= 2:
+            return True
+        
+        return False
+    
+    def get_non_instruction_pages(self, page_info: List[Dict]) -> List[int]:
+        return [p['page'] for p in page_info if p['has_content'] and not p['is_instruction']]
+
+# ==============================
+#  DUAL MODEL EXTRACTOR (DeepSeek + GPT-4o fallback)
+# ==============================
+class DualModelExtractor:
+    def __init__(self, deepseek_key: str, openai_key: str):
+        self.deepseek_key = deepseek_key
+        self.openai_key = openai_key
+        self.deepseek_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {deepseek_key}"
+        }
+        self.openai_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {openai_key}"
+        }
+    
+    def extract_with_primary(self, prompt: str, max_tokens: int = 4000) -> Optional[List[Dict]]:
+        """Extract using DeepSeek (primary model)"""
+        try:
+            payload = {
+                "model": EXTRACTION_MODEL,
+                "temperature": 0.1,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You extract ALL questions from ACTUAL QUESTION PAGES (not instruction pages). Never skip questions. Extract from ALL pages provided."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": max_tokens
+            }
+            
+            response = requests.post(
+                DEEPSEEK_BASE_URL,
+                headers=self.deepseek_headers,
+                json=payload,
+                timeout=90
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                
+                if content:
+                    return self._parse_response(content)
+            
+            return None
+            
+        except Exception as e:
+            print(f"    DeepSeek extraction error: {str(e)[:200]}")
+            return None
+    
+    def extract_with_fallback(self, prompt: str, max_tokens: int = 4000) -> Optional[List[Dict]]:
+        """Extract using GPT-4o (fallback model)"""
+        print("    Using GPT-4o as fallback...")
+        
+        try:
+            payload = {
+                "model": EXTRACTION_MODEL_FALLBACK,
+                "temperature": 0.1,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You extract ALL questions from ACTUAL QUESTION PAGES (not instruction pages). Never skip questions. Extract from ALL pages provided. Return ONLY valid JSON array."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": max_tokens
+            }
+            
+            response = requests.post(
+                OPENAI_BASE_URL,
+                headers=self.openai_headers,
+                json=payload,
+                timeout=120
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                
+                if content:
+                    return self._parse_response(content)
+            
+            return None
+            
+        except Exception as e:
+            print(f"    GPT-4o extraction error: {str(e)[:200]}")
+            return None
+    
+    def _parse_response(self, content: str) -> Optional[List[Dict]]:
+        """Parse API response to extract questions"""
+        try:
+            content = content.strip()
+            content = re.sub(r'```json|```', '', content)
+            content = re.sub(r'^\s*json\s*', '', content, flags=re.IGNORECASE)
+            
+            questions = json.loads(content)
+            if isinstance(questions, list):
+                return questions
+        except json.JSONDecodeError:
+            match = re.search(r'\[\s*\{.*?\}\s*\]', content, re.DOTALL)
+            if match:
+                json_str = match.group(0)
+                json_str = re.sub(r',\s*\}', '}', json_str)
+                json_str = re.sub(r',\s*\]', ']', json_str)
+                try:
+                    questions = json.loads(json_str)
+                    if isinstance(questions, list):
+                        return questions
+                except:
+                    pass
+        
+        return None
+    
+    def extract_questions(self, chunk_text: str, file_name: str, chunk_num: int, pages: List[int]) -> List[Dict]:
+        """Extract questions using primary model with fallback"""
+        prompt = f"""Extract ALL exam questions from the following text. This includes pages {pages} from "{file_name}".
+
+IMPORTANT: These pages have been filtered to EXCLUDE instruction pages, cover pages, and general information.
+You are now looking at ACTUAL QUESTION PAGES that students need to answer.
+
+INSTRUCTIONS:
+1. Extract EVERY single question without skipping any
+2. Look for questions on ALL pages in this chunk
+3. Preserve original question numbers exactly
+4. For EACH question, extract ALL 4 options (A, B, C, D)
+5. Extract answers if present (look for "Ans:", "Answer:", etc.)
+6. Extract explanations if present
+7. Convert LaTeX to readable text (H_2O → H₂O, CO_2 → CO₂)
+8. For tables, use simple text format
+9. For matching questions, note as type: "MATCHING"
+
+TEXT FROM PAGES {pages}:
+{chunk_text[:3500]}
+
+Return a JSON array. For EACH question found:
+{{
+  "number": "original question number (Q1, 1., etc.)",
+  "type": "MCQ or MATCHING or FILL_IN_BLANK",
+  "text": "full question text",
+  "option_a": "option A text",
+  "option_b": "option B text",
+  "option_c": "option C text",
+  "option_d": "option D text",
+  "instructions": "",
+  "answer": "correct answer if available",
+  "explanation": "explanation if available"
+}}
+
+If NO questions in this text, return empty array: []
+"""
+        
+        # Try primary model first
+        questions = self.extract_with_primary(prompt)
+        
+        # If primary fails or returns no questions, try fallback
+        if not questions or (isinstance(questions, list) and len(questions) == 0):
+            questions = self.extract_with_fallback(prompt)
+        
+        return questions if questions else []
+
+# ==============================
+#  SMART PDF QUESTION EXTRACTOR
+# ==============================
+class SmartPDFQuestionExtractor:
+    def __init__(self, deepseek_key: str, openai_key: str):
+        self.deepseek_key = deepseek_key
+        self.openai_key = openai_key
+        self.pdf_extractor = EnhancedPDFTextExtractor()
+        self.dual_extractor = DualModelExtractor(deepseek_key, openai_key)
+        self.total_questions = 0
+        self.total_pages = 0
+        
+        self.openai_headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {openai_key}"
+        }
+    
+    def download_pdf(self, pdf_url: str) -> Optional[bytes]:
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                    'Accept': 'application/pdf,text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8'
+                }
+                
+                response = requests.get(pdf_url, headers=headers, timeout=60, stream=True)
+                response.raise_for_status()
+                
+                pdf_bytes = response.content
+                
+                if len(pdf_bytes) < 1024:
+                    print(f"  Warning: PDF is very small ({len(pdf_bytes)} bytes)")
+                    continue
+                
+                print(f"  Downloaded {len(pdf_bytes):,} bytes")
+                return pdf_bytes
+                
+            except Exception as e:
+                print(f"  Download attempt {attempt+1} failed: {str(e)[:200]}")
+                if attempt < max_retries - 1:
+                    time.sleep(2)
+        
+        return None
+    
+    def extract_questions_smart(self, pdf_bytes: bytes, file_name: str) -> List[Dict]:
+        print(f"\n{'='*60}")
+        print(f"SMART EXTRACTION FROM: {file_name}")
+        print(f"(Skipping instruction/cover pages)")
+        print(f"{'='*60}")
+        
+        # Step 1: Extract ALL text from ALL pages
+        start_time = time.time()
+        text, page_info = self.pdf_extractor.extract_all_text_from_pdf(pdf_bytes)
+        extraction_time = time.time() - start_time
+        
+        if not text or len(page_info) == 0:
+            print(f"  Failed to extract text from PDF")
+            return [{"error": "Failed to extract text from PDF", "file_name": file_name}]
+        
+        self.total_pages = len(page_info)
+        
+        # Identify instruction vs non-instruction pages
+        instruction_pages = [p['page'] for p in page_info if p.get('is_instruction', False)]
+        non_instruction_pages = [p['page'] for p in page_info if not p.get('is_instruction', False)]
+        
+        print(f"  Extracted {len(page_info)} pages in {extraction_time:.1f}s")
+        print(f"  Instruction/cover pages: {instruction_pages}")
+        print(f"  Non-instruction pages: {non_instruction_pages}")
+        
+        if len(non_instruction_pages) == 0:
+            print(f"  No non-instruction pages found - processing pages 2-10 as fallback")
+            question_pages = [p for p in range(2, min(11, len(page_info) + 1))]
+        else:
+            # Step 2: Detect question pages
+            question_pages = self._detect_question_pages(page_info, non_instruction_pages)
+        
+        if not question_pages:
+            print(f"  No question pages detected, using first 5 non-instruction pages")
+            question_pages = non_instruction_pages[:5] if non_instruction_pages else [2, 3, 4, 5, 6]
+        
+        print(f"  Processing {len(question_pages)} pages: {question_pages}")
+        
+        # Step 3: Process detected pages
+        all_questions = []
+        chunks = self._create_smart_chunks(text, question_pages, page_info)
+        
+        print(f"  Processing {len(chunks)} chunks")
+        
+        for chunk_num, (chunk_text, chunk_pages) in enumerate(chunks, 1):
+            print(f"\n  Processing chunk {chunk_num}/{len(chunks)} (pages {chunk_pages})")
+            print(f"    Chunk size: {len(chunk_text):,} chars")
+            
+            questions = self.dual_extractor.extract_questions(chunk_text, file_name, chunk_num, chunk_pages)
+            if questions:
+                all_questions.extend(questions)
+                print(f"    Found {len(questions)} questions in this chunk")
+            
+            if chunk_num < len(chunks):
+                time.sleep(1)
+        
+        # If no questions found, try alternative approach
+        if not all_questions:
+            print(f"  No questions found with regular extraction, trying alternative approach...")
+            all_questions = self._try_alternative_extraction(text, file_name, page_info)
+        
+        # Step 4: Process and validate questions
+        processed_questions = self._process_all_questions(all_questions, file_name, text)
+        
+        # Step 5: Ensure sequential numbering
+        processed_questions = self._ensure_complete_sequential_numbering(processed_questions)
+        
+        # Step 6: Final verification
+        self._verify_smart_extraction(processed_questions, text, page_info, instruction_pages)
+        
+        self.total_questions += len(processed_questions)
+        
+        print(f"\n{'='*60}")
+        print(f"SMART EXTRACTION COMPLETE: {len(processed_questions)} questions extracted")
+        print(f"  From {len(question_pages)}/{len(non_instruction_pages)} non-instruction pages")
+        print(f"  Skipped {len(instruction_pages)} instruction/cover pages")
+        print(f"{'='*60}")
+        
+        return processed_questions
+    
+    def _detect_question_pages(self, page_info: List[Dict], non_instruction_pages: List[int]) -> List[int]:
+        """Detect which pages have questions"""
+        # Simple rule-based detection
+        question_pages = []
+        
+        for page in page_info:
+            if page['page'] in non_instruction_pages and page['has_content']:
+                page_text = page['text']
+                
+                # Check for question indicators
+                if (page_text.count('?') >= 1 or 
+                    re.search(r'\(1\)|\(2\)|\(3\)|\(4\)', page_text) or
+                    re.search(r'^\d+\.\s+', page_text, re.MULTILINE)):
+                    question_pages.append(page['page'])
+        
+        # If no pages detected, use first few non-instruction pages
+        if not question_pages and non_instruction_pages:
+            question_pages = non_instruction_pages[:5]
+        
+        return question_pages
+    
+    def _create_smart_chunks(self, text: str, question_pages: List[int], page_info: List[Dict]) -> List[Tuple[str, List[int]]]:
+        chunks = []
+        
+        if not question_pages:
+            return chunks
+        
+        question_pages.sort()
+        
+        current_chunk_pages = []
+        current_chunk_text = ""
+        
+        for page_num in question_pages:
+            page_text = self._extract_single_page_text(text, page_num)
+            if not page_text:
+                continue
+            
+            if current_chunk_text and (len(current_chunk_text) + len(page_text) > 3000 or len(current_chunk_pages) >= 3):
+                if current_chunk_text and len(current_chunk_pages) > 0:
+                    chunks.append((current_chunk_text, current_chunk_pages.copy()))
+                current_chunk_text = ""
+                current_chunk_pages = []
+            
+            if current_chunk_text:
+                current_chunk_text += f"\n--- Page {page_num} ---\n{page_text}\n"
+            else:
+                current_chunk_text = f"--- Page {page_num} ---\n{page_text}\n"
+            current_chunk_pages.append(page_num)
+        
+        if current_chunk_text and len(current_chunk_pages) > 0:
+            chunks.append((current_chunk_text, current_chunk_pages.copy()))
+        
+        return chunks
+    
+    def _extract_single_page_text(self, text: str, page_num: int) -> str:
+        pattern = rf'--- Page {page_num} ---\n(.*?)(?=\n--- Page \d+ ---|\Z)'
+        match = re.search(pattern, text, re.DOTALL)
+        if match:
+            return match.group(1).strip()
+        return ""
+    
+    def _try_alternative_extraction(self, text: str, file_name: str, page_info: List[Dict]) -> List[Dict]:
+        """Alternative extraction method when regular extraction fails"""
+        print("  Trying alternative extraction method...")
+        
+        # Extract all text and use GPT-4o to find questions
+        combined_text = ""
+        for page in page_info:
+            if page['has_content'] and not page.get('is_instruction', False):
+                combined_text += f"\nPage {page['page']}:\n{page['text'][:500]}\n"
+        
+        if len(combined_text) > 4000:
+            combined_text = combined_text[:4000] + "..."
+        
+        prompt = f"""I have text from an exam paper. Please extract ALL questions you can find.
+
+Text from exam paper "{file_name}":
+{combined_text}
+
+Extract ALL questions in JSON format:
+[
+  {{
+    "number": "question number or estimate",
+    "text": "question text",
+    "option_a": "option A if present",
+    "option_b": "option B if present",
+    "option_c": "option C if present",
+    "option_d": "option D if present",
+    "answer": "answer if present",
+    "explanation": "explanation if present"
+  }}
+]
+
+If you find any questions, extract them. If no questions found, return empty array: []"""
+        
+        try:
+            payload = {
+                "model": EXTRACTION_MODEL_FALLBACK,
+                "temperature": 0.1,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": "You extract exam questions from text. Be thorough and find all questions."
+                    },
+                    {"role": "user", "content": prompt}
+                ],
+                "max_tokens": 3000
+            }
+            
+            response = requests.post(
+                OPENAI_BASE_URL,
+                headers=self.openai_headers,
+                json=payload,
+                timeout=90
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                content = data.get("choices", [{}])[0].get("message", {}).get("content", "")
+                
+                if content:
+                    try:
+                        content = content.strip()
+                        content = re.sub(r'```json|```', '', content)
+                        questions = json.loads(content)
+                        if isinstance(questions, list):
+                            print(f"    Alternative method found {len(questions)} questions")
+                            return questions
+                    except:
+                        pass
+        
+        except Exception as e:
+            print(f"    Alternative extraction error: {str(e)[:200]}")
+        
+        return []
+    
+    def _process_all_questions(self, questions: List[Dict], file_name: str, original_text: str) -> List[Dict]:
+        processed = []
+        
+        for i, q in enumerate(questions):
+            if not isinstance(q, dict):
+                continue
+            
+            q.setdefault("number", f"Q{i+1}")
+            q.setdefault("type", "MCQ")
+            q.setdefault("text", "")
+            q.setdefault("option_a", "")
+            q.setdefault("option_b", "")
+            q.setdefault("option_c", "")
+            q.setdefault("option_d", "")
+            q.setdefault("instructions", "")
+            q.setdefault("answer", "")
+            q.setdefault("explanation", "")
+            q.setdefault("file_name", file_name)
+            
+            for field in ["text", "option_a", "option_b", "option_c", "option_d", 
+                         "instructions", "answer", "explanation"]:
+                if field in q and q[field]:
+                    q[field] = self._convert_latex_simple(q[field])
+                    q[field] = re.sub(r'\s+', ' ', q[field]).strip()
+                    q[field] = q[field].strip('"\'').strip()
+            
+            text_lower = q.get("text", "").lower()
+            if 'match' in text_lower or 'column' in text_lower:
+                q["type"] = "MATCHING"
+            elif '_____' in text_lower or 'blank' in text_lower:
+                q["type"] = "FILL_IN_BLANK"
+            elif any(q.get(f"option_{opt}") for opt in ['a', 'b', 'c', 'd']):
+                q["type"] = "MCQ"
+            
+            if q.get("answer"):
+                q["answer"] = re.sub(r'^Ans(?:wer)?\s*[:\-\.]\s*', '', q["answer"], flags=re.IGNORECASE).strip()
+            
+            processed.append(q)
+        
+        return processed
+    
+    def _convert_latex_simple(self, text: str) -> str:
+        if not text:
+            return text
+        
+        replacements = {
+            r'_0': '₀', r'_1': '₁', r'_2': '₂', r'_3': '₃', r'_4': '₄',
+            r'_5': '₅', r'_6': '₆', r'_7': '₇', r'_8': '₈', r'_9': '₉',
+            r'^0': '⁰', r'^1': '¹', r'^2': '²', r'^3': '³', r'^4': '⁴',
+            r'^5': '⁵', r'^6': '⁶', r'^7': '⁷', r'^8': '⁸', r'^9': '⁹',
+            r'->': '→', r'<->': '↔',
+            r'\frac{': '(', r'}{': '/', r'}': ')',
+            r'\sqrt{': '√(', r'}': ')',
+        }
+        
+        result = text
+        for latex, unicode_char in replacements.items():
+            result = result.replace(latex, unicode_char)
+        
+        return result
+    
+    def _ensure_complete_sequential_numbering(self, questions: List[Dict]) -> List[Dict]:
+        if not questions:
+            return questions
+        
+        numbered_questions = []
+        unnumbered_questions = []
+        
+        for q in questions:
+            original_num = q.get("number", "")
+            if original_num and re.search(r'\d+', original_num):
+                numbered_questions.append(q)
+            else:
+                unnumbered_questions.append(q)
+        
+        def extract_number(q):
+            num_match = re.search(r'(\d+)', q.get("number", ""))
+            return int(num_match.group(1)) if num_match else 999999
+        
+        numbered_questions.sort(key=extract_number)
+        
+        processed = []
+        expected_num = 1
+        
+        for q in numbered_questions:
+            q["number"] = f"Q{expected_num}"
+            processed.append(q)
+            expected_num += 1
+        
+        for q in unnumbered_questions:
+            q["number"] = f"Q{expected_num}"
+            processed.append(q)
+            expected_num += 1
+        
+        return processed
+    
+    def _verify_smart_extraction(self, questions: List[Dict], text: str, page_info: List[Dict], 
+                                instruction_pages: List[int]):
+        print(f"\n  VERIFICATION:")
+        print(f"    Total questions extracted: {len(questions)}")
+        print(f"    Total pages in PDF: {len(page_info)}")
+        print(f"    Instruction pages skipped: {len(instruction_pages)}")
+        
+        if not questions:
+            return
+        
+        complete = sum(1 for q in questions if all(q.get(f"option_{opt}") for opt in ['a', 'b', 'c', 'd']))
+        print(f"    Questions with all 4 options: {complete}/{len(questions)}")
+        
+        numbers = []
+        for q in questions:
+            num_match = re.search(r'(\d+)', q.get("number", ""))
+            if num_match:
+                numbers.append(int(num_match.group(1)))
+        
+        if numbers:
+            numbers.sort()
+            if numbers == list(range(1, len(numbers) + 1)):
+                print(f"    Numbering is sequential: Q1 to Q{len(numbers)}")
+    
+    def process_pdf_smart(self, file_name: str, pdf_url: str) -> List[Dict]:
+        print(f"\n{'='*80}")
+        print(f"PROCESSING: {file_name}")
+        print(f"(Using dual-model extraction with GPT-4o fallback)")
+        print(f"{'='*80}")
+        
+        try:
+            pdf_bytes = self.download_pdf(pdf_url)
+            if not pdf_bytes:
+                return [{"error": "Failed to download PDF", "file_name": file_name}]
+            
+            questions = self.extract_questions_smart(pdf_bytes, file_name)
+            
+            return questions
+            
+        except Exception as e:
+            error_msg = f"Error processing {file_name}: {str(e)[:200]}"
+            print(f"{error_msg}")
+            return [{"error": error_msg, "file_name": file_name}]
+
+# ==============================
+#  GOOGLE SHEETS PROCESSOR
+# ==============================
+class GoogleSheetsSmartProcessor:
+    def __init__(self, credentials_file: str, sheet_id: str, deepseek_key: str, openai_key: str, sheet_tab: str):
+        self.sheet_id = sheet_id
+        self.sheet_tab = sheet_tab
+        self.extractor = SmartPDFQuestionExtractor(deepseek_key, openai_key)
+        self.service = self._authenticate(credentials_file)
+        
+        self.next_empty_row = self._find_next_empty_row()
+        print(f"Next empty row for appending: {self.next_empty_row}")
+        
+        # Buffer for batch updates
+        self.questions_buffer = []
+    
+    def _authenticate(self, credentials_file: str):
+        try:
+            scopes = ['https://www.googleapis.com/auth/spreadsheets']
+            creds = service_account.Credentials.from_service_account_file(
+                credentials_file, scopes=scopes)
+            return build('sheets', 'v4', credentials=creds)
+        except Exception as e:
+            print(f"Google Sheets authentication failed: {e}")
+            raise
+    
+    def _find_next_empty_row(self) -> int:
+        try:
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!C:C"
+            ).execute()
+            
+            values = result.get('values', [])
+            
+            for i in range(len(values)):
+                if i >= 1:
+                    if len(values[i]) == 0 or not values[i][0].strip():
+                        return i + 1
+            
+            return len(values) + 1
+            
+        except Exception as e:
+            print(f"Error finding next empty row: {e}")
+            return 2
+    
+    def read_sheet_data(self) -> List[List[str]]:
+        try:
+            result = self.service.spreadsheets().values().get(
+                spreadsheetId=self.sheet_id,
+                range=f"{self.sheet_tab}!A:B"
+            ).execute()
+            
+            values = result.get('values', [])
+            print(f"Read {len(values)} rows from sheet")
+            return values
+        except Exception as e:
+            print(f"Error reading sheet: {e}")
+            return []
+    
+    def load_processed_files(self) -> set:
+        processed_files = set()
+        
+        if os.path.exists(PROGRESS_FILE):
+            try:
+                with open(PROGRESS_FILE, 'r', newline='', encoding='utf-8') as f:
+                    reader = csv.reader(f)
+                    for row in reader:
+                        if row and row[0]:
+                            processed_files.add(row[0])
+                print(f"Loaded {len(processed_files)} processed files from {PROGRESS_FILE}")
+            except Exception as e:
+                print(f"Error reading progress file: {e}")
+        
+        return processed_files
+    
+    def save_processed_files(self, processed_files: set):
+        try:
+            with open(PROGRESS_FILE, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                for file_name in sorted(processed_files):
+                    writer.writerow([file_name])
+            print(f"Saved {len(processed_files)} processed files")
+        except Exception as e:
+            print(f"Error saving progress file: {e}")
+    
+    def _flush_buffer(self) -> bool:
+        """Send buffered questions to Google Sheets"""
+        if not self.questions_buffer:
+            return True
+        
+        rows = []
+        for q in self.questions_buffer:
+            if not isinstance(q, dict):
+                continue
+            
+            if "error" in q:
+                rows.append([
+                    "ERROR",
+                    "",
+                    q.get("file_name", ""),
+                    "",
+                    q.get("error", ""),
+                    "", "", "", "", "", "", ""
+                ])
+            elif "info" in q:
+                rows.append([
+                    "INFO",
+                    "",
+                    q.get("file_name", ""),
+                    "",
+                    q.get("info", ""),
+                    "", "", "", "", "", "", ""
+                ])
+            else:
+                rows.append([
+                    q.get("type", ""),
+                    q.get("number", ""),
+                    q.get("file_name", ""),
+                    q.get("instructions", ""),
+                    q.get("text", ""),
+                    q.get("option_a", ""),
+                    q.get("option_b", ""),
+                    q.get("option_c", ""),
+                    q.get("option_d", ""),
+                    q.get("answer", ""),
+                    q.get("explanation", "")
+                ])
+        
+        try:
+            if rows:
+                range_name = f"{self.sheet_tab}!C{self.next_empty_row}"
+                body = {"values": rows}
+                
+                result = self.service.spreadsheets().values().update(
+                    spreadsheetId=self.sheet_id,
+                    range=range_name,
+                    valueInputOption="RAW",
+                    body=body
+                ).execute()
+                
+                print(f"  Updated Google Sheets with {len(rows)} rows (appended at row {self.next_empty_row})")
+                
+                self.next_empty_row += len(rows)
+                self.questions_buffer.clear()
+                return True
+                
+        except Exception as e:
+            print(f"  Error updating Google Sheets: {e}")
+            print(f"  Will retry later...")
+            return False
+        
+        return False
+    
+    def add_questions_to_buffer(self, questions: List[Dict]):
+        """Add questions to buffer and flush if buffer is full"""
+        if not questions:
+            return
+        
+        valid_questions = [q for q in questions if isinstance(q, dict) and q.get("text")]
+        if valid_questions:
+            self.questions_buffer.extend(valid_questions)
+            print(f"  Added {len(valid_questions)} questions to buffer (total: {len(self.questions_buffer)})")
+            
+            # If buffer reaches batch size, flush it
+            if len(self.questions_buffer) >= UPDATE_BATCH_SIZE:
+                print(f"  Buffer full ({len(self.questions_buffer)} questions), updating Google Sheets...")
+                if self._flush_buffer():
+                    print(f"  Successfully updated Google Sheets")
+                else:
+                    print(f"  Failed to update Google Sheets, keeping in buffer")
+        
+        # Also add error/info messages
+        other_messages = [q for q in questions if isinstance(q, dict) and ("error" in q or "info" in q)]
+        if other_messages:
+            self.questions_buffer.extend(other_messages)
+            print(f"  Added {len(other_messages)} error/info messages to buffer")
+    
+    def process_all_pdfs_smart(self, resume: bool = True, clear_existing: bool = False):
+        print(f"\n{'='*80}")
+        print("DUAL-MODEL PDF QUESTION EXTRACTION SYSTEM")
+        print(f"Questions will be sent to Google Sheets every {UPDATE_BATCH_SIZE} questions")
+        print(f"{'='*80}")
+        
+        if OPENAI_API_KEY == "your_openai_api_key_here":
+            print("ERROR: Please update OPENAI_API_KEY in the configuration section")
+            print("Get your key from: https://platform.openai.com/api-keys")
+            return
+        
+        # Read sheet data
+        sheet_data = self.read_sheet_data()
+        if len(sheet_data) < 2:
+            print("No data found in sheet (need at least header + 1 row)")
+            return
+        
+        processed_files = self.load_processed_files()
+        
+        files_to_process = []
+        
+        for i, row in enumerate(sheet_data[1:], start=2):
+            if len(row) < 2:
+                print(f"Row {i}: Insufficient data")
+                continue
+            
+            file_name = row[0].strip()
+            pdf_url = row[1].strip()
+            
+            if not pdf_url.startswith("http"):
+                print(f"Row {i}: Invalid URL for {file_name}")
+                continue
+            
+            if resume and file_name in processed_files:
+                print(f"Skipping already processed file: {file_name}")
+                continue
+            
+            files_to_process.append((file_name, pdf_url))
+        
+        print(f"\nPROCESSING SUMMARY:")
+        print(f"   Total rows in sheet: {len(sheet_data) - 1}")
+        print(f"   Already processed: {len(processed_files)}")
+        print(f"   To process: {len(files_to_process)}")
+        
+        if not files_to_process:
+            print("\nAll PDFs already processed!")
+            return
+        
+        total_questions = 0
+        total_pdfs_processed = 0
+        
+        for i, (file_name, pdf_url) in enumerate(files_to_process, 1):
+            print(f"\n{'='*80}")
+            print(f"PROCESSING PDF {i}/{len(files_to_process)}: {file_name}")
+            print(f"{'='*80}")
+            
+            # Extract questions
+            questions = self.extractor.process_pdf_smart(file_name, pdf_url)
+            
+            # Add to buffer (will auto-flush when buffer is full)
+            if questions:
+                self.add_questions_to_buffer(questions)
+                valid_questions = [q for q in questions if isinstance(q, dict) and q.get("text")]
+                total_questions += len(valid_questions)
+            
+            # Mark as processed
+            processed_files.add(file_name)
+            self.save_processed_files(processed_files)
+            total_pdfs_processed += 1
+            
+            if i < len(files_to_process):
+                print(f"\nWaiting 2 seconds before next PDF...")
+                time.sleep(2)
+        
+        # Flush any remaining questions in buffer
+        if self.questions_buffer:
+            print(f"\nFlushing remaining {len(self.questions_buffer)} questions from buffer...")
+            retry_count = 0
+            max_retries = 3
+            
+            while retry_count < max_retries and self.questions_buffer:
+                if self._flush_buffer():
+                    print(f"Successfully flushed remaining questions to Google Sheets")
+                    break
+                else:
+                    retry_count += 1
+                    print(f"Retry {retry_count}/{max_retries} in 5 seconds...")
+                    time.sleep(5)
+            
+            if self.questions_buffer:
+                print(f"WARNING: Failed to save {len(self.questions_buffer)} questions to Google Sheets after {max_retries} retries")
+        
+        # Final summary
+        print(f"\n{'='*80}")
+        print("PROCESSING COMPLETE!")
+        print(f"{'='*80}")
+        print(f"Total PDFs processed: {total_pdfs_processed}")
+        print(f"Total questions extracted: {total_questions}")
+        print(f"Questions saved to Google Sheets starting from row: {self.next_empty_row - total_questions}")
+        print(f"Next empty row for future appends: {self.next_empty_row}")
+        print(f"Progress saved to: {PROGRESS_FILE}")
+        print(f"{'='*80}")
+
+# ==============================
+#  MAIN FUNCTION
+# ==============================
+def main():
+    print("\n" + "="*80)
+    print("   DUAL-MODEL PDF QUESTION EXTRACTION SYSTEM")
+    print(f"   Questions sent to Google Sheets every {UPDATE_BATCH_SIZE} questions")
+    print("="*80)
+    
+    if DEEPSEEK_API_KEY == "your_deepseek_api_key_here":
+        print("ERROR: Please update DEEPSEEK_API_KEY in the configuration section")
+        print("Get your key from: https://platform.deepseek.com/api_keys")
+        return
+    
+    if OPENAI_API_KEY == "your_openai_api_key_here":
+        print("ERROR: Please update OPENAI_API_KEY in the configuration section")
+        print("Get your key from: https://platform.openai.com/api-keys")
+        return
+    
+    if not os.path.exists(CREDENTIALS_FILE):
+        print(f"\nCredentials file not found: {CREDENTIALS_FILE}")
+        print("Google Sheets functionality requires service account credentials.")
+        return
+    
+    print("\nOPTIONS:")
+    print("1. Append to existing data (recommended)")
+    print("2. Clear existing data and start fresh")
+    print("3. Exit")
+    
+    choice = input("\nEnter choice (1-3): ").strip()
+    
+    if choice == "3":
+        print("Exiting...")
+        return
+    elif choice not in ["1", "2"]:
+        print("Invalid choice, defaulting to Append mode")
+        choice = "1"
+    
+    clear_existing = (choice == "2")
+    
+    try:
+        processor = GoogleSheetsSmartProcessor(
+            credentials_file=CREDENTIALS_FILE,
+            sheet_id=GOOGLE_SHEET_ID,
+            deepseek_key=DEEPSEEK_API_KEY,
+            openai_key=OPENAI_API_KEY,
+            sheet_tab=SHEET_TAB
+        )
+        
+        processor.process_all_pdfs_smart(resume=True, clear_existing=clear_existing)
+        
+    except KeyboardInterrupt:
+        print("\n\nProcessing interrupted by user")
+        # Try to flush buffer before exiting
+        if hasattr(processor, '_flush_buffer'):
+            processor._flush_buffer()
+    except Exception as e:
+        print(f"\nFatal error: {e}")
+        import traceback
+        traceback.print_exc()
+
+# ==============================
+#  ENTRY POINT
+# ==============================
+if __name__ == "__main__":
+    print("DUAL-MODEL PDF QUESTION EXTRACTION SYSTEM")
+    print("="*50)
+    print("1. Process ALL PDFs (Append to Google Sheets)")
+    print("2. Exit")
+    
+    choice = input("\nEnter choice (1-2): ").strip()
+    
+    if choice == "1":
+        main()
+    else:
+        print("Exiting...")
