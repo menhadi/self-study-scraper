@@ -7,185 +7,163 @@ const BATCH_SIZE = 300;
 const TIMESTAMP_FORMAT = "yyyy-MM-dd HH:mm:ss";
 
 /******************************
- * 🔼 PUSH FUNCTION (Sheet → DB via API)
+ * 🔎 AUTO-FETCH DB SCHEMA
+ ******************************/
+function getAllowedColumns_(tableName) {
+  const res = UrlFetchApp.fetch(
+    `${API_BASE_URL}/schema.php?table=${encodeURIComponent(tableName)}`,
+    {
+      headers: { "X-API-KEY": API_KEY },
+      muteHttpExceptions: true
+    }
+  );
+
+  let json;
+  try {
+    json = JSON.parse(res.getContentText());
+  } catch (e) {
+    throw new Error("Invalid schema API response:\n" + res.getContentText());
+  }
+
+  if (!json.success) {
+    throw new Error("Schema API error: " + JSON.stringify(json));
+  }
+
+  return json.columns;
+}
+
+/******************************
+ * 🔼 PUSH FUNCTION
  ******************************/
 function pushSheetToDB() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getActiveSheet();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
   const tableName = sheet.getName();
 
-  Logger.log(`🔼 Pushing data from Sheet "${tableName}" → DB...`);
+  Logger.log(`🔼 Pushing "${tableName}" → DB`);
 
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  const statusCol = headers.findIndex(h => h.trim().toLowerCase() === "syncstatus");
-  if (statusCol === -1) {
-    Logger.log("❌ Missing SyncStatus column");
-    return;
-  }
+  const statusCol = headers.findIndex(h => h.toString().toLowerCase() === "syncstatus");
+  if (statusCol === -1) return Logger.log("❌ Missing SyncStatus");
 
-  const lastRow = sheet.getLastRow();
-  if (lastRow < 2) {
-    Logger.log("ℹ️ No data rows");
-    return;
-  }
+  const allowedCols = getAllowedColumns_(tableName);
 
-  const data = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+  const rows = sheet.getLastRow() >= 2
+    ? sheet.getRange(2, 1, sheet.getLastRow() - 1, headers.length).getValues()
+    : [];
 
-  const pendingRows = [];
-  data.forEach((row, i) => {
-    const status = row[statusCol];
-    if (status && status.toString().toLowerCase() === "pending") {
+  const pending = [];
+
+  rows.forEach((row, i) => {
+    if (row[statusCol]?.toString().toLowerCase() === "pending") {
       const obj = {};
       headers.forEach((h, idx) => {
         if (idx === statusCol) return;
+        if (!allowedCols.includes(h)) return;
+
         let val = row[idx];
         if (val instanceof Date) {
           val = Utilities.formatDate(val, Session.getScriptTimeZone(), TIMESTAMP_FORMAT);
         }
         obj[h] = val === "" ? null : val;
       });
-      pendingRows.push({ sheetRow: i + 2, data: obj });
+      pending.push({ rowNum: i + 2, data: obj });
     }
   });
 
-  if (!pendingRows.length) {
-    Logger.log("✅ No pending rows to push");
-    return;
-  }
+  if (!pending.length) return Logger.log("✅ No pending rows");
 
-  const payload = {
-    table: tableName,
-    rows: pendingRows.slice(0, BATCH_SIZE).map(r => r.data)
-  };
-
-  const url = `${API_BASE_URL}/push.php`;
-
-  const res = UrlFetchApp.fetch(url, {
+  const res = UrlFetchApp.fetch(`${API_BASE_URL}/push.php`, {
     method: "post",
     contentType: "application/json",
-    payload: JSON.stringify(payload),
-    headers: {
-      "X-API-KEY": API_KEY
-    },
+    payload: JSON.stringify({
+      table: tableName,
+      rows: pending.slice(0, BATCH_SIZE).map(r => r.data)
+    }),
+    headers: { "X-API-KEY": API_KEY },
     muteHttpExceptions: true
   });
 
-  const responseText = res.getContentText();
-  let response;
+  const json = JSON.parse(res.getContentText());
+  if (!json.success) throw new Error(JSON.stringify(json));
 
-  try {
-    response = JSON.parse(responseText);
-  } catch (e) {
-    throw new Error("Invalid API response:\n" + responseText);
-  }
-
-  if (!response.success) {
-    throw new Error("API error: " + JSON.stringify(response));
-  }
-
-  pendingRows.slice(0, BATCH_SIZE).forEach(r => {
-    sheet.getRange(r.sheetRow, statusCol + 1).setValue("Synced");
+  pending.slice(0, BATCH_SIZE).forEach(r => {
+    sheet.getRange(r.rowNum, statusCol + 1).setValue("Synced");
   });
 
-  Logger.log(`✅ ${pendingRows.length} rows pushed successfully.`);
+  Logger.log(`✅ ${pending.length} rows pushed`);
 }
 
 /******************************
- * ⬇️ PULL FUNCTION (DB → Sheet via API)
- * Incremental (updated_at based)
+ * ⬇️ PULL FUNCTION
  ******************************/
 function pullDBToSheet() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-  const sheet = ss.getActiveSheet();
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
   const tableName = sheet.getName();
 
-  Logger.log(`⬇️ Pulling (incremental) data from DB → Sheet "${tableName}"...`);
+  Logger.log(`⬇️ Pulling "${tableName}" from DB`);
 
   const props = PropertiesService.getScriptProperties();
   const lastSync = props.getProperty(`lastSync_${tableName}`) || "1970-01-01 00:00:00";
 
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  const idCol = headers.findIndex(h => h.trim().toLowerCase() === "id");
-  const statusCol = headers.findIndex(h => h.trim().toLowerCase() === "syncstatus");
+  const idCol = headers.findIndex(h => h.toLowerCase() === "id");
+  const statusCol = headers.findIndex(h => h.toLowerCase() === "syncstatus");
 
-  if (idCol === -1) {
-    Logger.log("❌ Missing id column");
-    return;
-  }
+  if (idCol === -1) throw new Error("Missing id column");
 
-  const existingRows = sheet.getLastRow() >= 2
+  const rows = sheet.getLastRow() >= 2
     ? sheet.getRange(2, 1, sheet.getLastRow() - 1, headers.length).getValues()
     : [];
 
   const idMap = {};
-  existingRows.forEach((r, i) => {
-    if (r[idCol]) idMap[r[idCol].toString()] = i + 2;
-  });
+  rows.forEach((r, i) => r[idCol] && (idMap[r[idCol]] = i + 2));
 
-  const payload = {
-    table: tableName,
-    lastSync: lastSync,
-    existingIds: Object.keys(idMap)
-  };
-
-  const url = `${API_BASE_URL}/pull.php`;
-
-  const res = UrlFetchApp.fetch(url, {
+  const res = UrlFetchApp.fetch(`${API_BASE_URL}/pull.php`, {
     method: "post",
     contentType: "application/json",
-    payload: JSON.stringify(payload),
-    headers: {
-      "X-API-KEY": API_KEY
-    },
+    payload: JSON.stringify({
+      table: tableName,
+      lastSync,
+      existingIds: Object.keys(idMap)
+    }),
+    headers: { "X-API-KEY": API_KEY },
     muteHttpExceptions: true
   });
 
-  const responseText = res.getContentText();
-  let response;
-
-  try {
-    response = JSON.parse(responseText);
-  } catch (e) {
-    throw new Error("Invalid API response:\n" + responseText);
-  }
-
-  if (!response.success) {
-    throw new Error("API error: " + JSON.stringify(response));
-  }
+  const json = JSON.parse(res.getContentText());
+  if (!json.success) throw new Error(JSON.stringify(json));
 
   let maxUpdatedAt = lastSync;
-  let updated = 0;
-  let inserted = 0;
+  let updated = 0, inserted = 0;
 
-  response.rows.forEach(row => {
-    const rowArr = headers.map(h => row[h] ?? "");
-    if (statusCol !== -1) rowArr[statusCol] = "Synced";
+  json.rows.forEach(row => {
+    const arr = headers.map(h => row[h] ?? "");
+    if (statusCol !== -1) arr[statusCol] = "Synced";
 
-    if (row.updated_at && row.updated_at > maxUpdatedAt) {
-      maxUpdatedAt = row.updated_at;
-    }
+    if (row.updated_at > maxUpdatedAt) maxUpdatedAt = row.updated_at;
 
     if (idMap[row.id]) {
-      sheet.getRange(idMap[row.id], 1, 1, rowArr.length).setValues([rowArr]);
+      sheet.getRange(idMap[row.id], 1, 1, arr.length).setValues([arr]);
       updated++;
     } else {
-      sheet.appendRow(rowArr);
+      sheet.appendRow(arr);
       inserted++;
     }
   });
 
   props.setProperty(`lastSync_${tableName}`, maxUpdatedAt);
-
-  Logger.log(`✅ Pull complete: Updated ${updated}, Inserted ${inserted}`);
+  Logger.log(`✅ Pull done: Updated ${updated}, Inserted ${inserted}`);
 }
 
 /******************************
- * 🪄 AUTO MARK EDITED ROWS AS PENDING
+ * 🪄 SAFE onEdit
  ******************************/
 function onEdit(e) {
+  if (!e || !e.range) return;
+
   const sheet = e.range.getSheet();
   const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
-  const syncCol = headers.findIndex(h => h.trim().toLowerCase() === "syncstatus");
+  const syncCol = headers.findIndex(h => h.toLowerCase() === "syncstatus");
   if (syncCol === -1) return;
 
   if (e.range.getRow() > 1 && e.range.getColumn() !== syncCol + 1) {
