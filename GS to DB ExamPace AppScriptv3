@@ -1,0 +1,203 @@
+/******************************
+ * CONFIGURATION
+ ******************************/
+const API_BASE_URL = "https://exampace.com/api";
+const API_KEY = "EXAMPACE_SYNC_KEY_2025";
+const BATCH_SIZE = 300;
+const TIMESTAMP_FORMAT = "yyyy-MM-dd HH:mm:ss";
+
+/******************************
+ * 🔼 PUSH FUNCTION (Sheet → DB via API)
+ ******************************/
+function pushSheetToDB() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getActiveSheet();
+  const tableName = sheet.getName();
+
+  Logger.log(`🔼 Pushing data from Sheet "${tableName}" → DB...`);
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const statusCol = headers.findIndex(h => h.trim().toLowerCase() === "syncstatus");
+  if (statusCol === -1) {
+    Logger.log("❌ Missing SyncStatus column");
+    return;
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    Logger.log("ℹ️ No data rows");
+    return;
+  }
+
+  const data = sheet.getRange(2, 1, lastRow - 1, headers.length).getValues();
+
+  const pendingRows = [];
+  data.forEach((row, i) => {
+    const status = row[statusCol];
+    if (status && status.toString().toLowerCase() === "pending") {
+      const obj = {};
+      headers.forEach((h, idx) => {
+        if (idx === statusCol) return;
+        let val = row[idx];
+        if (val instanceof Date) {
+          val = Utilities.formatDate(val, Session.getScriptTimeZone(), TIMESTAMP_FORMAT);
+        }
+        obj[h] = val === "" ? null : val;
+      });
+      pendingRows.push({ sheetRow: i + 2, data: obj });
+    }
+  });
+
+  if (!pendingRows.length) {
+    Logger.log("✅ No pending rows to push");
+    return;
+  }
+
+  const payload = {
+    table: tableName,
+    rows: pendingRows.slice(0, BATCH_SIZE).map(r => r.data)
+  };
+
+  const url = `${API_BASE_URL}/push.php`;
+
+  const res = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    headers: {
+      "X-API-KEY": API_KEY
+    },
+    muteHttpExceptions: true
+  });
+
+  const responseText = res.getContentText();
+  let response;
+
+  try {
+    response = JSON.parse(responseText);
+  } catch (e) {
+    throw new Error("Invalid API response:\n" + responseText);
+  }
+
+  if (!response.success) {
+    throw new Error("API error: " + JSON.stringify(response));
+  }
+
+  pendingRows.slice(0, BATCH_SIZE).forEach(r => {
+    sheet.getRange(r.sheetRow, statusCol + 1).setValue("Synced");
+  });
+
+  Logger.log(`✅ ${pendingRows.length} rows pushed successfully.`);
+}
+
+/******************************
+ * ⬇️ PULL FUNCTION (DB → Sheet via API)
+ * Incremental (updated_at based)
+ ******************************/
+function pullDBToSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getActiveSheet();
+  const tableName = sheet.getName();
+
+  Logger.log(`⬇️ Pulling (incremental) data from DB → Sheet "${tableName}"...`);
+
+  const props = PropertiesService.getScriptProperties();
+  const lastSync = props.getProperty(`lastSync_${tableName}`) || "1970-01-01 00:00:00";
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const idCol = headers.findIndex(h => h.trim().toLowerCase() === "id");
+  const statusCol = headers.findIndex(h => h.trim().toLowerCase() === "syncstatus");
+
+  if (idCol === -1) {
+    Logger.log("❌ Missing id column");
+    return;
+  }
+
+  const existingRows = sheet.getLastRow() >= 2
+    ? sheet.getRange(2, 1, sheet.getLastRow() - 1, headers.length).getValues()
+    : [];
+
+  const idMap = {};
+  existingRows.forEach((r, i) => {
+    if (r[idCol]) idMap[r[idCol].toString()] = i + 2;
+  });
+
+  const payload = {
+    table: tableName,
+    lastSync: lastSync,
+    existingIds: Object.keys(idMap)
+  };
+
+  const url = `${API_BASE_URL}/pull.php`;
+
+  const res = UrlFetchApp.fetch(url, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    headers: {
+      "X-API-KEY": API_KEY
+    },
+    muteHttpExceptions: true
+  });
+
+  const responseText = res.getContentText();
+  let response;
+
+  try {
+    response = JSON.parse(responseText);
+  } catch (e) {
+    throw new Error("Invalid API response:\n" + responseText);
+  }
+
+  if (!response.success) {
+    throw new Error("API error: " + JSON.stringify(response));
+  }
+
+  let maxUpdatedAt = lastSync;
+  let updated = 0;
+  let inserted = 0;
+
+  response.rows.forEach(row => {
+    const rowArr = headers.map(h => row[h] ?? "");
+    if (statusCol !== -1) rowArr[statusCol] = "Synced";
+
+    if (row.updated_at && row.updated_at > maxUpdatedAt) {
+      maxUpdatedAt = row.updated_at;
+    }
+
+    if (idMap[row.id]) {
+      sheet.getRange(idMap[row.id], 1, 1, rowArr.length).setValues([rowArr]);
+      updated++;
+    } else {
+      sheet.appendRow(rowArr);
+      inserted++;
+    }
+  });
+
+  props.setProperty(`lastSync_${tableName}`, maxUpdatedAt);
+
+  Logger.log(`✅ Pull complete: Updated ${updated}, Inserted ${inserted}`);
+}
+
+/******************************
+ * 🪄 AUTO MARK EDITED ROWS AS PENDING
+ ******************************/
+function onEdit(e) {
+  const sheet = e.range.getSheet();
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const syncCol = headers.findIndex(h => h.trim().toLowerCase() === "syncstatus");
+  if (syncCol === -1) return;
+
+  if (e.range.getRow() > 1 && e.range.getColumn() !== syncCol + 1) {
+    sheet.getRange(e.range.getRow(), syncCol + 1).setValue("Pending");
+  }
+}
+
+/******************************
+ * ♻️ RESET LAST SYNC
+ ******************************/
+function resetLastSync() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getActiveSheet();
+  PropertiesService.getScriptProperties().deleteProperty(`lastSync_${sheet.getName()}`);
+  Logger.log("🔁 lastSync reset");
+}
