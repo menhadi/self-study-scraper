@@ -1,0 +1,191 @@
+/******************************
+ * CONFIGURATION
+ ******************************/
+const API_BASE = "https://exampace.com/api";
+const SHEET_NAME = "questions";
+const BATCH_SIZE = 300;
+
+/******************************
+ * 🔼 PUSH FUNCTION (Sheet → DB)
+ ******************************/
+function pushSheetToDB() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SHEET_NAME);
+  if (!sheet) throw new Error(`Sheet "${SHEET_NAME}" not found`);
+
+  Logger.log(`🔼 Pushing data from Sheet "${SHEET_NAME}" → DB...`);
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const statusCol = headers.findIndex(h => h && h.toString().trim().toLowerCase() === "syncstatus");
+  if (statusCol === -1) {
+    Logger.log("❌ Missing SyncStatus column");
+    return;
+  }
+
+  const lastRow = sheet.getLastRow();
+  if (lastRow < 2) {
+    Logger.log("ℹ️ No data rows");
+    return;
+  }
+
+  const statusVals = sheet
+    .getRange(2, statusCol + 1, lastRow - 1)
+    .getValues()
+    .flat();
+
+  const pendingRows = statusVals
+    .map((v, i) =>
+      v && v.toString().trim().toLowerCase() === "pending" ? i + 2 : null
+    )
+    .filter(Boolean)
+    .slice(0, BATCH_SIZE);
+
+  if (!pendingRows.length) {
+    Logger.log("✅ 0 rows pushed successfully.");
+    return;
+  }
+
+  const payloadRows = [];
+
+  pendingRows.forEach(rowNum => {
+    const row = sheet.getRange(rowNum, 1, 1, headers.length).getValues()[0];
+    const obj = {};
+    headers.forEach((h, i) => {
+      if (i !== statusCol) obj[h] = row[i];
+    });
+    payloadRows.push(obj);
+  });
+
+  const payload = {
+    table: SHEET_NAME,
+    rows: payloadRows
+  };
+
+  const res = UrlFetchApp.fetch(`${API_BASE}/push.php`, {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true
+  });
+
+  const text = res.getContentText();
+  const json = JSON.parse(text);
+
+  if (!json.success) {
+    throw new Error("API error: " + text);
+  }
+
+  // Mark rows as Synced
+  pendingRows.forEach(r =>
+    sheet.getRange(r, statusCol + 1).setValue("Synced")
+  );
+
+  Logger.log(`✅ ${pendingRows.length} rows pushed successfully.`);
+}
+
+/******************************
+ * ⬇️ PULL FUNCTION (DB → Sheet)
+ ******************************/
+function pullDBToSheet() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName("questions");
+  if (!sheet) throw new Error("Sheet not found");
+
+  Logger.log(`⬇️ Pulling (incremental) data from DB → Sheet "questions"...`);
+
+  const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+  const idCol = headers.findIndex(h => h.toLowerCase() === "id");
+  const hasSyncStatus = headers.some(h => h.toLowerCase() === "syncstatus");
+
+  if (idCol === -1) throw new Error("Missing id column");
+
+  const props = PropertiesService.getScriptProperties();
+  const lastSync = props.getProperty("lastSync_questions") || "1970-01-01 00:00:00";
+
+  const data = sheet.getLastRow() > 1
+    ? sheet.getRange(2,1,sheet.getLastRow()-1,headers.length).getValues()
+    : [];
+
+  const ids = [];
+  const idToRow = {};
+  data.forEach((r,i)=>{
+    if (r[idCol]) {
+      const id = String(r[idCol]);
+      ids.push(id);
+      idToRow[id] = i + 2;
+    }
+  });
+
+  const res = UrlFetchApp.fetch("https://exampace.com/api/pull.php", {
+    method: "post",
+    contentType: "application/json",
+    payload: JSON.stringify({
+      table: "questions",
+      lastSync: lastSync,
+      ids: ids
+    }),
+    muteHttpExceptions: true
+  });
+
+  const text = res.getContentText();
+  const json = JSON.parse(text);
+  if (!json.success) throw new Error(text);
+
+  let maxUpdatedAt = lastSync;
+
+  /* ---- INSERT & UPDATE ---- */
+  json.rows.forEach(r => {
+    const row = headers.map(h =>
+      h.toLowerCase() === "syncstatus" ? "Synced" : (r[h] ?? "")
+    );
+
+    if (idToRow[r.id]) {
+      sheet.getRange(idToRow[r.id],1,1,row.length).setValues([row]);
+    } else {
+      sheet.appendRow(row);
+    }
+
+    if (r.updated_at && r.updated_at > maxUpdatedAt) {
+      maxUpdatedAt = r.updated_at;
+    }
+  });
+
+  /* ---- DELETE ---- */
+  json.deleted
+    .map(String)
+    .filter(id => idToRow[id])
+    .sort((a,b)=>idToRow[b]-idToRow[a])
+    .forEach(id => sheet.deleteRow(idToRow[id]));
+
+  props.setProperty("lastSync_questions", maxUpdatedAt);
+
+  Logger.log(`✅ Pull complete: Updated/Inserted ${json.rows.length}, Deleted ${json.deleted.length}`);
+}
+/******************************
+ * 🪄 AUTO MARK EDITED ROWS AS PENDING
+ ******************************/
+function onEdit(e) {
+  const sheet = e.range.getSheet();
+  if (sheet.getName() !== SHEET_NAME) return;
+
+  const headers = sheet.getRange(1, 1, 1, sheet.getLastColumn()).getValues()[0];
+  const syncCol = headers.findIndex(h => h.toLowerCase() === "syncstatus");
+  if (syncCol === -1) return;
+
+  if (e.range.getRow() > 1 && e.range.getColumn() !== syncCol + 1) {
+    const cell = sheet.getRange(e.range.getRow(), syncCol + 1);
+    if (cell.getValue().toString().toLowerCase() !== "pending") {
+      cell.setValue("Pending");
+    }
+  }
+}
+
+/******************************
+ * ♻️ MANUAL HELPERS
+ ******************************/
+function markAllPending() {
+  const sheet = SpreadsheetApp.getActiveSpreadsheet().getSheetByName(SHEET_NAME);
+  const headers = sheet.getRange(1,1,1,sheet.getLastColumn()).getValues()[0];
+  const col = headers.findIndex(h => h.toLowerCase() === "syncstatus");
+  sheet.getRange(2, col+1, sheet.getLastRow()-1).setValue("Pending");
+}
