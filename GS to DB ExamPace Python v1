@@ -1,93 +1,157 @@
 import requests
 import gspread
-from google.oauth2.service_account import Credentials
 from datetime import datetime
+from google.oauth2.service_account import Credentials
 
 # ================= CONFIG =================
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+
+TAB_TABLE_MAP = {
+    "GATE PYQ": "questions"
+}
+
 API_BASE_URL = "https://exampace.com/api"
 API_KEY = "EXAMPACE_SYNC_KEY_2025"
 
-SPREADSHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
-SHEET_NAME = "questions"
-
 SERVICE_ACCOUNT_FILE = "service-account.json"
-BATCH_SIZE = 500
+TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 # =========================================
 
-SCOPES = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
 
+# ================= HELPERS =================
+def now():
+    return datetime.now().strftime(TIMESTAMP_FORMAT)
+
+def norm(v):
+    return "" if v is None else str(v).strip()
+
+def to_db_key(header: str) -> str:
+    """
+    Converts sheet header to DB column name
+    Example:
+      'Question Text' → 'question_text'
+      'Correct-Answer' → 'correct_answer'
+    """
+    return (
+        header.strip()
+              .lower()
+              .replace(" ", "_")
+              .replace("-", "_")
+    )
+
+# ================= AUTH =================
 creds = Credentials.from_service_account_file(
     SERVICE_ACCOUNT_FILE,
-    scopes=SCOPES
+    scopes=[
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
 )
 gc = gspread.authorize(creds)
-sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
 
-def get_schema():
+# ================= SCHEMA =================
+def get_allowed_columns(table):
     r = requests.get(
         f"{API_BASE_URL}/schema.php",
-        params={"table": SHEET_NAME},
-        headers={"X-API-KEY": API_KEY},
-        timeout=30
+        params={"table": table},
+        headers={"X-API-KEY": API_KEY}
     )
+    r.raise_for_status()
     data = r.json()
-    if not data["success"]:
+
+    if not data.get("success"):
         raise Exception(data)
-    return data["columns"]
 
-def push():
-    print("🔼 PUSH START")
+    # normalize for comparison
+    return {c.strip().lower() for c in data["columns"]}
 
-    rows = sheet.get_all_values()
-    headers = rows[0]
-    data = rows[1:]
 
-    schema_cols = get_schema()
-    status_col = headers.index("SyncStatus")
+# =====================================================
+# 🔼 PUSH (INSERT + UPDATE — EXACTLY LIKE APPS SCRIPT)
+# =====================================================
+def push_tab(tab):
+    table = TAB_TABLE_MAP[tab]
+    ws = gc.open_by_key(GOOGLE_SHEET_ID).worksheet(tab)
+
+    allowed_cols = get_allowed_columns(table)
+
+    headers_raw = ws.row_values(1)
+    headers_db = [to_db_key(h) for h in headers_raw]
+
+    if "id" not in headers_db:
+        raise Exception(f"❌ 'id' column missing in tab '{tab}'")
+    if "syncstatus" not in headers_db:
+        raise Exception(f"❌ 'SyncStatus' column missing in tab '{tab}'")
+
+    id_col = headers_db.index("id")
+    status_col = headers_db.index("syncstatus")
+
+    rows = ws.get_all_values()[1:]
 
     payload = []
-    row_nums = []
+    row_map = []  # (sheet_row, has_id)
 
-    for i, row in enumerate(data, start=2):
-        if row[status_col].lower() == "pending":
-            obj = {}
-            for j, h in enumerate(headers):
-                if h in schema_cols:
-                    obj[h] = None if row[j] == "" else row[j]
-            payload.append(obj)
-            row_nums.append(i)
+    for sheet_row, row in enumerate(rows, start=2):
+        if norm(row[status_col]).lower() != "pending":
+            continue
 
-        if len(payload) >= BATCH_SIZE:
-            break
+        obj = {}
+        has_id = False
+
+        # INSERT or UPDATE
+        if row[id_col]:
+            obj["id"] = int(row[id_col])
+            has_id = True
+
+        for h_db, v in zip(headers_db, row):
+            if h_db in ("id", "syncstatus", "created_at"):
+                continue
+            if h_db not in allowed_cols:
+                continue   # 🔥 ignore extra sheet columns
+            if v != "":
+                obj[h_db] = v
+
+        obj["updated_at"] = now()
+
+        # nothing meaningful to send
+        if len(obj) == 1 and "id" in obj:
+            continue
+
+        payload.append(obj)
+        row_map.append((sheet_row, has_id))
 
     if not payload:
-        print("✅ No pending rows")
+        print(f"⚠️ {tab}: nothing to push")
         return
 
     r = requests.post(
         f"{API_BASE_URL}/push.php",
-        headers={
-            "Content-Type": "application/json",
-            "X-API-KEY": API_KEY
-        },
+        headers={"X-API-KEY": API_KEY},
         json={
-            "table": SHEET_NAME,
+            "table": table,
             "rows": payload
-        },
-        timeout=120
+        }
     )
+    r.raise_for_status()
+    resp = r.json()
 
-    res = r.json()
-    if not res["success"]:
-        raise Exception(res)
+    if not resp.get("success"):
+        raise Exception(resp)
 
-    for rnum in row_nums:
-        sheet.update_cell(rnum, status_col + 1, "Synced")
+    # 🔁 WRITE BACK IDS (FOR INSERTS)
+    for i, (sheet_row, has_id) in enumerate(row_map):
+        if not has_id:
+            ws.update_cell(sheet_row, id_col + 1, resp["rows"][i]["id"])
 
-    print(f"✅ PUSHED {len(row_nums)} rows")
+        ws.update_cell(sheet_row, status_col + 1, "Synced")
+
+    print(f"✅ PUSH {tab} → {table}: {len(payload)} rows")
+
+
+# ================= RUN =================
+def main():
+    for tab in TAB_TABLE_MAP:
+        push_tab(tab)
 
 if __name__ == "__main__":
-    push()
+    main()
