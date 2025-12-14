@@ -4,14 +4,11 @@
 const GOOGLE_SHEET_ID = "1Ur-uRw_LwfA7UchfwfjwIO6ZQsGtD1fJHQLsYoSxbAU";
 
 /**
- * TAB NAME  →  DB TABLE NAME
+ * TAB NAME → DB TABLE
  */
 const TAB_TABLE_MAP = {
   "groups1": "groups",
   "groups2": "groups",
- 
-
-  "exams": "exams",
 
 };
 
@@ -57,24 +54,20 @@ function getAllTabs_() {
   return Object.keys(TAB_TABLE_MAP);
 }
 
-function getTableForTab_(tab) {
-  return TAB_TABLE_MAP[tab];
-}
-
 /*********************************
- * 🔼 PUSH (UPDATE ONLY)
+ * 🔼 PUSH (INSERT + UPDATE)
  *********************************/
 function pushOneTab_(tab) {
-  const table = getTableForTab_(tab);
+  const table = TAB_TABLE_MAP[tab];
   const sheet = getSheet_(tab);
 
   const headers = sheet.getRange(1,1,1,sheet.getLastColumn())
-    .getValues()[0].map(norm_);
+    .getValues()[0]
+    .map(norm_);
 
   const idCol = headers.findIndex(h => h.toLowerCase() === "id");
   const statusCol = headers.findIndex(h => h.toLowerCase() === "syncstatus");
 
-  if (idCol === -1) throw new Error(`❌ ${tab}: id missing`);
   if (statusCol === -1) return;
 
   const allowed = getAllowedColumns_(table);
@@ -85,52 +78,50 @@ function pushOneTab_(tab) {
 
   const payload = [];
   const rowNums = [];
+  const hasId = [];
 
   rows.forEach((row,i)=>{
     if (norm_(row[statusCol]).toLowerCase() !== "pending") return;
 
-    const idVal = row[idCol];
-    if (!idVal) return; // 🚫 update only
-
-    const obj = { id: Number(idVal) };
+    const obj = {};
+    if (row[idCol]) obj.id = Number(row[idCol]);
 
     headers.forEach((h,idx)=>{
       if (!allowed.includes(h)) return;
       if (["id","syncstatus","created_at"].includes(h.toLowerCase())) return;
-
-      let v = row[idx];
-      if (v instanceof Date) {
-        v = Utilities.formatDate(v, Session.getScriptTimeZone(), TIMESTAMP_FORMAT);
-      }
-      obj[h] = v === "" ? null : v;
+      if (row[idx] !== "") obj[h] = row[idx];
     });
 
     obj.updated_at = now_();
 
     payload.push(obj);
     rowNums.push(i+2);
+    hasId.push(!!row[idCol]);
   });
 
   if (!payload.length) return;
 
   const res = UrlFetchApp.fetch(`${API_BASE_URL}/push.php`,{
-    method:"post",
-    contentType:"application/json",
-    headers:{ "X-API-KEY":API_KEY },
-    payload:JSON.stringify({
+    method: "post",
+    contentType: "application/json",
+    headers: { "X-API-KEY": API_KEY },
+    payload: JSON.stringify({
       table,
-      rows: payload.slice(0,BATCH_SIZE)
+      rows: payload.slice(0, BATCH_SIZE)
     })
   });
 
   const json = JSON.parse(res.getContentText());
   if (!json.success) throw new Error(res.getContentText());
 
-  rowNums.forEach(r =>
-    sheet.getRange(r,statusCol+1).setValue("Synced")
-  );
+  payload.forEach((_,i)=>{
+    if (!hasId[i] && json.rows?.[i]?.id) {
+      sheet.getRange(rowNums[i], idCol+1).setValue(json.rows[i].id);
+    }
+    sheet.getRange(rowNums[i], statusCol+1).setValue("Synced");
+  });
 
-  Logger.log(`✅ PUSH ${tab} → ${table}: ${rowNums.length}`);
+  Logger.log(`✅ PUSH ${tab} → ${table}: ${payload.length}`);
 }
 
 function pushAllTabs() {
@@ -141,22 +132,21 @@ function pushAllTabs() {
  * ⬇️ PULL (FULL + INCREMENTAL)
  *********************************/
 function pullOneTab_(tab) {
-  const table = getTableForTab_(tab);
+  const table = TAB_TABLE_MAP[tab];
   const sheet = getSheet_(tab);
 
   const headers = sheet.getRange(1,1,1,sheet.getLastColumn())
-    .getValues()[0].map(norm_);
+    .getValues()[0]
+    .map(norm_);
 
   const idCol = headers.findIndex(h => h.toLowerCase() === "id");
   const statusCol = headers.findIndex(h => h.toLowerCase() === "syncstatus");
-
-  if (idCol === -1) throw new Error(`❌ ${tab}: id missing`);
 
   const props = PropertiesService.getScriptProperties();
   const key = `lastSync_${GOOGLE_SHEET_ID}_${tab}`;
   const lastSync = props.getProperty(key) || "1970-01-01 00:00:00";
 
-  const rows = sheet.getLastRow()>1
+  const rows = sheet.getLastRow() > 1
     ? sheet.getRange(2,1,sheet.getLastRow()-1,headers.length).getValues()
     : [];
 
@@ -191,6 +181,7 @@ function pullOneTab_(tab) {
     });
 
     if (statusCol !== -1) arr[statusCol] = "Synced";
+
     if (row.updated_at && row.updated_at > maxUpdatedAt) {
       maxUpdatedAt = row.updated_at;
     }
@@ -215,6 +206,7 @@ function pullAllTabs() {
  *********************************/
 function onEdit(e) {
   if (!e || !e.range) return;
+
   const sheet = e.range.getSheet();
   const tab = sheet.getName();
   if (!TAB_TABLE_MAP[tab]) return;
@@ -225,13 +217,13 @@ function onEdit(e) {
   const statusCol = headers.findIndex(h => h.toLowerCase() === "syncstatus");
   if (statusCol === -1) return;
 
-  if (e.range.getRow()>1 && e.range.getColumn() !== statusCol+1) {
-    sheet.getRange(e.range.getRow(),statusCol+1).setValue("Pending");
+  if (e.range.getRow() > 1 && e.range.getColumn() !== statusCol+1) {
+    sheet.getRange(e.range.getRow(), statusCol+1).setValue("Pending");
   }
 }
 
 /*********************************
- * ♻️ RESET ALL
+ * ♻️ RESET (FULL RESYNC)
  *********************************/
 function resetAllLastSync() {
   const props = PropertiesService.getScriptProperties();
