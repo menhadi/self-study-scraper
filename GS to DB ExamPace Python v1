@@ -1,0 +1,93 @@
+import requests
+import gspread
+from google.oauth2.service_account import Credentials
+from datetime import datetime
+
+# ================= CONFIG =================
+API_BASE_URL = "https://exampace.com/api"
+API_KEY = "EXAMPACE_SYNC_KEY_2025"
+
+SPREADSHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+SHEET_NAME = "questions"
+
+SERVICE_ACCOUNT_FILE = "service-account.json"
+BATCH_SIZE = 500
+# =========================================
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+creds = Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE,
+    scopes=SCOPES
+)
+gc = gspread.authorize(creds)
+sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+
+def get_schema():
+    r = requests.get(
+        f"{API_BASE_URL}/schema.php",
+        params={"table": SHEET_NAME},
+        headers={"X-API-KEY": API_KEY},
+        timeout=30
+    )
+    data = r.json()
+    if not data["success"]:
+        raise Exception(data)
+    return data["columns"]
+
+def push():
+    print("🔼 PUSH START")
+
+    rows = sheet.get_all_values()
+    headers = rows[0]
+    data = rows[1:]
+
+    schema_cols = get_schema()
+    status_col = headers.index("SyncStatus")
+
+    payload = []
+    row_nums = []
+
+    for i, row in enumerate(data, start=2):
+        if row[status_col].lower() == "pending":
+            obj = {}
+            for j, h in enumerate(headers):
+                if h in schema_cols:
+                    obj[h] = None if row[j] == "" else row[j]
+            payload.append(obj)
+            row_nums.append(i)
+
+        if len(payload) >= BATCH_SIZE:
+            break
+
+    if not payload:
+        print("✅ No pending rows")
+        return
+
+    r = requests.post(
+        f"{API_BASE_URL}/push.php",
+        headers={
+            "Content-Type": "application/json",
+            "X-API-KEY": API_KEY
+        },
+        json={
+            "table": SHEET_NAME,
+            "rows": payload
+        },
+        timeout=120
+    )
+
+    res = r.json()
+    if not res["success"]:
+        raise Exception(res)
+
+    for rnum in row_nums:
+        sheet.update_cell(rnum, status_col + 1, "Synced")
+
+    print(f"✅ PUSHED {len(row_nums)} rows")
+
+if __name__ == "__main__":
+    push()
