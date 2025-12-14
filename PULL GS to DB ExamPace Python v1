@@ -1,0 +1,162 @@
+import json
+import requests
+import gspread
+from google.oauth2.service_account import Credentials
+from pathlib import Path
+
+# ================= CONFIG =================
+GOOGLE_SHEET_ID = "1Ur-uRw_LwfA7UchfwfjwIO6ZQsGtD1fJHQLsYoSxbAU"
+
+TAB_TABLE_MAP = {
+    "exams": "exams"
+}
+
+API_BASE_URL = "https://exampace.com/api"
+API_KEY = "EXAMPACE_SYNC_KEY_2025"
+
+SERVICE_ACCOUNT_FILE = "service-account.json"
+STATE_FILE = "sync_state.json"
+# =========================================
+
+# ================= AUTH =================
+creds = Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE,
+    scopes=[
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+)
+gc = gspread.authorize(creds)
+
+# ================= STATE =================
+def load_state():
+    if Path(STATE_FILE).exists():
+        return json.loads(Path(STATE_FILE).read_text())
+    return {}
+
+def save_state(state):
+    Path(STATE_FILE).write_text(json.dumps(state, indent=2))
+
+# ================= HELPERS =================
+def norm(v):
+    return "" if v is None else str(v).strip()
+
+# =====================================================
+# ⬇️ PULL ONE TAB (BATCH SAFE)
+# =====================================================
+def pull_tab(tab):
+    table = TAB_TABLE_MAP[tab]
+    ws = gc.open_by_key(GOOGLE_SHEET_ID).worksheet(tab)
+
+    headers = ws.row_values(1)
+    headers_norm = [h.strip().lower() for h in headers]
+
+    if "id" not in headers_norm:
+        raise Exception(f"❌ 'id' column missing in tab '{tab}'")
+
+    id_col = headers_norm.index("id")
+    status_col = headers_norm.index("syncstatus") if "syncstatus" in headers_norm else -1
+
+    rows = ws.get_all_values()[1:]
+
+    # ID → row map (PER TAB)
+    id_map = {}
+    for i, r in enumerate(rows):
+        if r[id_col]:
+            id_map[int(r[id_col])] = i + 2
+
+    # Load lastSync (PER TAB)
+    state = load_state()
+    state_key = f"{GOOGLE_SHEET_ID}:{tab}"
+    last_sync = state.get(state_key, "1970-01-01 00:00:00")
+
+    payload = {
+        "table": table,
+        "lastSync": last_sync,
+        "existingIds": []
+        if not rows or last_sync == "1970-01-01 00:00:00"
+        else list(id_map.keys())
+    }
+
+    r = requests.post(
+        f"{API_BASE_URL}/pull.php",
+        headers={"X-API-KEY": API_KEY},
+        json=payload
+    )
+    r.raise_for_status()
+    resp = r.json()
+
+    if not resp.get("success"):
+        raise Exception(resp)
+
+    max_updated = last_sync
+
+    updates = []     # batch updates
+    append_rows = [] # rows to append
+
+    for row in resp["rows"]:
+        values = []
+        for h in headers_norm:
+            if h == "id":
+                values.append(row.get("id", ""))
+            else:
+                values.append(row.get(h, ""))
+
+        if status_col != -1:
+            values[status_col] = "Synced"
+
+        if row.get("updated_at") and row["updated_at"] > max_updated:
+            max_updated = row["updated_at"]
+
+        if row["id"] in id_map:
+            updates.append({
+                "range": f"A{id_map[row['id']]}",
+                "values": [values]
+            })
+        else:
+            append_rows.append(values)
+
+    # 🔥 ONE API CALL FOR UPDATES
+    if updates:
+        ws.batch_update(updates)
+
+    # 🔥 ONE API CALL FOR APPENDS
+    if append_rows:
+        ws.append_rows(append_rows)
+
+    # Save lastSync
+    state[state_key] = max_updated
+    save_state(state)
+
+    print(f"✅ PULL {tab} ← {table}: {len(resp['rows'])} rows")
+
+
+# =====================================================
+# ⬇️ PULL ALL TABS
+# =====================================================
+def pull_all_tabs():
+    for tab in TAB_TABLE_MAP:
+        pull_tab(tab)
+
+# =====================================================
+# ♻️ FULL RESYNC
+# =====================================================
+def full_resync():
+    save_state({})
+    print("🔁 lastSync reset for ALL tabs")
+    pull_all_tabs()
+
+# ================= ENTRY =================
+if __name__ == "__main__":
+    print("Choose operation:")
+    print("1 → Pull")
+    print("2 → Full Resync")
+
+    choice = input("Enter choice: ").strip()
+
+    if choice == "1":
+        pull_all_tabs()
+    elif choice == "2":
+        full_resync()
+    else:
+        print("❌ Invalid choice")
