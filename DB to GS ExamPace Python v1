@@ -1,0 +1,93 @@
+import requests
+import gspread
+from google.oauth2.service_account import Credentials
+from pathlib import Path
+
+# ================= CONFIG =================
+API_BASE_URL = "https://exampace.com/api"
+API_KEY = "EXAMPACE_SYNC_KEY_2025"
+
+SPREADSHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+SHEET_NAME = "questions"
+
+SERVICE_ACCOUNT_FILE = "service-account.json"
+LAST_SYNC_FILE = f"lastsync_{SHEET_NAME}.txt"
+# =========================================
+
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+creds = Credentials.from_service_account_file(
+    SERVICE_ACCOUNT_FILE,
+    scopes=SCOPES
+)
+gc = gspread.authorize(creds)
+sheet = gc.open_by_key(SPREADSHEET_ID).worksheet(SHEET_NAME)
+
+def read_last_sync():
+    if Path(LAST_SYNC_FILE).exists():
+        return Path(LAST_SYNC_FILE).read_text().strip()
+    return "1970-01-01 00:00:00"
+
+def write_last_sync(ts):
+    Path(LAST_SYNC_FILE).write_text(ts)
+
+def pull():
+    print("⬇️ PULL START")
+
+    last_sync = read_last_sync()
+    rows = sheet.get_all_values()
+    headers = rows[0]
+    data = rows[1:]
+
+    id_col = headers.index("id")
+    status_col = headers.index("SyncStatus")
+
+    id_map = {
+        row[id_col]: idx + 2
+        for idx, row in enumerate(data)
+        if row[id_col]
+    }
+
+    r = requests.post(
+        f"{API_BASE_URL}/pull.php",
+        headers={
+            "Content-Type": "application/json",
+            "X-API-KEY": API_KEY
+        },
+        json={
+            "table": SHEET_NAME,
+            "lastSync": last_sync,
+            "existingIds": list(id_map.keys())
+        },
+        timeout=120
+    )
+
+    res = r.json()
+    if not res["success"]:
+        raise Exception(res)
+
+    max_updated = last_sync
+    updated = inserted = 0
+
+    for row in res["rows"]:
+        row_values = [row.get(h, "") for h in headers]
+        row_values[status_col] = "Synced"
+
+        if row["updated_at"] > max_updated:
+            max_updated = row["updated_at"]
+
+        if str(row["id"]) in id_map:
+            sheet.update(f"A{id_map[str(row['id'])]}", [row_values])
+            updated += 1
+        else:
+            sheet.append_row(row_values)
+            inserted += 1
+
+    write_last_sync(max_updated)
+    print(f"✅ PULL DONE (Updated={updated}, Inserted={inserted})")
+
+if __name__ == "__main__":
+    pull()
