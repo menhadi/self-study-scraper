@@ -7,9 +7,17 @@ const GOOGLE_SHEET_ID = "1Ur-uRw_LwfA7UchfwfjwIO6ZQsGtD1fJHQLsYoSxbAU";
  * TAB NAME → DB TABLE
  */
 const TAB_TABLE_MAP = {
-  "groups1": "groups",
-  "groups2": "groups",
-
+  "groups": "groups",
+  "packages": "packages",
+  "package_groups": "package_groups",
+  "exams": "exams",
+  "exam_groups": "exam_groups",
+  "exam_questions": "exam_questions",
+  "exam_packages": "exam_packages",
+  "exam_subject_durations": "exam_subject_durations",
+  "question_groups": "question_groups",
+  "subjects": "subjects",
+  "subject_groups": "subject_groups"
 };
 
 const API_BASE_URL = "https://exampace.com/api";
@@ -47,7 +55,7 @@ function getAllowedColumns_(table) {
   );
   const json = JSON.parse(res.getContentText());
   if (!json.success) throw new Error(res.getContentText());
-  return json.columns.map(c => c.trim());
+  return json.columns.map(c => c.trim().toLowerCase());
 }
 
 function getAllTabs_() {
@@ -55,7 +63,7 @@ function getAllTabs_() {
 }
 
 /*********************************
- * 🔼 PUSH (INSERT + UPDATE)
+ * 🔼 PUSH (INSERT + UPDATE) — BATCH SAFE
  *********************************/
 function pushOneTab_(tab) {
   const table = TAB_TABLE_MAP[tab];
@@ -63,11 +71,12 @@ function pushOneTab_(tab) {
 
   const headers = sheet.getRange(1,1,1,sheet.getLastColumn())
     .getValues()[0]
-    .map(norm_);
+    .map(h => h.toString().trim());
 
-  const idCol = headers.findIndex(h => h.toLowerCase() === "id");
-  const statusCol = headers.findIndex(h => h.toLowerCase() === "syncstatus");
+  const headersLc = headers.map(h => h.toLowerCase());
 
+  const idCol = headersLc.indexOf("id");
+  const statusCol = headersLc.indexOf("syncstatus");
   if (statusCol === -1) return;
 
   const allowed = getAllowedColumns_(table);
@@ -80,48 +89,80 @@ function pushOneTab_(tab) {
   const rowNums = [];
   const hasId = [];
 
-  rows.forEach((row,i)=>{
+  rows.forEach((row, i) => {
     if (norm_(row[statusCol]).toLowerCase() !== "pending") return;
 
     const obj = {};
-    if (row[idCol]) obj.id = Number(row[idCol]);
 
-    headers.forEach((h,idx)=>{
-      if (!allowed.includes(h)) return;
-      if (["id","syncstatus","created_at"].includes(h.toLowerCase())) return;
-      if (row[idx] !== "") obj[h] = row[idx];
+    if (idCol !== -1 && row[idCol]) {
+      obj.id = Number(row[idCol]);
+    }
+
+    headers.forEach((h, idx) => {
+      const hLc = h.toLowerCase();
+      if (!allowed.includes(hLc)) return;
+      if (["id", "syncstatus", "created_at"].includes(hLc)) return;
+
+      const v = row[idx];
+      if (v === "" || v === "NULL") return;
+
+      if (v instanceof Date) {
+        const d = new Date(v);
+        if (d.getSeconds() > 59) d.setSeconds(59);
+        obj[hLc] = Utilities.formatDate(d, Session.getScriptTimeZone(), TIMESTAMP_FORMAT);
+      } else {
+        obj[hLc] = v;
+      }
     });
 
     obj.updated_at = now_();
 
+    // 🔒 Must contain at least one real DB column
+    const realKeys = Object.keys(obj).filter(
+      k => !["id", "updated_at"].includes(k)
+    );
+    if (!realKeys.length) {
+      Logger.log(`⏭️ Skipping row ${i+2}: no real DB columns`);
+      return;
+    }
+
     payload.push(obj);
-    rowNums.push(i+2);
-    hasId.push(!!row[idCol]);
+    rowNums.push(i + 2);
+    hasId.push(!!(idCol !== -1 && row[idCol]));
   });
 
   if (!payload.length) return;
 
-  const res = UrlFetchApp.fetch(`${API_BASE_URL}/push.php`,{
-    method: "post",
-    contentType: "application/json",
-    headers: { "X-API-KEY": API_KEY },
-    payload: JSON.stringify({
-      table,
-      rows: payload.slice(0, BATCH_SIZE)
-    })
-  });
+  // 🔥 PUSH IN BATCHES
+  for (let start = 0; start < payload.length; start += BATCH_SIZE) {
+    const end = Math.min(start + BATCH_SIZE, payload.length);
 
-  const json = JSON.parse(res.getContentText());
-  if (!json.success) throw new Error(res.getContentText());
+    const batchPayload = payload.slice(start, end);
+    const batchRowNums = rowNums.slice(start, end);
+    const batchHasId = hasId.slice(start, end);
 
-  payload.forEach((_,i)=>{
-    if (!hasId[i] && json.rows?.[i]?.id) {
-      sheet.getRange(rowNums[i], idCol+1).setValue(json.rows[i].id);
-    }
-    sheet.getRange(rowNums[i], statusCol+1).setValue("Synced");
-  });
+    const res = UrlFetchApp.fetch(`${API_BASE_URL}/push.php`, {
+      method: "post",
+      contentType: "application/json",
+      headers: { "X-API-KEY": API_KEY },
+      payload: JSON.stringify({
+        table,
+        rows: batchPayload
+      })
+    });
 
-  Logger.log(`✅ PUSH ${tab} → ${table}: ${payload.length}`);
+    const json = JSON.parse(res.getContentText());
+    if (!json.success) throw new Error(res.getContentText());
+
+    batchPayload.forEach((_, i) => {
+      if (!batchHasId[i] && json.rows?.[i]?.id) {
+        sheet.getRange(batchRowNums[i], idCol + 1).setValue(json.rows[i].id);
+      }
+      sheet.getRange(batchRowNums[i], statusCol + 1).setValue("Synced");
+    });
+
+    Logger.log(`✅ PUSH ${tab} → ${table}: rows ${start+1}–${end}`);
+  }
 }
 
 function pushAllTabs() {
@@ -137,10 +178,12 @@ function pullOneTab_(tab) {
 
   const headers = sheet.getRange(1,1,1,sheet.getLastColumn())
     .getValues()[0]
-    .map(norm_);
+    .map(h => h.toString().trim());
 
-  const idCol = headers.findIndex(h => h.toLowerCase() === "id");
-  const statusCol = headers.findIndex(h => h.toLowerCase() === "syncstatus");
+  const headersLc = headers.map(h => h.toLowerCase());
+
+  const idCol = headersLc.indexOf("id");
+  const statusCol = headersLc.indexOf("syncstatus");
 
   const props = PropertiesService.getScriptProperties();
   const key = `lastSync_${GOOGLE_SHEET_ID}_${tab}`;
@@ -151,15 +194,17 @@ function pullOneTab_(tab) {
     : [];
 
   const idMap = {};
-  rows.forEach((r,i)=>{
-    if (r[idCol]) idMap[Number(r[idCol])] = i+2;
+  rows.forEach((r, i) => {
+    if (idCol !== -1 && r[idCol]) {
+      idMap[Number(r[idCol])] = i + 2;
+    }
   });
 
-  const res = UrlFetchApp.fetch(`${API_BASE_URL}/pull.php`,{
-    method:"post",
-    contentType:"application/json",
-    headers:{ "X-API-KEY":API_KEY },
-    payload:JSON.stringify({
+  const res = UrlFetchApp.fetch(`${API_BASE_URL}/pull.php`, {
+    method: "post",
+    contentType: "application/json",
+    headers: { "X-API-KEY": API_KEY },
+    payload: JSON.stringify({
       table,
       lastSync,
       existingIds:
@@ -174,9 +219,9 @@ function pullOneTab_(tab) {
 
   let maxUpdatedAt = lastSync;
 
-  json.rows.forEach(row=>{
-    const arr = headers.map(h=>{
-      if (h.toLowerCase() === "id") return row.id ?? "";
+  json.rows.forEach(row => {
+    const arr = headersLc.map(h => {
+      if (h === "id") return row.id ?? "";
       return row[h] ?? "";
     });
 
@@ -212,13 +257,14 @@ function onEdit(e) {
   if (!TAB_TABLE_MAP[tab]) return;
 
   const headers = sheet.getRange(1,1,1,sheet.getLastColumn())
-    .getValues()[0].map(norm_);
+    .getValues()[0]
+    .map(h => h.toString().trim().toLowerCase());
 
-  const statusCol = headers.findIndex(h => h.toLowerCase() === "syncstatus");
+  const statusCol = headers.indexOf("syncstatus");
   if (statusCol === -1) return;
 
-  if (e.range.getRow() > 1 && e.range.getColumn() !== statusCol+1) {
-    sheet.getRange(e.range.getRow(), statusCol+1).setValue("Pending");
+  if (e.range.getRow() > 1 && e.range.getColumn() !== statusCol + 1) {
+    sheet.getRange(e.range.getRow(), statusCol + 1).setValue("Pending");
   }
 }
 
