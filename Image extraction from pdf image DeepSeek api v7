@@ -1,0 +1,1015 @@
+import cv2
+import numpy as np
+import os
+import csv
+import re
+import requests
+import base64
+import json
+from collections import defaultdict
+import traceback
+import shutil
+from datetime import datetime
+import pandas as pd
+
+# ======================================
+# ✅ CONFIGURATION
+# ======================================
+INPUT_ROOT  = r"D:\Vector Academy\Contents\PYQ\GATE\Image"
+OUTPUT_ROOT = r"D:\Vector Academy\Contents\PYQ\GATE\Image1"
+CSV_PATH    = r"C:\Users\menha\Downloads\input.csv"
+DEBUG_DIR   = r"C:\Users\menha\Downloads\test\debug"
+RESULTS_CSV = r"C:\Users\menha\Downloads\extraction_results.csv"
+UPDATED_CSV = r"C:\Users\menha\Downloads\input_updated.csv"
+
+# DeepSeek Vision API Configuration
+DEEPSEEK_API_KEY = "your-deepseek-api-key-here"
+USE_VISION_API = True
+VISION_API_CONFIDENCE_THRESHOLD = 0.7
+
+# Safety Settings
+SAFETY_MODE = True
+BACKUP_BEFORE_OVERWRITE = True
+
+# Progress saving
+SAVE_EVERY_N_IMAGES = 10  # Save progress after every N images
+
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
+os.makedirs(DEBUG_DIR, exist_ok=True)
+
+if BACKUP_BEFORE_OVERWRITE:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    BACKUP_DIR = os.path.join(OUTPUT_ROOT, f"backup_{timestamp}")
+    os.makedirs(BACKUP_DIR, exist_ok=True)
+    print(f"📂 Backup directory created: {BACKUP_DIR}")
+
+# Performance settings
+VISION_API_BATCH_SIZE = 5
+CACHE_VISION_RESULTS = True
+vision_cache = {}
+
+min_area = 3500
+
+# ======================================
+# ✅ CSV TRACKING FUNCTIONS
+# ======================================
+class ExtractionTracker:
+    """Track extraction results and update CSV incrementally"""
+    
+    def __init__(self, csv_path, results_csv_path, updated_csv_path):
+        self.csv_path = csv_path
+        self.results_csv_path = results_csv_path
+        self.updated_csv_path = updated_csv_path
+        self.results = []
+        self.original_data = []
+        self.fieldnames = []
+        self.image_counter = 0
+        self.last_save_count = 0
+        
+    def load_original_csv(self):
+        """Load the original CSV data"""
+        try:
+            with open(self.csv_path, newline="", encoding="utf-8") as f:
+                reader = csv.DictReader(f)
+                self.fieldnames = reader.fieldnames
+                self.original_data = list(reader)
+                print(f"✅ Loaded {len(self.original_data)} rows from original CSV")
+        except Exception as e:
+            print(f"❌ Error loading CSV: {e}")
+            self.original_data = []
+    
+    def add_result(self, csv_row_num, folder, subfolder, file_name, question_no, 
+                   image_name, extracted_row=None, image_path=None):
+        """Add extraction result and check if we should save"""
+        result = {
+            'csv_row': csv_row_num,
+            'folder': folder,
+            'subfolder': subfolder,
+            'file_name': file_name,
+            'question_no': question_no,
+            'image_name': image_name,
+            'extracted_row': extracted_row,
+            'image_path': image_path,
+            'status': 'SUCCESS' if extracted_row is not None else 'NO_IMAGE',
+            'timestamp': datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        self.results.append(result)
+        self.image_counter += 1
+        
+        # Check if we should save progress
+        if self.image_counter - self.last_save_count >= SAVE_EVERY_N_IMAGES:
+            self.save_progress()
+    
+    def save_progress(self):
+        """Save incremental progress"""
+        try:
+            # Save detailed results incrementally
+            progress_suffix = f"_progress_{self.image_counter}"
+            progress_csv = self.results_csv_path.replace('.csv', f'{progress_suffix}.csv')
+            
+            with open(progress_csv, 'w', newline='', encoding='utf-8') as f:
+                fieldnames = ['csv_row', 'folder', 'subfolder', 'file_name', 
+                             'question_no', 'image_name', 'extracted_row', 
+                             'image_path', 'status', 'timestamp']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(self.results)
+            
+            # Update the main results file
+            with open(self.results_csv_path, 'w', newline='', encoding='utf-8') as f:
+                fieldnames = ['csv_row', 'folder', 'subfolder', 'file_name', 
+                             'question_no', 'image_name', 'extracted_row', 
+                             'image_path', 'status', 'timestamp']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(self.results)
+            
+            # Update the modified CSV with extraction info
+            self._update_original_csv()
+            
+            print(f"   💾 Progress saved: {len(self.results)} images processed")
+            print(f"   📁 Latest progress file: {progress_csv}")
+            self.last_save_count = self.image_counter
+            
+        except Exception as e:
+            print(f"   ⚠️  Error saving progress: {e}")
+    
+    def _update_original_csv(self):
+        """Update the original CSV with extraction info"""
+        try:
+            # Create a mapping for quick lookup
+            result_map = {}
+            for result in self.results:
+                key = (result['folder'], result['subfolder'], result['file_name'], 
+                      result['question_no'], result['image_name'])
+                result_map[key] = result
+            
+            # Update original data
+            updated_rows = []
+            for row in self.original_data:
+                updated_row = dict(row)
+                key = (row.get('folder', ''), row.get('sub_folder', ''), 
+                      row.get('file_name', ''), row.get('question_no', ''), 
+                      row.get('image name', ''))
+                
+                if key in result_map:
+                    result = result_map[key]
+                    updated_row['extracted_from_row'] = str(result['extracted_row']) if result['extracted_row'] else ''
+                    updated_row['extraction_status'] = result['status']
+                    updated_row['image_path'] = result['image_path'] if result['image_path'] else ''
+                    updated_row['extraction_timestamp'] = result['timestamp']
+                else:
+                    updated_row['extracted_from_row'] = ''
+                    updated_row['extraction_status'] = 'PENDING'
+                    updated_row['image_path'] = ''
+                    updated_row['extraction_timestamp'] = ''
+                
+                updated_rows.append(updated_row)
+            
+            # Save updated CSV
+            with open(self.updated_csv_path, 'w', newline='', encoding='utf-8') as f:
+                # Add new fields to fieldnames
+                updated_fieldnames = list(self.original_data[0].keys()) if self.original_data else []
+                for field in ['extracted_from_row', 'extraction_status', 'image_path', 'extraction_timestamp']:
+                    if field not in updated_fieldnames:
+                        updated_fieldnames.append(field)
+                
+                writer = csv.DictWriter(f, fieldnames=updated_fieldnames)
+                writer.writeheader()
+                writer.writerows(updated_rows)
+            
+            # Also save a timestamped version
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamped_csv = self.updated_csv_path.replace('.csv', f'_{timestamp}.csv')
+            shutil.copy2(self.updated_csv_path, timestamped_csv)
+            
+        except Exception as e:
+            print(f"   ⚠️  Error updating original CSV: {e}")
+    
+    def final_save(self):
+        """Final save after all processing"""
+        try:
+            # Final save of results
+            with open(self.results_csv_path, 'w', newline='', encoding='utf-8') as f:
+                fieldnames = ['csv_row', 'folder', 'subfolder', 'file_name', 
+                             'question_no', 'image_name', 'extracted_row', 
+                             'image_path', 'status', 'timestamp']
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(self.results)
+            
+            # Final update of original CSV
+            self._update_original_csv()
+            
+            print(f"\n💾 Final results saved:")
+            print(f"   📊 Detailed results: {self.results_csv_path}")
+            print(f"   📄 Updated CSV: {self.updated_csv_path}")
+            print(f"   📈 Total images processed: {len(self.results)}")
+            
+        except Exception as e:
+            print(f"❌ Error in final save: {e}")
+
+# Initialize tracker
+tracker = ExtractionTracker(CSV_PATH, RESULTS_CSV, UPDATED_CSV)
+tracker.load_original_csv()
+
+# ======================================
+# ✅ VISION API FUNCTIONS
+# ======================================
+def encode_image_to_base64(image):
+    """Encode OpenCV image to base64 string"""
+    _, buffer = cv2.imencode('.jpg', image, [cv2.IMWRITE_JPEG_QUALITY, 90])
+    return base64.b64encode(buffer).decode('utf-8')
+
+def analyze_crops_with_deepseek(crops, descriptions=None):
+    """Use DeepSeek Vision API to analyze multiple image crops"""
+    if not DEEPSEEK_API_KEY or not USE_VISION_API:
+        return ['unknown'] * len(crops)
+    
+    cache_key = tuple(encode_image_to_base64(crop)[:100] for crop in crops)
+    if CACHE_VISION_RESULTS and cache_key in vision_cache:
+        return vision_cache[cache_key]
+    
+    try:
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {DEEPSEEK_API_KEY}"
+        }
+        
+        messages = [{"role": "user", "content": []}]
+        
+        system_msg = {
+            "type": "text",
+            "text": """Analyze each image and classify it as either:
+            1. 'image' - if it contains diagrams, graphs, charts, illustrations, or non-text visuals
+            2. 'text' - if it contains primarily text, equations, or formulas
+            3. 'unknown' - if you're not sure
+            
+            Return ONLY a JSON array with one classification per image in the same order.
+            Example: ["image", "text", "image"]"""
+        }
+        messages[0]["content"].append(system_msg)
+        
+        for i, crop in enumerate(crops):
+            img_base64 = encode_image_to_base64(crop)
+            img_msg = {
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{img_base64}"}
+            }
+            messages[0]["content"].append(img_msg)
+            
+            if descriptions and i < len(descriptions):
+                desc_msg = {
+                    "type": "text",
+                    "text": f"Image {i+1}: {descriptions[i]}"
+                }
+                messages[0]["content"].append(desc_msg)
+        
+        payload = {
+            "model": "deepseek-chat",
+            "messages": messages,
+            "max_tokens": 500
+        }
+        
+        response = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            headers=headers,
+            json=payload,
+            timeout=30
+        )
+        
+        if response.status_code == 200:
+            result = response.json()
+            answer = result['choices'][0]['message']['content'].strip()
+            
+            try:
+                classifications = json.loads(answer)
+                if CACHE_VISION_RESULTS:
+                    vision_cache[cache_key] = classifications
+                return classifications
+            except json.JSONDecodeError:
+                classifications = []
+                lines = answer.lower().split('\n')
+                for line in lines:
+                    if 'image' in line and 'text' not in line:
+                        classifications.append('image')
+                    elif 'text' in line:
+                        classifications.append('text')
+                    else:
+                        classifications.append('unknown')
+                
+                if len(classifications) < len(crops):
+                    classifications.extend(['unknown'] * (len(crops) - len(classifications)))
+                elif len(classifications) > len(crops):
+                    classifications = classifications[:len(crops)]
+                
+                if CACHE_VISION_RESULTS:
+                    vision_cache[cache_key] = classifications
+                return classifications
+        else:
+            print(f"⚠️  DeepSeek API Error: {response.status_code} - {response.text}")
+            return ['unknown'] * len(crops)
+            
+    except Exception as e:
+        print(f"⚠️  DeepSeek API call failed: {e}")
+        return ['unknown'] * len(crops)
+
+def is_text_like_enhanced(crop, threshold=0.20, use_traditional=True):
+    """Enhanced image/text classification using multiple methods"""
+    if crop.size == 0:
+        return True
+    
+    if use_traditional:
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, 60, 160)
+        density = np.sum(edges > 0) / edges.size
+        
+        if density > 0.35:
+            return True
+        elif density < 0.15:
+            return False
+    
+    if USE_VISION_API and DEEPSEEK_API_KEY:
+        classification = analyze_crops_with_deepseek([crop])[0]
+        return classification == 'text'
+    
+    return density > threshold if use_traditional else False
+
+def batch_classify_crops(crops, descriptions=None):
+    """Classify multiple crops in batch using Vision API"""
+    if not USE_VISION_API or not DEEPSEEK_API_KEY or not crops:
+        return [False] * len(crops)
+    
+    all_classifications = []
+    for i in range(0, len(crops), VISION_API_BATCH_SIZE):
+        batch = crops[i:i + VISION_API_BATCH_SIZE]
+        batch_descriptions = descriptions[i:i + VISION_API_BATCH_SIZE] if descriptions else None
+        
+        classifications = analyze_crops_with_deepseek(batch, batch_descriptions)
+        
+        for cls in classifications:
+            all_classifications.append(cls == 'text')
+    
+    return all_classifications
+
+# ======================================
+# ✅ HELPER FUNCTIONS
+# ======================================
+def parse_question_number(question_str):
+    """Parse question number from string"""
+    if not question_str:
+        return 999
+    
+    question_str = str(question_str).strip()
+    
+    try:
+        return int(question_str)
+    except ValueError:
+        pass
+    
+    patterns = [
+        r'Q\.?\s*(\d+)',
+        r'Question\s*(\d+)',
+        r'(\d+)',
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, question_str, re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                continue
+    
+    digits = re.findall(r'\d+', question_str)
+    if digits:
+        try:
+            return int(digits[-1])
+        except ValueError:
+            pass
+    
+    return 999
+
+def check_existing_files(save_dir):
+    """Check if there are existing files in the output directory"""
+    if os.path.exists(save_dir):
+        existing_files = os.listdir(save_dir)
+        image_files = [f for f in existing_files if f.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp'))]
+        return len(image_files)
+    return 0
+
+def backup_existing_files(source_dir, backup_dir):
+    """Backup existing files before processing"""
+    if not os.path.exists(source_dir):
+        return
+    
+    rel_path = os.path.relpath(source_dir, OUTPUT_ROOT)
+    target_backup_dir = os.path.join(backup_dir, rel_path)
+    os.makedirs(target_backup_dir, exist_ok=True)
+    
+    for filename in os.listdir(source_dir):
+        if filename.lower().endswith(('.png', '.jpg', '.jpeg', '.bmp')):
+            src = os.path.join(source_dir, filename)
+            dst = os.path.join(target_backup_dir, filename)
+            shutil.copy2(src, dst)
+    
+    print(f"   📦 Backed up {len(os.listdir(source_dir))} files from {source_dir}")
+
+def safe_save_image(image, filepath):
+    """Safely save an image with overwrite protection"""
+    if SAFETY_MODE and os.path.exists(filepath):
+        base, ext = os.path.splitext(filepath)
+        counter = 1
+        while os.path.exists(filepath):
+            filepath = f"{base}_{counter}{ext}"
+            counter += 1
+        print(f"   ⚠️  File exists, saving as: {os.path.basename(filepath)}")
+    
+    cv2.imwrite(filepath, image)
+    return filepath
+
+def crop_header_footer(img):
+    h, w, _ = img.shape
+    top = int(0.06 * h)
+    bottom = int(0.95 * h)
+    return img[top:bottom, :]
+
+def iou(boxA, boxB):
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[0] + boxA[2], boxB[0] + boxB[2])
+    yB = min(boxA[1] + boxA[3], boxB[1] + boxB[3])
+    inter = max(0, xB - xA) * max(0, yB - yA)
+    union = boxA[2]*boxA[3] + boxB[2]*boxB[3] - inter
+    return inter / union if union != 0 else 0
+
+def non_max_suppression(boxes, thresh=0.45):
+    if not boxes:
+        return []
+    boxes = sorted(boxes, key=lambda b: b[2]*b[3], reverse=True)
+    final = []
+    while boxes:
+        best = boxes.pop(0)
+        final.append(best)
+        boxes = [b for b in boxes if iou(best, b) < thresh]
+    return final
+
+def pad_box(x, y, w, h, img_w, img_h, pad_ratio=0.10):
+    px = int(w * pad_ratio)
+    py = int(h * pad_ratio)
+    x0 = max(0, x - px)
+    y0 = max(0, y - py)
+    x1 = min(img_w, x + w + px)
+    y1 = min(img_h, y + h + py)
+    return x0, y0, x1 - x0, y1 - y0
+
+def visualize_page_detection(page_cropped, boxes, questions, file_name, save_dir):
+    """Visualize detected boxes and question positions for debugging"""
+    debug_img = page_cropped.copy()
+    
+    for i, (x, y, w, h) in enumerate(boxes):
+        cv2.rectangle(debug_img, (x, y), (x+w, y+h), (0, 255, 0), 2)
+        cv2.putText(debug_img, f"Box {i}", (x, y-10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+    
+    H, W = page_cropped.shape[:2]
+    for i, (question_num, _, _) in enumerate(questions):
+        estimated_y = int((H / len(questions)) * (i + 0.5))
+        cv2.line(debug_img, (0, estimated_y), (W, estimated_y), (255, 0, 0), 2)
+        cv2.putText(debug_img, f"Q{question_num}", (10, estimated_y-10), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+    
+    clean_name = os.path.splitext(file_name)[0].replace(' ', '_').replace('/', '_')
+    debug_path = os.path.join(save_dir, f"debug_{clean_name}.png")
+    safe_save_image(debug_img, debug_path)
+    print(f"   📊 Debug visualization saved: {debug_path}")
+    return debug_path
+
+def extract_images_with_vision_assistance(page_cropped, boxes, questions, save_dir, file_name, csv_rows, tracker):
+    """
+    Extract images using Vision API and track CSV row numbers
+    """
+    H, W = page_cropped.shape[:2]
+    questions_sorted = sorted(questions, key=lambda x: x[0])
+    boxes_sorted = sorted(boxes, key=lambda b: b[1])
+    
+    print(f"   📦 Processing {len(boxes_sorted)} boxes for {len(questions_sorted)} questions")
+    
+    # Map CSV rows to questions
+    question_to_csv_row = {}
+    question_to_csv_data = {}
+    for i, (question_num, question_no_str, image_name) in enumerate(questions_sorted):
+        for csv_row in csv_rows:
+            if (csv_row['question_no'] == question_no_str and 
+                csv_row['image_name'] == image_name):
+                question_to_csv_row[i] = csv_row['row_num']
+                question_to_csv_data[i] = csv_row
+                break
+    
+    crops = []
+    box_info = []
+    for i, (x, y, w, h) in enumerate(boxes_sorted):
+        crop = page_cropped[y:y + h, x:x + w]
+        crops.append(crop)
+        box_info.append({
+            'index': i,
+            'box': (x, y, w, h),
+            'area': w * h,
+            'center_y': y + h/2
+        })
+    
+    print(f"   🤖 Using Vision API to classify {len(crops)} crops...")
+    is_text_list = batch_classify_crops(crops)
+    
+    image_boxes = []
+    text_boxes = []
+    
+    for i, (is_text, info) in enumerate(zip(is_text_list, box_info)):
+        if not is_text:
+            image_boxes.append(info)
+            print(f"   📷 Box {i}: Classified as IMAGE (size: {info['area']}px)")
+        else:
+            text_boxes.append(info)
+            print(f"   📝 Box {i}: Classified as TEXT (size: {info['area']}px)")
+    
+    print(f"   📊 Results: {len(image_boxes)} image boxes, {len(text_boxes)} text boxes")
+    
+    extraction_results = {}
+    
+    # If we have exactly the right number of image boxes
+    if len(image_boxes) == len(questions_sorted):
+        print(f"   ✅ Perfect match! {len(image_boxes)} images for {len(questions_sorted)} questions")
+        image_boxes_sorted = sorted(image_boxes, key=lambda b: b['center_y'])
+        
+        for i, ((_, question_no_str, image_name), box_info) in enumerate(zip(questions_sorted, image_boxes_sorted)):
+            x, y, w, h = box_info['box']
+            crop = page_cropped[y:y + h, x:x + w]
+            
+            if not os.path.splitext(image_name)[1]:
+                image_name += ".png"
+            
+            out_path = os.path.join(save_dir, image_name)
+            out_path = safe_save_image(crop, out_path)
+            
+            csv_row_num = question_to_csv_row.get(i)
+            csv_data = question_to_csv_data.get(i)
+            
+            if csv_data:
+                tracker.add_result(
+                    csv_row_num=csv_data['row_num'],
+                    folder=csv_data['folder'],
+                    subfolder=csv_data['sub_folder'],
+                    file_name=csv_data['file_name'],
+                    question_no=csv_data['question_no'],
+                    image_name=csv_data['image_name'],
+                    extracted_row=csv_row_num,
+                    image_path=out_path
+                )
+            
+            extraction_results[image_name] = ('SUCCESS', csv_row_num, out_path)
+            print(f"   ✅ Q{question_no_str} → {image_name} (box {box_info['index']}, CSV row: {csv_row_num})")
+    
+    # If we have more image boxes than questions
+    elif len(image_boxes) > len(questions_sorted):
+        print(f"   🔍 More image boxes ({len(image_boxes)}) than questions ({len(questions_sorted)})")
+        
+        image_boxes_sorted = sorted(image_boxes, key=lambda b: (-b['area'], b['center_y']))
+        selected_boxes = image_boxes_sorted[:len(questions_sorted)]
+        selected_boxes = sorted(selected_boxes, key=lambda b: b['center_y'])
+        
+        for i, ((_, question_no_str, image_name), box_info) in enumerate(zip(questions_sorted, selected_boxes)):
+            x, y, w, h = box_info['box']
+            crop = page_cropped[y:y + h, x:x + w]
+            
+            if not os.path.splitext(image_name)[1]:
+                image_name += ".png"
+            
+            out_path = os.path.join(save_dir, image_name)
+            out_path = safe_save_image(crop, out_path)
+            
+            csv_row_num = question_to_csv_row.get(i)
+            csv_data = question_to_csv_data.get(i)
+            
+            if csv_data:
+                tracker.add_result(
+                    csv_row_num=csv_data['row_num'],
+                    folder=csv_data['folder'],
+                    subfolder=csv_data['sub_folder'],
+                    file_name=csv_data['file_name'],
+                    question_no=csv_data['question_no'],
+                    image_name=csv_data['image_name'],
+                    extracted_row=csv_row_num,
+                    image_path=out_path
+                )
+            
+            extraction_results[image_name] = ('SUCCESS', csv_row_num, out_path)
+            print(f"   ✅ Q{question_no_str} → {image_name} (box {box_info['index']}, CSV row: {csv_row_num})")
+    
+    # If we have fewer image boxes than questions
+    else:
+        print(f"   ⚠️  Fewer image boxes ({len(image_boxes)}) than questions ({len(questions_sorted)})")
+        
+        image_boxes_sorted = sorted(image_boxes, key=lambda b: b['center_y'])
+        
+        # Process images we have
+        for i, box_info in enumerate(image_boxes_sorted):
+            if i < len(questions_sorted):
+                _, question_no_str, image_name = questions_sorted[i]
+                x, y, w, h = box_info['box']
+                crop = page_cropped[y:y + h, x:x + w]
+                
+                if not os.path.splitext(image_name)[1]:
+                    image_name += ".png"
+                
+                out_path = os.path.join(save_dir, image_name)
+                out_path = safe_save_image(crop, out_path)
+                
+                csv_row_num = question_to_csv_row.get(i)
+                csv_data = question_to_csv_data.get(i)
+                
+                if csv_data:
+                    tracker.add_result(
+                        csv_row_num=csv_data['row_num'],
+                        folder=csv_data['folder'],
+                        subfolder=csv_data['sub_folder'],
+                        file_name=csv_data['file_name'],
+                        question_no=csv_data['question_no'],
+                        image_name=csv_data['image_name'],
+                        extracted_row=csv_row_num,
+                        image_path=out_path
+                    )
+                
+                extraction_results[image_name] = ('SUCCESS', csv_row_num, out_path)
+                print(f"   ✅ Q{question_no_str} → {image_name} (box {box_info['index']}, CSV row: {csv_row_num})")
+        
+        # Mark missing images
+        for i in range(len(image_boxes), len(questions_sorted)):
+            _, question_no_str, image_name = questions_sorted[i]
+            csv_row_num = question_to_csv_row.get(i)
+            csv_data = question_to_csv_data.get(i)
+            
+            if csv_data:
+                tracker.add_result(
+                    csv_row_num=csv_data['row_num'],
+                    folder=csv_data['folder'],
+                    subfolder=csv_data['sub_folder'],
+                    file_name=csv_data['file_name'],
+                    question_no=csv_data['question_no'],
+                    image_name=csv_data['image_name'],
+                    extracted_row=None,
+                    image_path=None
+                )
+            
+            extraction_results[image_name] = ('NO_IMAGE', csv_row_num, None)
+            print(f"   ⚠️  Q{question_no_str} → {image_name}: No image extracted (CSV row: {csv_row_num})")
+    
+    return extraction_results
+
+# ======================================
+# ✅ LOAD CSV - GROUP BY FILE NAME WITH ROW NUMBERS
+# ======================================
+file_groups = defaultdict(list)
+
+try:
+    with open(CSV_PATH, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        print("\n✅ CSV HEADERS FOUND:", reader.fieldnames)
+        
+        required_fields = ["folder", "file_name", "question_no", "image name"]
+        if not all(field in reader.fieldnames for field in required_fields):
+            print(f"❌ Missing required fields in CSV")
+            print(f"   Required: {required_fields}")
+            print(f"   Found: {reader.fieldnames}")
+            exit(1)
+
+        for row_num, row in enumerate(reader, 1):
+            try:
+                folder = row["folder"].strip()
+                if not folder:
+                    print(f"⚠️  Row {row_num}: Missing folder")
+                    continue
+                
+                file_name = row["file_name"].strip()
+                if not file_name:
+                    print(f"⚠️  Row {row_num}: Missing file_name")
+                    continue
+                
+                sub_folder = row.get("sub_folder", "").strip()
+                key = (folder, sub_folder, file_name)
+                
+                question_no = row["question_no"].strip()
+                image_name = row["image name"].strip()
+                
+                if not question_no or not image_name:
+                    print(f"⚠️  Row {row_num}: Missing question_no or image name")
+                    continue
+                    
+                question_num = parse_question_number(question_no)
+                if question_num == 999 and question_no:
+                    print(f"⚠️  Row {row_num}: Could not parse question number '{question_no}', using 999")
+                
+                csv_row_data = {
+                    'row_num': row_num,
+                    'folder': folder,
+                    'sub_folder': sub_folder,
+                    'file_name': file_name,
+                    'question_no': question_no,
+                    'image_name': image_name,
+                    'full_row': row
+                }
+                
+                file_groups[key].append((question_num, question_no, image_name, csv_row_data))
+                
+            except Exception as e:
+                print(f"❌ Error processing row {row_num}: {e}")
+                continue
+
+except Exception as e:
+    print(f"❌ Error reading CSV: {e}")
+    traceback.print_exc()
+    exit(1)
+
+print(f"\n✅ Loaded {sum(len(v) for v in file_groups.values())} images from CSV")
+print(f"✅ Found {len(file_groups)} unique files")
+
+if USE_VISION_API:
+    if DEEPSEEK_API_KEY:
+        print(f"🤖 Vision API: ENABLED (DeepSeek)")
+    else:
+        print(f"⚠️  Vision API: DISABLED (No API key provided)")
+        USE_VISION_API = False
+else:
+    print(f"🤖 Vision API: DISABLED (Traditional method only)")
+
+print(f"💾 Progress saving: Every {SAVE_EVERY_N_IMAGES} images")
+print(f"📁 Output location: {os.path.dirname(RESULTS_CSV)}")
+
+# Sort files for consistent processing
+sorted_files = sorted(file_groups.items(), key=lambda x: (
+    x[0][0],  # folder
+    x[0][1],  # subfolder
+    x[0][2]   # file_name
+))
+
+# ======================================
+# ✅ FILE FINDER
+# ======================================
+def find_file_path(folder, subfolder, file_name):
+    """Find file with the given name in the folder/subfolder structure"""
+    if subfolder:
+        folder_path = os.path.join(INPUT_ROOT, folder, subfolder)
+    else:
+        folder_path = os.path.join(INPUT_ROOT, folder)
+    
+    if not os.path.isdir(folder_path):
+        print(f"❌ Folder not found: {folder_path}")
+        return None
+    
+    file_path = os.path.join(folder_path, file_name)
+    if os.path.exists(file_path):
+        return file_path
+    
+    base_name = os.path.splitext(file_name)[0]
+    files = os.listdir(folder_path)
+    
+    extensions = ['.png', '.jpg', '.jpeg', '.PNG', '.JPG', '.JPEG', '.bmp', '.BMP']
+    
+    for ext in extensions:
+        possible_file = base_name + ext
+        if possible_file in files:
+            return os.path.join(folder_path, possible_file)
+    
+    file_lower = file_name.lower()
+    for f in files:
+        if f.lower() == file_lower:
+            return os.path.join(folder_path, f)
+    
+    for f in files:
+        if os.path.splitext(f)[0] == base_name:
+            return os.path.join(folder_path, f)
+    
+    print(f"   🔍 File '{file_name}' not found in {folder_path}")
+    return None
+
+# ======================================
+# ✅ MAIN EXTRACTION WITH INCREMENTAL CSV UPDATES
+# ======================================
+successful_files = 0
+failed_files = []
+start_time = datetime.now()
+
+print(f"\n⏰ Starting extraction at: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"{'='*60}")
+
+for file_index, ((folder, subfolder, file_name), questions_data) in enumerate(sorted_files, 1):
+    print(f"\n📄 Processing file {file_index}/{len(sorted_files)}:")
+    print(f"   Folder: {folder}, Sub: {subfolder or '(none)'}, File: {file_name}")
+    
+    # Extract question data and CSV row data
+    questions = [(q[0], q[1], q[2]) for q in questions_data]
+    csv_rows = [q[3] for q in questions_data]
+    
+    print(f"   Questions: {[q[1] for q in sorted(questions, key=lambda x: x[0])]}")
+    
+    try:
+        # Find the file
+        file_path = find_file_path(folder, subfolder, file_name)
+        
+        if not file_path:
+            print(f"❌ File not found")
+            for csv_row in csv_rows:
+                tracker.add_result(
+                    csv_row_num=csv_row['row_num'],
+                    folder=folder,
+                    subfolder=subfolder,
+                    file_name=file_name,
+                    question_no=csv_row['question_no'],
+                    image_name=csv_row['image_name'],
+                    extracted_row=None,
+                    image_path=None
+                )
+            failed_files.append((folder, subfolder, file_name, "File not found"))
+            continue
+        
+        # Load the image
+        img = cv2.imread(file_path)
+        if img is None:
+            print(f"❌ Failed to load image: {file_path}")
+            for csv_row in csv_rows:
+                tracker.add_result(
+                    csv_row_num=csv_row['row_num'],
+                    folder=folder,
+                    subfolder=subfolder,
+                    file_name=file_name,
+                    question_no=csv_row['question_no'],
+                    image_name=csv_row['image_name'],
+                    extracted_row=None,
+                    image_path=None
+                )
+            failed_files.append((folder, subfolder, file_name, "Failed to load image"))
+            continue
+        
+        print(f"   ✅ Loaded file: {os.path.basename(file_path)} ({img.shape[1]}x{img.shape[0]})")
+        
+        # Create save directory
+        if subfolder:
+            save_dir = os.path.join(OUTPUT_ROOT, folder, subfolder)
+        else:
+            save_dir = os.path.join(OUTPUT_ROOT, folder)
+        
+        # Check for existing files
+        existing_count = check_existing_files(save_dir)
+        if existing_count > 0:
+            print(f"   ⚠️  Found {existing_count} existing images in {save_dir}")
+            
+            if BACKUP_BEFORE_OVERWRITE and os.path.exists(save_dir):
+                backup_existing_files(save_dir, BACKUP_DIR)
+                print(f"   ✅ Existing files backed up")
+        
+        os.makedirs(save_dir, exist_ok=True)
+        
+        # Crop header and footer
+        page_cropped = crop_header_footer(img)
+        H, W = page_cropped.shape[:2]
+        print(f"   📐 Cropped size: {W}x{H}")
+        
+        # Image preprocessing
+        gray = cv2.cvtColor(page_cropped, cv2.COLOR_BGR2GRAY)
+        
+        # Method 1: Adaptive threshold
+        th1 = cv2.adaptiveThreshold(
+            gray, 255,
+            cv2.ADAPTIVE_THRESH_MEAN_C,
+            cv2.THRESH_BINARY_INV,
+            17, 3
+        )
+        
+        # Method 2: Canny edges
+        edges = cv2.Canny(gray, 60, 160)
+        
+        # Method 3: Simple threshold
+        _, th2 = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        
+        # Combine methods
+        combined = cv2.bitwise_or(th1, edges)
+        combined = cv2.bitwise_or(combined, th2)
+        
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (4, 4))
+        dilated = cv2.dilate(combined, kernel, iterations=2)
+        
+        # Find contours
+        contours1, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours2, _ = cv2.findContours(dilated, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        
+        contours = contours1 if len(contours1) > len(contours2) else contours2
+        
+        print(f"   🔍 Found {len(contours)} contours")
+        
+        raw_boxes = []
+        for cnt in contours:
+            x, y, w, h = cv2.boundingRect(cnt)
+            area = w * h
+            aspect = w / h if h != 0 else 0
+            
+            if "2" in file_name or "page2" in file_name.lower():
+                if area > 2000 and 60 < w < 2500 and 60 < h < 1800 and 0.1 < aspect < 10.0:
+                    x, y, w, h = pad_box(x, y, w, h, W, H)
+                    raw_boxes.append((x, y, w, h))
+            else:
+                if area > min_area and 80 < w < 2200 and 80 < h < 1600 and 0.15 < aspect < 7.0:
+                    x, y, w, h = pad_box(x, y, w, h, W, H)
+                    raw_boxes.append((x, y, w, h))
+        
+        boxes = non_max_suppression(raw_boxes)
+        print(f"   📦 After NMS: {len(boxes)} boxes")
+        
+        # Visualize for debugging
+        debug_path = visualize_page_detection(page_cropped, boxes, questions, file_name, DEBUG_DIR)
+        
+        # Extract images with CSV row tracking
+        extraction_results = extract_images_with_vision_assistance(
+            page_cropped, boxes, questions, save_dir, file_name, csv_rows, tracker
+        )
+        
+        successful_files += 1
+        print(f"   ✅ File '{file_name}' processed successfully")
+            
+    except Exception as e:
+        print(f"❌ Error processing file '{file_name}': {e}")
+        traceback.print_exc()
+        for csv_row in csv_rows:
+            tracker.add_result(
+                csv_row_num=csv_row['row_num'],
+                folder=folder,
+                subfolder=subfolder,
+                file_name=file_name,
+                question_no=csv_row['question_no'],
+                image_name=csv_row['image_name'],
+                extracted_row=None,
+                image_path=None
+            )
+        failed_files.append((folder, subfolder, file_name, f"Error: {str(e)}"))
+
+# Final save
+tracker.final_save()
+
+end_time = datetime.now()
+duration = end_time - start_time
+
+# ======================================
+# ✅ FINAL SUMMARY
+# ======================================
+print(f"\n{'='*60}")
+print("🎯 EXTRACTION COMPLETE")
+print(f"{'='*60}")
+print(f"⏰ Started: {start_time.strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"⏰ Ended: {end_time.strftime('%Y-%m-%d %H:%M:%S')}")
+print(f"⏰ Duration: {duration}")
+
+print(f"\n📊 SUMMARY STATISTICS:")
+print(f"   ✅ Successful files: {successful_files}/{len(sorted_files)}")
+print(f"   ❌ Failed files: {len(failed_files)}")
+
+success_count = sum(1 for r in tracker.results if r['status'] == 'SUCCESS')
+no_image_count = sum(1 for r in tracker.results if r['status'] == 'NO_IMAGE')
+pending_count = len(tracker.original_data) - len(tracker.results)
+
+print(f"\n📈 IMAGE EXTRACTION RESULTS:")
+print(f"   ✅ Successfully extracted: {success_count}")
+print(f"   ⚠️  No image found: {no_image_count}")
+print(f"   ⏳ Pending/not processed: {pending_count}")
+print(f"   📊 Total CSV rows: {len(tracker.original_data)}")
+
+if BACKUP_BEFORE_OVERWRITE:
+    backup_files_count = sum([len(files) for r, d, files in os.walk(BACKUP_DIR)])
+    print(f"\n📦 Backup created: {backup_files_count} files in {BACKUP_DIR}")
+
+print(f"\n📁 OUTPUT FILES:")
+print(f"   📊 Detailed results: {RESULTS_CSV}")
+print(f"   📄 Updated CSV with extraction info: {UPDATED_CSV}")
+print(f"   📈 Progress files: {os.path.dirname(RESULTS_CSV)}/*_progress_*.csv")
+print(f"   🐛 Debug files: {DEBUG_DIR}")
+print(f"   🖼️  Extracted images: {OUTPUT_ROOT}")
+
+if failed_files:
+    print(f"\n❌ FAILED FILES ({len(failed_files)}):")
+    for folder, subfolder, file_name, reason in failed_files[:10]:  # Show first 10
+        subfolder_display = subfolder if subfolder else "(none)"
+        print(f"   - {folder}/{subfolder_display}/{file_name}: {reason}")
+    if len(failed_files) > 10:
+        print(f"   ... and {len(failed_files) - 10} more")
+
+print(f"\n🤖 VISION API STATUS: {'ENABLED' if USE_VISION_API and DEEPSEEK_API_KEY else 'DISABLED'}")
+
+if CACHE_VISION_RESULTS:
+    print(f"🧹 Vision API cache entries: {len(vision_cache)}")
+
+# Show sample of final results
+print(f"\n📋 SAMPLE OF FINAL RESULTS (first 10):")
+print(f"{'CSV Row':<8} {'Question':<10} {'Image':<20} {'Extracted Row':<15} {'Status':<10}")
+print("-" * 65)
+for result in tracker.results[:10]:
+    extracted = str(result['extracted_row']) if result['extracted_row'] else ''
+    print(f"{result['csv_row']:<8} {result['question_no']:<10} {result['image_name'][:18]:<20} {extracted:<15} {result['status']:<10}")
+
+print(f"\n✅ Extraction complete! Check the CSV files for detailed results.")
