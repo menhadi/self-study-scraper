@@ -32,7 +32,7 @@ SAFETY_MODE = True
 BACKUP_BEFORE_OVERWRITE = True
 
 # Progress saving
-SAVE_EVERY_N_IMAGES = 10  # Save progress after every N images
+SAVE_EVERY_N_IMAGES = 100  # Save progress after every N images
 
 os.makedirs(OUTPUT_ROOT, exist_ok=True)
 os.makedirs(DEBUG_DIR, exist_ok=True)
