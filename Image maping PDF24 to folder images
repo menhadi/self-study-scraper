@@ -1,0 +1,137 @@
+import os
+import csv
+import re
+import shutil
+from collections import defaultdict
+from PIL import Image, ImageDraw, ImageFont
+
+# ================= CONFIG =================
+IMAGE_ROOT = r"C:\Users\menha\Downloads\images"
+CSV_FILE   = r"C:\Users\menha\Downloads\input.csv"
+OUTPUT_ROOT = r"C:\Users\menha\Downloads\output_images"
+OUTPUT_LOG  = r"C:\Users\menha\Downloads\output_mapping.csv"
+
+PLACEHOLDER_TEXT = "Image will appear soon"
+PLACEHOLDER_SIZE = (800, 600)
+
+# ================= HELPERS =================
+def extract_page_key(name):
+    """
+    Extracts page number as page_2 from:
+    Aerospace Engineering2022 (AE2022)_page_2.png
+    """
+    m = re.search(r'page[_\s]?(\d+)', name.lower())
+    return f"page_{m.group(1)}" if m else None
+
+def create_placeholder(path):
+    img = Image.new("RGB", PLACEHOLDER_SIZE, (240, 240, 240))
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("arial.ttf", 32)
+    except:
+        font = ImageFont.load_default()
+
+    bbox = draw.textbbox((0, 0), PLACEHOLDER_TEXT, font=font)
+    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    draw.text(
+        ((PLACEHOLDER_SIZE[0] - w) // 2, (PLACEHOLDER_SIZE[1] - h) // 2),
+        PLACEHOLDER_TEXT,
+        fill=(80, 80, 80),
+        font=font
+    )
+    img.save(path)
+
+# ================= STEP 1: INDEX IMAGES BY PAGE =================
+page_images = defaultdict(list)
+
+for root, _, files in os.walk(IMAGE_ROOT):
+    for f in files:
+        full = os.path.join(root, f)
+        try:
+            Image.open(full)  # confirms image even without extension
+        except:
+            continue
+
+        key = extract_page_key(f)
+        if key:
+            page_images[key].append(full)
+
+# Stable order: -0, -1, -2 ...
+for k in page_images:
+    page_images[k].sort()
+
+print("Indexed pages:", {k: len(v) for k, v in page_images.items()})
+
+# ================= STEP 2: READ CSV =================
+with open(CSV_FILE, newline="", encoding="utf-8") as f:
+    rows = list(csv.DictReader(f))
+
+# ================= STEP 3: PROCESS =================
+usage_counter = defaultdict(int)   # per page
+folder_counters = defaultdict(int) # per (folder, sub_folder)
+
+log = []
+
+for row in rows:
+    folder = row["folder"].strip()
+    sub = row["sub_folder"].strip()
+    csv_file = row["file_name"].strip()
+
+    page_key = extract_page_key(csv_file)
+
+    out_dir = os.path.join(OUTPUT_ROOT, folder, sub)
+    os.makedirs(out_dir, exist_ok=True)
+
+    # 🔁 RESET COUNTER PER SUBFOLDER
+    key_fs = (folder, sub)
+    folder_counters[key_fs] += 1
+    img_no = folder_counters[key_fs]
+
+    out_img = f"IMAGE_{img_no}.png"
+    out_path = os.path.join(out_dir, out_img)
+
+    status = "PLACEHOLDER"
+    matched = ""
+
+    if page_key in page_images:
+        idx = usage_counter[page_key]
+        if idx < len(page_images[page_key]):
+            src = page_images[page_key][idx]
+            shutil.copy(src, out_path)
+            matched = os.path.basename(src)
+            status = "COPIED"
+            usage_counter[page_key] += 1
+        else:
+            create_placeholder(out_path)
+    else:
+        create_placeholder(out_path)
+
+    log.append({
+        "folder": folder,
+        "sub_folder": sub,
+        "csv_file_name": csv_file,
+        "page_key": page_key,
+        "matched_image": matched,
+        "output_image": out_img,
+        "status": status
+    })
+
+# ================= STEP 4: WRITE LOG =================
+with open(OUTPUT_LOG, "w", newline="", encoding="utf-8") as f:
+    writer = csv.DictWriter(
+        f,
+        fieldnames=[
+            "folder",
+            "sub_folder",
+            "csv_file_name",
+            "page_key",
+            "matched_image",
+            "output_image",
+            "status"
+        ]
+    )
+    writer.writeheader()
+    writer.writerows(log)
+
+print("✅ DONE SUCCESSFULLY")
+print(f"📄 Debug CSV: {OUTPUT_LOG}")
