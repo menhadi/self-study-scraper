@@ -6,26 +6,24 @@ from collections import defaultdict
 from PIL import Image, ImageDraw, ImageFont
 
 # ================= CONFIG =================
-IMAGE_ROOT  = r"C:\Users\menha\Downloads\images"
-CSV_FILE    = r"C:\Users\menha\Downloads\input.csv"
-OUTPUT_ROOT = r"C:\Users\menha\Downloads\output_images"
+IMAGE_ROOT  = r"D:\Images"
+CSV_FILE    = r"C:\Users\menha\Downloads\input11.csv"
+OUTPUT_ROOT = r"D:\output_images"
 OUTPUT_LOG  = r"C:\Users\menha\Downloads\output_mapping.csv"
 
 PLACEHOLDER_TEXT = "Image will appear soon"
-PLACEHOLDER_SIZE = (300, 100)
+PLACEHOLDER_SIZE = (800, 600)
 
 # ================= HELPERS =================
-def extract_page_key(name):
-    """
-    Extracts page key like 'page_2'
-    """
+def extract_page(name):
     m = re.search(r'page[_\s]?(\d+)', name.lower())
     return f"page_{m.group(1)}" if m else None
 
+def extract_year(name):
+    m = re.search(r'(20\d{2})', name)
+    return m.group(1) if m else None
+
 def is_zero_image(name):
-    """
-    Returns True if image ends with -0 (page_2-0, page_5-0, etc.)
-    """
     return bool(re.search(r'-0(\D|$)', name))
 
 def create_placeholder(path):
@@ -37,66 +35,69 @@ def create_placeholder(path):
         font = ImageFont.load_default()
 
     bbox = draw.textbbox((0, 0), PLACEHOLDER_TEXT, font=font)
-    w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    w, h = bbox[2]-bbox[0], bbox[3]-bbox[1]
     draw.text(
-        ((PLACEHOLDER_SIZE[0] - w) // 2, (PLACEHOLDER_SIZE[1] - h) // 2),
+        ((PLACEHOLDER_SIZE[0]-w)//2, (PLACEHOLDER_SIZE[1]-h)//2),
         PLACEHOLDER_TEXT,
-        fill=(80, 80, 80),
+        fill=(80,80,80),
         font=font
     )
     img.save(path)
 
-# ================= STEP 1: INDEX IMAGES BY PAGE (IGNORE -0) =================
-page_images = defaultdict(list)
+# ================= STEP 1: INDEX IMAGES BY (YEAR + PAGE) =================
+image_index = defaultdict(list)
 
 for root, _, files in os.walk(IMAGE_ROOT):
     for f in files:
         full = os.path.join(root, f)
 
-        # Confirm it's an image (even without extension)
         try:
             Image.open(full)
         except:
             continue
 
-        # Ignore logos / banners (no page number)
-        page = extract_page_key(f)
-        if not page:
+        page = extract_page(f)
+        year = extract_year(f)
+
+        if not page or not year:
             continue
 
-        # 🚫 HARD RULE: ignore -0 images
         if is_zero_image(f):
-            continue
+            continue  # ignore -0 permanently
 
-        page_images[page].append(full)
+        key = f"{year}|{page}"
+        image_index[key].append(full)
 
-# Stable ordering: page_2-1, page_2-2, ...
-for p in page_images:
-    page_images[p].sort()
+# stable ordering
+for k in image_index:
+    image_index[k].sort()
 
 # ================= STEP 2: READ CSV =================
 with open(CSV_FILE, newline="", encoding="utf-8") as f:
     rows = list(csv.DictReader(f))
 
-# ================= STEP 3: GROUP CSV ROWS BY PAGE =================
-csv_by_page = defaultdict(list)
-for idx, row in enumerate(rows):
-    page = extract_page_key(row["file_name"])
-    csv_by_page[page].append((idx, row))
+# ================= STEP 3: GROUP CSV ROWS BY (YEAR + PAGE) =================
+csv_groups = defaultdict(list)
 
-# ================= STEP 4: ASSIGN IMAGES TO CSV ROWS =================
+for idx, row in enumerate(rows):
+    page = extract_page(row["file_name"])
+    year = extract_year(row["file_name"])
+    key = f"{year}|{page}"
+    csv_groups[key].append((idx, row))
+
+# ================= STEP 4: ASSIGN IMAGES (IGNORE -0, NO LEAKAGE) =================
 csv_image_assignment = {}
 
-for page, csv_rows in csv_by_page.items():
-    images = page_images.get(page, [])
+for key, csv_rows in csv_groups.items():
+    images = image_index.get(key, [])
 
     for i, (csv_idx, _) in enumerate(csv_rows):
         if i < len(images):
             csv_image_assignment[csv_idx] = images[i]
         else:
-            csv_image_assignment[csv_idx] = None  # placeholder
+            csv_image_assignment[csv_idx] = None
 
-# ================= STEP 5: WRITE OUTPUT IMAGES =================
+# ================= STEP 5: WRITE OUTPUT =================
 folder_counters = defaultdict(int)
 log = []
 
@@ -126,7 +127,8 @@ for idx, row in enumerate(rows):
         "folder": folder,
         "sub_folder": sub,
         "csv_file_name": row["file_name"],
-        "page_key": extract_page_key(row["file_name"]),
+        "year": extract_year(row["file_name"]),
+        "page": extract_page(row["file_name"]),
         "matched_image": matched,
         "output_image": out_name,
         "status": status
@@ -140,7 +142,8 @@ with open(OUTPUT_LOG, "w", newline="", encoding="utf-8") as f:
             "folder",
             "sub_folder",
             "csv_file_name",
-            "page_key",
+            "year",
+            "page",
             "matched_image",
             "output_image",
             "status"
@@ -149,5 +152,5 @@ with open(OUTPUT_LOG, "w", newline="", encoding="utf-8") as f:
     writer.writeheader()
     writer.writerows(log)
 
-print("✅ DONE — '-0' IMAGES ARE NEVER USED")
+print("✅ DONE — YEAR + PAGE SAFE MATCHING")
 print("Debug CSV:", OUTPUT_LOG)
