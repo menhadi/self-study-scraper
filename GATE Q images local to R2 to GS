@@ -1,0 +1,161 @@
+import os
+import boto3
+import gspread
+from google.oauth2.service_account import Credentials
+from botocore.exceptions import ClientError
+
+# =====================================================
+# 🔐 R2 CONFIGURATION
+# =====================================================
+R2_ACCOUNT_ID   = "9c3a111cd1c8101060111b18f9dda444"
+R2_ACCESS_KEY  = "cd09fc348dc0e5ac72d04d7b301ae141"
+R2_SECRET_KEY  = "15c67f92b18a5b0dc5a4ce9f6b675e76367544a316aa21118ce0d737ab080d7a"
+
+R2_BUCKET_NAME = "exampace"
+R2_BASE_PATH   = "GATE"
+PUBLIC_BASE_URL = "https://cdn.exampace.com"
+
+DEFAULT_IMAGE_URL = f"{PUBLIC_BASE_URL}/{R2_BASE_PATH}/image.png"
+
+# =====================================================
+# 📁 LOCAL FILE BASE
+# =====================================================
+LOCAL_BASE_DIR = r"D:\Vector Academy\Contents\PYQ\GATE\Image1"
+
+# =====================================================
+# 📄 GOOGLE SHEET CONFIG
+# =====================================================
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+SHEET_TAB = "Sheet4"
+CREDENTIALS_FILE = "service-account.json"
+
+# Column indexes (0-based)
+COL_FOLDER     = 0   # A
+COL_SUBFOLDER  = 1   # B
+COL_FILENAME   = 2   # C
+COL_URL        = 7   # H
+
+# Batch size for Google Sheet update
+BATCH_SIZE = 100
+
+# =====================================================
+# 🔗 GOOGLE SHEET CONNECTION
+# =====================================================
+scope = ["https://www.googleapis.com/auth/spreadsheets"]
+creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scope)
+gs = gspread.authorize(creds)
+
+sheet = gs.open_by_key(GOOGLE_SHEET_ID).worksheet(SHEET_TAB)
+rows = sheet.get_all_values()
+
+# =====================================================
+# 🔗 R2 CONNECTION
+# =====================================================
+r2 = boto3.client(
+    "s3",
+    endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+    aws_access_key_id=R2_ACCESS_KEY,
+    aws_secret_access_key=R2_SECRET_KEY,
+    region_name="auto",
+)
+
+# =====================================================
+# 🚀 PROCESS ROWS WITH BATCHED SHEET UPDATES
+# =====================================================
+batch_values = []
+batch_start_row = None
+
+uploaded = skipped = failed = 0
+
+for idx in range(1, len(rows)):  # skip header
+    row = rows[idx]
+
+    while len(row) <= COL_URL:
+        row.append("")
+
+    folder = row[COL_FOLDER].strip()
+    sub_folder = row[COL_SUBFOLDER].strip()
+    file_name = row[COL_FILENAME].strip()
+    existing_url = row[COL_URL].strip()
+
+    # Track first row of batch
+    if batch_start_row is None:
+        batch_start_row = idx + 1  # sheet row number
+
+    # -------------------------------------------------
+    # CASE 0: URL already exists → keep as-is
+    # -------------------------------------------------
+    if existing_url:
+        batch_values.append([existing_url])
+        skipped += 1
+
+    # -------------------------------------------------
+    # CASE 1: file_name is BLANK → default image
+    # -------------------------------------------------
+    elif not file_name:
+        batch_values.append([DEFAULT_IMAGE_URL])
+
+    # -------------------------------------------------
+    # CASE 2: Upload file to R2
+    # -------------------------------------------------
+    else:
+        local_path = os.path.join(
+            LOCAL_BASE_DIR, folder, sub_folder, file_name
+        )
+
+        if not os.path.exists(local_path):
+            print(f"❌ Missing file: {local_path}")
+            batch_values.append([""])
+            failed += 1
+        else:
+            r2_key = f"{R2_BASE_PATH}/{folder}/{sub_folder}/{file_name}"
+            public_url = f"{PUBLIC_BASE_URL}/{r2_key}"
+
+            try:
+                r2.upload_file(
+                    local_path,
+                    R2_BUCKET_NAME,
+                    r2_key,
+                    ExtraArgs={"ACL": "public-read"}
+                )
+                batch_values.append([public_url])
+                uploaded += 1
+                print(f"✅ Uploaded: {r2_key}")
+
+            except ClientError as e:
+                print(f"❌ Upload failed: {r2_key}")
+                print(e)
+                batch_values.append([""])
+                failed += 1
+
+    # -------------------------------------------------
+    # FLUSH BATCH
+    # -------------------------------------------------
+    if len(batch_values) == BATCH_SIZE:
+        start = batch_start_row
+        end = start + len(batch_values) - 1
+        sheet.update(f"H{start}:H{end}", batch_values)
+
+        print(f"📤 Sheet updated: rows {start}–{end}")
+
+        batch_values = []
+        batch_start_row = None
+
+# =====================================================
+# 🔚 FLUSH REMAINING ROWS
+# =====================================================
+if batch_values:
+    start = batch_start_row
+    end = start + len(batch_values) - 1
+    sheet.update(f"H{start}:H{end}", batch_values)
+    print(f"📤 Sheet updated: rows {start}–{end}")
+
+# =====================================================
+# 📊 SUMMARY
+# =====================================================
+print("\n==============================")
+print(f"✅ Uploaded files : {uploaded}")
+print(f"⏭️ Skipped rows  : {skipped}")
+print(f"❌ Failures     : {failed}")
+print("🚀 DONE WITHOUT QUOTA ERRORS")
+print("==============================")
