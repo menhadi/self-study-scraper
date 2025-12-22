@@ -1,0 +1,182 @@
+import gspread
+from google.oauth2.service_account import Credentials
+from urllib.parse import urlparse
+from collections import defaultdict
+import csv
+
+# ============================================
+# CONFIG
+# ============================================
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+CREDENTIALS_FILE = "service-account.json"
+
+SOURCE_SHEET = "urls"
+TARGET_SHEET = "GATE PYQ"
+
+LOG_CSV = "image_replacement_log.csv"
+IMAGE_TOKEN = "[IMAGE]"
+
+TEXT_COLUMNS = ["question", "option1", "option2", "option3", "option4"]
+
+# Insert URLs on separate lines (SAFE FOR PDF/HTML)
+def format_url(url):
+    return f"\n{url}\n"
+
+# ============================================
+# AUTH
+# ============================================
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+creds = Credentials.from_service_account_file(
+    CREDENTIALS_FILE,
+    scopes=SCOPES
+)
+client = gspread.authorize(creds)
+
+src_ws = client.open_by_key(GOOGLE_SHEET_ID).worksheet(SOURCE_SHEET)
+tgt_ws = client.open_by_key(GOOGLE_SHEET_ID).worksheet(TARGET_SHEET)
+
+# ============================================
+# HELPERS
+# ============================================
+def normalize(h):
+    return h.strip().lower().replace(" ", "_")
+
+def header_map(headers):
+    return {normalize(h): i for i, h in enumerate(headers)}
+
+def last_part_of_url(url):
+    return urlparse(url).path.split("/")[-1]
+
+# ============================================
+# READ DATA
+# ============================================
+src_data = src_ws.get_all_values()
+tgt_data = tgt_ws.get_all_values()
+
+src_h = header_map(src_data[0])
+tgt_h = header_map(tgt_data[0])
+
+# ============================================
+# BUILD IMAGE MAP (ORDER PRESERVED)
+# key = (folder, sub_folder, file_name)
+# ============================================
+image_map = defaultdict(list)
+
+for r in src_data[1:]:
+    folder = r[src_h["folder"]].strip()
+    subf   = r[src_h["sub_folder"]].strip()
+    fname  = r[src_h["file_name"]].strip()
+    url    = r[src_h["url"]].strip()
+
+    if folder and subf and fname and url:
+        image_map[(folder, subf, fname)].append(url)
+
+print(f"✅ Loaded {len(image_map)} image groups from urls")
+
+# ============================================
+# PROCESS TARGET SHEET
+# ============================================
+updates = []
+log_rows = []
+
+for row_idx, row in enumerate(tgt_data[1:], start=2):
+    folder = row[tgt_h["folder"]].strip()
+    subf   = row[tgt_h["sub_folder"]].strip()
+    imp    = row[tgt_h["important"]].strip()
+
+    if not imp:
+        continue
+
+    imp_file = last_part_of_url(imp)
+    key = (folder, subf, imp_file)
+
+    if key not in image_map:
+        continue
+
+    urls = image_map[key]
+    url_ptr = 0
+
+    new_row = row.copy()
+    row_changed = False
+
+    for col in TEXT_COLUMNS:
+        col_i = tgt_h[col]
+        text = new_row[col_i]
+
+        while IMAGE_TOKEN in text and url_ptr < len(urls):
+            text = text.replace(
+                IMAGE_TOKEN,
+                format_url(urls[url_ptr]),
+                1
+            )
+
+            log_rows.append([
+                row_idx,
+                folder,
+                subf,
+                imp,
+                imp_file,
+                col,
+                url_ptr + 1,
+                urls[url_ptr],
+                "REPLACED"
+            ])
+
+            url_ptr += 1
+            row_changed = True
+
+        if IMAGE_TOKEN in text and url_ptr >= len(urls):
+            remaining = text.count(IMAGE_TOKEN)
+            for i in range(remaining):
+                log_rows.append([
+                    row_idx,
+                    folder,
+                    subf,
+                    imp,
+                    imp_file,
+                    col,
+                    url_ptr + i + 1,
+                    "",
+                    "NO_URL_LEFT"
+                ])
+
+        new_row[col_i] = text
+
+    if row_changed:
+        updates.append({
+            "range": f"A{row_idx}",
+            "values": [new_row]
+        })
+
+# ============================================
+# APPLY UPDATES
+# ============================================
+if updates:
+    tgt_ws.batch_update(updates)
+    print(f"✅ Updated {len(updates)} rows in GATE PYQ")
+else:
+    print("⚠️ No rows updated")
+
+# ============================================
+# WRITE LOG CSV
+# ============================================
+with open(LOG_CSV, "w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
+    writer.writerow([
+        "row_number",
+        "folder",
+        "sub_folder",
+        "important",
+        "important_file",
+        "target_column",
+        "image_sequence",
+        "url_used",
+        "status"
+    ])
+    writer.writerows(log_rows)
+
+print(f"📄 Detailed log written to: {LOG_CSV}")
