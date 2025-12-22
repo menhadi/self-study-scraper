@@ -1,0 +1,109 @@
+import re
+import math
+import gspread
+from google.oauth2.service_account import Credentials
+
+# ======================================================
+# CONFIG
+# ======================================================
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+CREDENTIALS_FILE = "service-account.json"
+SHEET_TAB = "GATE PYQ"
+
+# ======================================================
+# AUTH
+# ======================================================
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+creds = Credentials.from_service_account_file(
+    CREDENTIALS_FILE,
+    scopes=SCOPES
+)
+
+client = gspread.authorize(creds)
+sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(SHEET_TAB)
+
+# ======================================================
+# HELPERS
+# ======================================================
+def safe_value(val):
+    """
+    Convert NaN / Inf / None → empty string
+    Convert everything else → string
+    """
+    if val is None:
+        return ""
+    if isinstance(val, float) and (math.isnan(val) or math.isinf(val)):
+        return ""
+    return str(val).strip()
+
+# ======================================================
+# LOAD DATA
+# ======================================================
+rows = sheet.get_all_records()
+headers = sheet.row_values(1)
+
+def col(name):
+    return headers.index(name) + 1
+
+# ======================================================
+# PROCESS
+# ======================================================
+updates = []
+
+for row_idx, row in enumerate(rows, start=2):
+
+    correct = safe_value(row.get("Correct Option"))
+    if not correct:
+        continue
+
+    # ---------- CASE 1: A / B / C / D ----------
+    letters = re.findall(r"\b[A-D]\b", correct)
+
+    if letters:
+        option_map = {
+            "A": safe_value(row.get("option1")),
+            "B": safe_value(row.get("option2")),
+            "C": safe_value(row.get("option3")),
+            "D": safe_value(row.get("option4")),
+        }
+
+        target_map = {
+            "A": "mi_answer1",
+            "B": "mi_answer2",
+            "C": "mi_answer3",
+            "D": "mi_answer4",
+        }
+
+        for letter in set(letters):
+            value = option_map.get(letter, "")
+            if value:
+                updates.append({
+                    "range": gspread.utils.rowcol_to_a1(
+                        row_idx, col(target_map[letter])
+                    ),
+                    "values": [[value]]
+                })
+
+        continue
+
+    # ---------- CASE 2: Numeric ----------
+    if re.search(r"\d", correct):
+        updates.append({
+            "range": gspread.utils.rowcol_to_a1(
+                row_idx, col("fill_blank")
+            ),
+            "values": [[correct]]
+        })
+
+# ======================================================
+# UPDATE
+# ======================================================
+if updates:
+    sheet.batch_update(updates)
+    print(f"✅ Successfully updated {len(updates)} cells")
+else:
+    print("ℹ️ No updates needed")
