@@ -10,7 +10,7 @@ import csv
 GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
 CREDENTIALS_FILE = "service-account.json"
 
-SOURCE_SHEET = "Sheet4"
+SOURCE_SHEET = "urls"
 TARGET_SHEET = "GATE PYQ"
 
 LOG_CSV = "image_replacement_log.csv"
@@ -75,7 +75,7 @@ for r in src_data[1:]:
     if folder and subf and fname and url:
         image_map[(folder, subf, fname)].append(url)
 
-print(f"✅ Loaded {len(image_map)} image groups from Sheet4")
+print(f"✅ Loaded {len(image_map)} image groups from urls")
 
 # ============================================
 # PROCESS TARGET SHEET
