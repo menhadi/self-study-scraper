@@ -9,13 +9,13 @@ import time
 
 GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
 CREDENTIALS_FILE = "service-account.json"
-SHEET_TAB = "Sheet4"
+SHEET_TAB = "GATE PYQ1"
 
 # ======================================
 # ✅ OPENAI CONFIG
 # ======================================
 
-OPENAI_API_KEY = "PASTE_YOUR_OPENAI_API_KEY_HERE"
+OPENAI_API_KEY = "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"
 TEMPERATURE = 0
 
 client = OpenAI(api_key=OPENAI_API_KEY)
@@ -60,14 +60,14 @@ rows = data[1:]
 def col(name):
     return headers.index(name)
 
-IDX_TYPE     = col("Question Type")
-IDX_QTEXT    = col("Question Text")
-IDX_OPTA     = col("Option A")
-IDX_OPTB     = col("Option B")
-IDX_OPTC     = col("Option C")
-IDX_OPTD     = col("Option D")
+IDX_TYPE     = col("Question type")
+IDX_QTEXT    = col("question")
+IDX_OPTA     = col("option1")
+IDX_OPTB     = col("option2")
+IDX_OPTC     = col("option3")
+IDX_OPTD     = col("option4")
 IDX_CORRECT  = col("Correct Option")
-IDX_SOLUTION = col("Solution")
+IDX_SOLUTION = col("explanation")
 IDX_PENDING  = col("Pending")
 
 # ======================================
