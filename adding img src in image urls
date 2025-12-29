@@ -1,0 +1,101 @@
+import gspread
+from google.oauth2.service_account import Credentials
+
+# ======================================================
+# CONFIG
+# ======================================================
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+CREDENTIALS_FILE = "service-account.json"
+SHEET_TAB = "GATE PYQ"
+
+TARGET_COLUMNS = ["question", "option1", "option2", "option3", "option4"]
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".webp")
+
+# ======================================================
+# AUTH
+# ======================================================
+SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive"
+]
+
+creds = Credentials.from_service_account_file(
+    CREDENTIALS_FILE,
+    scopes=SCOPES
+)
+
+client = gspread.authorize(creds)
+sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(SHEET_TAB)
+
+# ======================================================
+# LOAD DATA
+# ======================================================
+rows = sheet.get_all_records()
+headers = sheet.row_values(1)
+
+def col(name):
+    return headers.index(name) + 1
+
+# ======================================================
+# IMAGE REPLACER (NO REGEX)
+# ======================================================
+def replace_image_urls(text):
+    if "<img" in text.lower():
+        return text
+
+    i = 0
+    out = ""
+
+    while i < len(text):
+        if text[i:i+4].lower() == "http":
+            start = i
+            end = -1
+
+            for ext in IMAGE_EXTS:
+                pos = text.lower().find(ext, i)
+                if pos != -1:
+                    end = pos + len(ext)
+                    break
+
+            if end != -1:
+                url = text[start:end].strip()
+                out += f'<img src="{url}"/>'
+                i = end
+                continue
+
+        out += text[i]
+        i += 1
+
+    return out
+
+# ======================================================
+# PROCESS
+# ======================================================
+updates = []
+
+for row_idx, row in enumerate(rows, start=2):
+    for column_name in TARGET_COLUMNS:
+
+        val = row.get(column_name)
+        if not val:
+            continue
+
+        original = str(val)
+        updated = replace_image_urls(original)
+
+        if updated != original:
+            updates.append({
+                "range": gspread.utils.rowcol_to_a1(
+                    row_idx, col(column_name)
+                ),
+                "values": [[updated]]
+            })
+
+# ======================================================
+# UPDATE
+# ======================================================
+if updates:
+    sheet.batch_update(updates)
+    print(f"✅ Replaced image URLs in {len(updates)} cells")
+else:
+    print("ℹ️ No image URLs found")
