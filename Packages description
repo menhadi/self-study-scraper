@@ -1,0 +1,116 @@
+import re
+import gspread
+from collections import defaultdict
+from google.oauth2.service_account import Credentials
+
+# ================= CONFIG =================
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+CREDENTIALS_FILE = "service-account.json"
+SHEET_TAB = "Sheet13"
+START_ROW = 2
+# =========================================
+
+HTML_TEMPLATE = """<h2>GATE {subject} Previous Year Question Papers</h2>
+
+<p>
+Access <strong>FREE GATE {subject} Previous Year Question Papers</strong> on Exampace, covering papers from <strong>{year_range}</strong>. This package provides authentic GATE exam questions to help aspirants understand real exam patterns and difficulty levels.
+</p>
+
+<p>
+Practicing GATE {subject} previous year papers improves conceptual clarity, accuracy, and time management. These papers highlight important topics and repeated questions essential for effective GATE preparation.
+</p>
+
+<p>
+This is a <strong>completely free GATE PYQ package</strong> available on Exampace. Explore the year-wise papers below and prepare with confidence.
+</p>
+"""
+
+# ================= MAIN =================
+def main():
+    scope = [
+        "https://www.googleapis.com/auth/spreadsheets",
+        "https://www.googleapis.com/auth/drive"
+    ]
+
+    creds = Credentials.from_service_account_file(
+        CREDENTIALS_FILE,
+        scopes=scope
+    )
+
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(SHEET_TAB)
+
+    rows = sheet.get_all_values()
+    headers = rows[0]
+
+    # ---- SAFE HEADER FINDER ----
+    def find_col(name):
+        for i, h in enumerate(headers):
+            if h.strip().lower() == name.lower():
+                return i
+        raise ValueError(f"Column '{name}' not found")
+
+    FOLDER_COL = find_col("Folder")
+    YEAR_COL = find_col("Sub Folder")
+    DESC_COL = find_col("Description")
+
+    subject_years = defaultdict(set)
+    subject_first_row = {}
+
+    # ---- COLLECT DATA ----
+    for idx, row in enumerate(rows[START_ROW - 1:], start=START_ROW):
+        subject = row[FOLDER_COL].strip()
+        year = re.sub(r"\s+", "", row[YEAR_COL]) if len(row) > YEAR_COL else ""
+
+        if not subject:
+            continue
+
+        if re.fullmatch(r"(19|20)\d{2}", year):
+            subject_years[subject].add(int(year))
+
+        if subject not in subject_first_row:
+            subject_first_row[subject] = idx
+
+    updates = []
+
+    # ---- BUILD & UPDATE ----
+    for subject, years in subject_years.items():
+        if not years:
+            continue
+
+        row_idx = subject_first_row[subject]
+        current_desc = rows[row_idx - 1][DESC_COL].strip()
+
+        if current_desc:
+            continue
+
+        year_range = f"{min(years)} to {max(years)}"
+
+        html = HTML_TEMPLATE.format(
+            subject=subject,
+            year_range=year_range
+        )
+
+        # ---- WRAP IN {"en":"..."} ----
+        escaped_html = (
+            html.replace("\\", "\\\\")
+                .replace('"', '\\"')
+                .replace("\n", "\\n")
+        )
+
+        wrapped_html = f'{{"en":"{escaped_html}"}}'
+
+        cell = gspread.utils.rowcol_to_a1(row_idx, DESC_COL + 1)
+        updates.append({
+            "range": cell,
+            "values": [[wrapped_html]]
+        })
+
+    if updates:
+        sheet.batch_update(updates)
+        print(f"✅ Descriptions written for {len(updates)} subjects")
+    else:
+        print("⚠️ No updates needed")
+
+if __name__ == "__main__":
+    main()
