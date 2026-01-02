@@ -1,0 +1,97 @@
+import gspread
+from google.oauth2.service_account import Credentials
+import re
+import unicodedata
+
+# ================= CONFIG =================
+GOOGLE_SHEET_ID = "1U6gW0yqh3GZlkyxvhF_5k3sXMP8GwZT-TNsXqKv7S1o"
+CREDENTIALS_FILE = "service-account.json"
+SHEET_TAB = "GATE PYQ"
+
+COL_L = 12            # L
+COL_N = 14            # N
+TARGET_COL = 61       # BB
+START_ROW = 2
+MAX_CELL_CHARS = 50000
+# =========================================
+
+# ---------- AUTH ----------
+scope = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive",
+]
+creds = Credentials.from_service_account_file(
+    CREDENTIALS_FILE, scopes=scope
+)
+client = gspread.authorize(creds)
+sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(SHEET_TAB)
+
+# ---------- PARSER ----------
+def parse_body_text(text):
+    if not text:
+        return ""
+
+    text = unicodedata.normalize("NFKC", text)
+    text = re.sub(r"[\u200B-\u200D\uFEFF]", "", text)
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+
+    # Convert **bold** → <b> (if any inside body)
+    text = re.sub(
+        r"\*\*\s*(.*?)\s*\*\*",
+        r"<b>\1</b>",
+        text,
+        flags=re.DOTALL
+    )
+
+    # Paragraph split
+    paragraphs = re.split(r"\n{2,}", text)
+    paragraphs = [
+        f"<p>{p.strip()}</p>"
+        for p in paragraphs
+        if p.strip()
+    ]
+
+    return "".join(paragraphs)
+
+# ---------- MAIN ----------
+rows = sheet.get_all_values()
+updates = []
+
+for i in range(START_ROW - 1, len(rows)):
+    row = rows[i]
+
+    text_l = row[COL_L - 1].strip() if len(row) >= COL_L else ""
+    text_n = row[COL_N - 1].strip() if len(row) >= COL_N else ""
+
+    if not text_l and not text_n:
+        continue
+
+    parts = []
+
+    # Column L → bold heading
+    if text_l:
+        text_l = unicodedata.normalize("NFKC", text_l)
+        text_l = re.sub(r"[\u200B-\u200D\uFEFF]", "", text_l)
+        parts.append(f"<b>{text_l}</b>")
+
+    # Column N → body paragraphs
+    if text_n:
+        parts.append(parse_body_text(text_n))
+
+    final_text = "".join(parts)
+
+    if len(final_text) > MAX_CELL_CHARS:
+        print(f"⚠️ Skipped row {i+1}: {len(final_text)} chars (>50k)")
+        continue
+
+    updates.append({
+        "range": gspread.utils.rowcol_to_a1(i + 1, TARGET_COL),
+        "values": [[final_text]]
+    })
+
+# ---------- WRITE ----------
+if updates:
+    sheet.batch_update(updates)
+    print(f"✅ Updated {len(updates)} rows in column BI")
+else:
+    print("⚠️ No rows updated")
