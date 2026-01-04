@@ -1,0 +1,120 @@
+import gspread
+from google.oauth2.service_account import Credentials
+import unicodedata
+import re
+
+# ================= CONFIG =================
+GOOGLE_SHEET_ID = "1hUdMPgUUy1KgLczFGipzNHgSRN14W5MuPvwOQezo9BY"
+CREDENTIALS_FILE = "service-account.json"
+SHEET_TAB = "JEE Main"
+
+COL_R = "R"   # Subject
+COL_S = "S"   # Topic
+COL_T = "T"   # Sub-topic
+
+COL_E = "E"   # ID based on R
+COL_F = "F"   # ID based on R + S
+COL_G = "G"   # ID based on R + S + T
+
+START_ID_E = 1958
+START_ID_F = 3756
+START_ID_G = 18757
+# =========================================
+
+
+# ---------- NORMALIZE ----------
+def normalize_text(text):
+    if not text:
+        return ""
+    text = unicodedata.normalize("NFKC", str(text))
+    text = re.sub(r"[\u200B\u200C\u200D\uFEFF]", "", text)
+    text = text.replace("\u00A0", " ").replace("\u202F", " ")
+    return " ".join(text.split()).lower()
+
+
+def is_blank(val):
+    return not normalize_text(val)
+
+
+# ---------- MAIN ----------
+def main():
+    scopes = ["https://www.googleapis.com/auth/spreadsheets"]
+    creds = Credentials.from_service_account_file(
+        CREDENTIALS_FILE, scopes=scopes
+    )
+    client = gspread.authorize(creds)
+    sheet = client.open_by_key(GOOGLE_SHEET_ID).worksheet(SHEET_TAB)
+
+    def col_idx(c):
+        return gspread.utils.a1_to_rowcol(f"{c}1")[1]
+
+    r_vals = sheet.col_values(col_idx(COL_R))[1:]
+    s_vals = sheet.col_values(col_idx(COL_S))[1:]
+    t_vals = sheet.col_values(col_idx(COL_T))[1:]
+
+    e_vals = sheet.col_values(col_idx(COL_E))[1:]
+    f_vals = sheet.col_values(col_idx(COL_F))[1:]
+    g_vals = sheet.col_values(col_idx(COL_G))[1:]
+
+    map_e, map_f, map_g = {}, {}, {}
+    next_e, next_f, next_g = START_ID_E, START_ID_F, START_ID_G
+
+    updates = []
+
+    max_len = max(len(r_vals), len(s_vals), len(t_vals))
+
+    for i in range(max_len):
+        row = i + 2
+
+        r = normalize_text(r_vals[i]) if i < len(r_vals) else ""
+        s = normalize_text(s_vals[i]) if i < len(s_vals) else ""
+        t = normalize_text(t_vals[i]) if i < len(t_vals) else ""
+
+        e = e_vals[i] if i < len(e_vals) else ""
+        f = f_vals[i] if i < len(f_vals) else ""
+        g = g_vals[i] if i < len(g_vals) else ""
+
+        # ----- E: based on R -----
+        if is_blank(e) and r:
+            if r not in map_e:
+                map_e[r] = next_e
+                next_e += 1
+            updates.append({
+                "range": gspread.utils.rowcol_to_a1(row, col_idx(COL_E)),
+                "values": [[map_e[r]]]
+            })
+
+        # ----- F: based on R + S -----
+        if is_blank(f) and r and s:
+            key_f = f"{r}♦{s}"
+            if key_f not in map_f:
+                map_f[key_f] = next_f
+                next_f += 1
+            updates.append({
+                "range": gspread.utils.rowcol_to_a1(row, col_idx(COL_F)),
+                "values": [[map_f[key_f]]]
+            })
+
+        # ----- G: based on R + S + T -----
+        if is_blank(g) and r and s and t:
+            key_g = f"{r}♦{s}♦{t}"
+            if key_g not in map_g:
+                map_g[key_g] = next_g
+                next_g += 1
+            updates.append({
+                "range": gspread.utils.rowcol_to_a1(row, col_idx(COL_G)),
+                "values": [[map_g[key_g]]]
+            })
+
+    if updates:
+        sheet.batch_update(updates)
+        print("✅ UPDATED SUCCESSFULLY")
+        print(f"E IDs created: {len(map_e)}")
+        print(f"F IDs created: {len(map_f)}")
+        print(f"G IDs created: {len(map_g)}")
+    else:
+        print("❌ No updates — check input columns")
+
+
+if __name__ == "__main__":
+    main()
