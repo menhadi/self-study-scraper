@@ -1,0 +1,148 @@
+import fitz  # PyMuPDF
+import os
+import re
+import csv
+from collections import defaultdict, deque
+
+# ================= CONFIG =================
+BASE_FOLDER = r"C:\Users\menha\Downloads\test"
+OUTPUT_ROOT = "extracted_images"
+CSV_OUTPUT = "question_image_index.csv"
+
+MAX_IMG_PER_LANG = 8
+# ========================================
+
+QUESTION_REGEX = re.compile(r"Question Number\s*:\s*(\d+)")
+
+def relative_path(path):
+    return os.path.relpath(path, BASE_FOLDER)
+
+os.makedirs(OUTPUT_ROOT, exist_ok=True)
+
+with open(CSV_OUTPUT, "w", newline="", encoding="utf-8") as f:
+    writer = csv.writer(f)
+
+    header = [
+        "input_folder",
+        "pdf_name",
+        "output_folder",
+        "instruction_imgs",
+        "question_no",
+        "page_no",
+    ]
+    header += [f"en_img_{i}" for i in range(1, MAX_IMG_PER_LANG + 1)]
+    header += [f"hi_img_{i}" for i in range(1, MAX_IMG_PER_LANG + 1)]
+    header.append("status")
+    writer.writerow(header)
+
+    # ================= MAIN =================
+    for root, _, files in os.walk(BASE_FOLDER):
+        for file in files:
+            if not file.lower().endswith(".pdf"):
+                continue
+
+            pdf_path = os.path.join(root, file)
+            rel_dir = relative_path(root)
+            pdf_name = os.path.splitext(file)[0]
+
+            print(f"📄 Processing: {pdf_path}")
+
+            try:
+                doc = fitz.open(pdf_path)
+            except Exception as e:
+                writer.writerow([rel_dir, pdf_name, "", "", "", "", *[""]*(2*MAX_IMG_PER_LANG), f"OPEN_ERROR: {e}"])
+                continue
+
+            output_base = os.path.join(OUTPUT_ROOT, rel_dir, pdf_name)
+            instr_dir = os.path.join(output_base, "instruction")
+            en_dir = os.path.join(output_base, "english")
+            hi_dir = os.path.join(output_base, "hindi")
+
+            os.makedirs(instr_dir, exist_ok=True)
+            os.makedirs(en_dir, exist_ok=True)
+            os.makedirs(hi_dir, exist_ok=True)
+
+            occurrence = defaultdict(int)
+            q_page = {}
+            en_imgs = defaultdict(list)
+            hi_imgs = defaultdict(list)
+
+            instruction_imgs = []
+            instr_counter = 0
+
+            current_qno = None
+            current_lang = None
+
+            for page_no in range(len(doc)):
+                page = doc[page_no]
+                image_queue = deque(page.get_images(full=True))
+                blocks = page.get_text("dict")["blocks"]
+
+                for block in blocks:
+                    # -------- TEXT BLOCK --------
+                    if block["type"] == 0:
+                        text = " ".join(
+                            span["text"]
+                            for line in block.get("lines", [])
+                            for span in line.get("spans", [])
+                        )
+
+                        match = QUESTION_REGEX.search(text)
+                        if match:
+                            qno = match.group(1)
+                            occurrence[qno] += 1
+                            current_qno = qno
+                            q_page.setdefault(qno, page_no + 1)
+
+                            current_lang = "en" if occurrence[qno] == 1 else "hi"
+
+                    # -------- IMAGE BLOCK --------
+                    elif block["type"] == 1 and image_queue:
+                        img_info = image_queue.popleft()
+                        xref = img_info[0]
+                        img_bytes = doc.extract_image(xref)["image"]
+
+                        # ---- Instruction image ----
+                        if current_qno is None:
+                            instr_counter += 1
+                            path = os.path.join(instr_dir, f"I{instr_counter}.png")
+                            with open(path, "wb") as im:
+                                im.write(img_bytes)
+                            instruction_imgs.append(path)
+
+                        # ---- Question images ----
+                        elif current_lang == "en":
+                            if len(en_imgs[current_qno]) < MAX_IMG_PER_LANG:
+                                idx = len(en_imgs[current_qno]) + 1
+                                path = os.path.join(en_dir, f"Q{current_qno}_{idx}.png")
+                                with open(path, "wb") as im:
+                                    im.write(img_bytes)
+                                en_imgs[current_qno].append(path)
+
+                        elif current_lang == "hi":
+                            if len(hi_imgs[current_qno]) < MAX_IMG_PER_LANG:
+                                idx = len(hi_imgs[current_qno]) + 1
+                                path = os.path.join(hi_dir, f"Q{current_qno}_{idx}.png")
+                                with open(path, "wb") as im:
+                                    im.write(img_bytes)
+                                hi_imgs[current_qno].append(path)
+
+            # -------- CSV WRITE --------
+            for qno in sorted(q_page, key=lambda x: int(x)):
+                row = [
+                    rel_dir,
+                    pdf_name,
+                    output_base,
+                    "|".join(instruction_imgs),
+                    qno,
+                    q_page[qno],
+                ]
+                row += en_imgs[qno] + [""] * (MAX_IMG_PER_LANG - len(en_imgs[qno]))
+                row += hi_imgs[qno] + [""] * (MAX_IMG_PER_LANG - len(hi_imgs[qno]))
+                row.append("OK")
+                writer.writerow(row)
+
+print("✅ DONE: hierarchy preserved + instruction images handled")
+
+
+
