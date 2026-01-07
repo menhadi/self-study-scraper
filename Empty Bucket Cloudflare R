@@ -1,62 +1,83 @@
 import boto3
 from botocore.client import Config
 
-# === CONFIGURATION ===
+# ================= CONFIG =================
 R2_ACCOUNT_ID   = "9c3a111cd1c8101060111b18f9dda444"
 R2_ACCESS_KEY   = "cd09fc348dc0e5ac72d04d7b301ae141"
 R2_SECRET_KEY   = "15c67f92b18a5b0dc5a4ce9f6b675e76367544a316aa21118ce0d737ab080d7a"
-R2_BUCKET_NAME  = "tech4learn"
 
-# === CONNECT TO R2 ===
+R2_BUCKET_NAME = "backup"          # ✅ bucket only
+DELETE_PREFIX  = "virtualmin"         # ✅ folder inside bucket
+# =========================================
+
 endpoint_url = f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com"
+
 s3 = boto3.client(
     "s3",
     endpoint_url=endpoint_url,
     aws_access_key_id=R2_ACCESS_KEY,
     aws_secret_access_key=R2_SECRET_KEY,
-    config=Config(signature_version="s3v4"),
-    region_name="auto"
+    region_name="auto",
+    config=Config(signature_version="s3v4")
 )
 
-# === SAFETY PROMPT ===
-confirm = input(f"⚠️ WARNING: This will permanently delete ALL files and incomplete uploads from bucket '{R2_BUCKET_NAME}'.\nType 'DELETE' to confirm: ")
+# ================= SAFETY PROMPT =================
+confirm = input(
+    f"\n⚠️ WARNING ⚠️\n"
+    f"This will permanently delete EVERYTHING under:\n"
+    f"  Bucket : {R2_BUCKET_NAME}\n"
+    f"  Prefix : {DELETE_PREFIX}\n\n"
+    f"Type DELETE to confirm: "
+)
+
 if confirm.strip().upper() != "DELETE":
     print("❌ Operation cancelled.")
     exit()
 
-# === 1️⃣ DELETE INCOMPLETE MULTIPART UPLOADS ===
-print("\n🔍 Checking for incomplete multipart uploads...")
+# ================= 1️⃣ CLEAN MULTIPART UPLOADS =================
+print("\n🔍 Checking incomplete multipart uploads...")
+
 try:
-    uploads = s3.list_multipart_uploads(Bucket=R2_BUCKET_NAME)
+    uploads = s3.list_multipart_uploads(Bucket=R2_BUCKET_NAME, Prefix=DELETE_PREFIX)
+
     if "Uploads" in uploads:
-        total = len(uploads["Uploads"])
-        print(f"⚠️ Found {total} incomplete multipart uploads.")
-        for upload in uploads["Uploads"]:
-            key = upload["Key"]
-            upload_id = upload["UploadId"]
-            print(f"🧹 Aborting: {key}")
-            s3.abort_multipart_upload(Bucket=R2_BUCKET_NAME, Key=key, UploadId=upload_id)
-        print(f"✅ Cleaned up {total} incomplete uploads.")
+        for u in uploads["Uploads"]:
+            print(f"🧹 Aborting multipart: {u['Key']}")
+            s3.abort_multipart_upload(
+                Bucket=R2_BUCKET_NAME,
+                Key=u["Key"],
+                UploadId=u["UploadId"]
+            )
+        print(f"✅ Aborted {len(uploads['Uploads'])} multipart uploads.")
     else:
-        print("✅ No incomplete multipart uploads found.")
+        print("✅ No multipart uploads found.")
+
 except Exception as e:
-    print(f"⚠️ Error cleaning multipart uploads: {e}")
+    print(f"⚠️ Multipart cleanup error: {e}")
 
-# === 2️⃣ DELETE ALL NORMAL OBJECTS ===
-print("\n🧹 Deleting all objects from bucket...")
+# ================= 2️⃣ DELETE OBJECTS UNDER PREFIX =================
+print("\n🗑️ Deleting objects...")
+
 paginator = s3.get_paginator("list_objects_v2")
-total_deleted = 0
+deleted = 0
 
-for page in paginator.paginate(Bucket=R2_BUCKET_NAME):
-    if "Contents" in page:
-        objects = [{"Key": obj["Key"]} for obj in page["Contents"]]
-        s3.delete_objects(Bucket=R2_BUCKET_NAME, Delete={"Objects": objects})
-        total_deleted += len(objects)
-        print(f"🗑️ Deleted {len(objects)} objects... (Total: {total_deleted})")
+for page in paginator.paginate(Bucket=R2_BUCKET_NAME, Prefix=DELETE_PREFIX):
+    if "Contents" not in page:
+        continue
 
-if total_deleted == 0:
-    print("✅ No regular objects found to delete.")
+    objects = [{"Key": obj["Key"]} for obj in page["Contents"]]
+
+    s3.delete_objects(
+        Bucket=R2_BUCKET_NAME,
+        Delete={"Objects": objects}
+    )
+
+    deleted += len(objects)
+    print(f"🧹 Deleted {len(objects)} objects (Total: {deleted})")
+
+if deleted == 0:
+    print("✅ No objects found under prefix.")
 else:
-    print(f"\n✅ Completed! Total {total_deleted} objects deleted from '{R2_BUCKET_NAME}'.")
+    print(f"\n✅ SUCCESS: Deleted {deleted} objects under '{DELETE_PREFIX}'")
 
-print("\n🎯 Bucket cleanup complete. (Both normal files and incomplete uploads removed.)")
+print("\n🎯 Cleanup complete.")
