@@ -3,7 +3,7 @@ from google.oauth2.service_account import Credentials
 from collections import defaultdict
 
 # ================= CONFIG =================
-GOOGLE_SHEET_ID = "1Ug58LhC0ps4_zmibFPzJR9AUFvs0y3JrPmUUj224IEM"
+GOOGLE_SHEET_ID = "1sOtllm0w-4QU2Ka_RxecmPeyTp5Y4zC-tK_KdrClkAU"
 CREDENTIALS_FILE = "service-account.json"
 
 SOURCE_SHEET = "Sheet4"
@@ -15,68 +15,68 @@ scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
-creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=scope)
+creds = Credentials.from_service_account_file(
+    CREDENTIALS_FILE, scopes=scope
+)
 client = gspread.authorize(creds)
 
 sh = client.open_by_key(GOOGLE_SHEET_ID)
 src_ws = sh.worksheet(SOURCE_SHEET)
 
-# Create / clear target sheet
+# ---------- TARGET ----------
 try:
     tgt_ws = sh.worksheet(TARGET_SHEET)
     tgt_ws.clear()
 except gspread.exceptions.WorksheetNotFound:
-    tgt_ws = sh.add_worksheet(title=TARGET_SHEET, rows=3000, cols=10)
+    tgt_ws = sh.add_worksheet(title=TARGET_SHEET, rows=4000, cols=10)
 
 # ---------- READ ----------
 rows = src_ws.get_all_values()
 header = rows[0]
-
-# Final header: only A–G
-final_header = header[:7]
-
 data = rows[1:]
+
+final_header = header[:7]
 
 # ---------- COLLECT QUESTIONS ----------
 files = defaultdict(dict)
 
 for row in data:
-    row += [""] * (13 - len(row))  # ensure up to M
+    row += [""] * (13 - len(row))  # ensure A–M
+    paper = row[0].strip()
 
-    file_name = row[0].strip()
-
-    # -------- Block 1 (B–G) --------
-    q1 = row[1].strip()
-    if q1.isdigit():
-        files[file_name][int(q1)] = [
+    # ----- Block B–G -----
+    q_bg = row[1].strip()
+    if q_bg.isdigit():
+        qn = int(q_bg)
+        files[paper][qn] = [
             row[0], row[1], row[2], row[3], row[4], row[5], row[6]
         ]
 
-    # -------- Block 2 (H–M) --------
-    q2 = row[7].strip()
-    if q2.isdigit():
-        files[file_name][int(q2)] = [
+    # ----- Block H–M -----
+    q_hm = row[7].strip()
+    if q_hm.isdigit():
+        qn = int(q_hm)
+        files[paper][qn] = [
             row[0], row[7], row[8], row[9], row[10], row[11], row[12]
         ]
 
-# ---------- BUILD CLEAN OUTPUT ----------
+# ---------- BUILD SEQUENTIAL OUTPUT ----------
 output = [final_header]
 
-for file_name in sorted(files.keys()):
-    q_map = files[file_name]
+for paper in sorted(files.keys()):
+    q_map = files[paper]
     max_q = max(q_map.keys())
 
     for q in range(1, max_q + 1):
         if q in q_map:
             output.append(q_map[q])
         else:
-            # missing question → blank row
             blank = [""] * 7
-            blank[0] = file_name
+            blank[0] = paper
             blank[1] = str(q)
             output.append(blank)
 
 # ---------- WRITE ----------
-tgt_ws.update("A1", output)
+tgt_ws.update(range_name="A1", values=output)
 
-print("✅ Sheet5 created: H–M merged into B–G, gaps filled correctly")
+print("✅ FIXED: Both B–G and H–M questions collected, no blanks due to skipping")
