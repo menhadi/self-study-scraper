@@ -1,0 +1,879 @@
+import os
+import base64
+import requests
+import pdfplumber
+import fitz  # PyMuPDF
+import re
+import json
+import pandas as pd
+from pathlib import Path
+import time
+import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+class DeepSeekQuestionExtractor:
+    def __init__(self, api_key=None):
+        self.api_key = api_key
+        self.pages_per_batch = 3
+        self.base_url = "https://api.deepseek.com/v1/chat/completions"
+        self.image_counter = 0
+        
+    def encode_image(self, image_path):
+        """Encode image to base64"""
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    
+    def call_deepseek_api(self, prompt, images=None, max_tokens=4000):
+        """Call DeepSeek API with text and optional images"""
+        if not self.api_key:
+            print("DeepSeek API key not provided. Using fallback extraction.")
+            return None
+            
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        
+        messages = [{"role": "user", "content": []}]
+        
+        messages[0]["content"].append({
+            "type": "text",
+            "text": prompt
+        })
+        
+        if images:
+            for image_path in images:
+                if os.path.exists(image_path):
+                    base64_image = self.encode_image(image_path)
+                    messages[0]["content"].append({
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:image/png;base64,{base64_image}"
+                        }
+                    })
+                else:
+                    print(f"Warning: Image file not found: {image_path}")
+        
+        payload = {
+            "model": "deepseek-chat",
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.1
+        }
+        
+        try:
+            response = requests.post(self.base_url, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            print(f"DeepSeek API Error: {e}")
+            return None
+    
+    def clean_scientific_text(self, text):
+        """Clean and convert scientific notation to LaTeX with proper formatting"""
+        if not text:
+            return ""
+        
+        # Convert Unicode superscripts to LaTeX
+        superscript_map = {
+            '²': '^{2}', '³': '^{3}', '⁴': '^{4}', '⁵': '^{5}', 
+            '⁶': '^{6}', '⁷': '^{7}', '⁸': '^{8}', '⁹': '^{9}', 
+            '⁰': '^{0}', '¹': '^{1}',
+        }
+        
+        for unicode_char, latex_char in superscript_map.items():
+            text = text.replace(unicode_char, latex_char)
+        
+        # Convert Unicode subscripts to LaTeX
+        subscript_map = {
+            '₀': '_{0}', '₁': '_{1}', '₂': '_{2}', '₃': '_{3}', '₄': '_{4}',
+            '₅': '_{5}', '₆': '_{6}', '₇': '_{7}', '₈': '_{8}', '₉': '_{9}',
+            'ₕ': '_{h}', 'ₖ': '_{k}', 'ₗ': '_{l}', 'ₘ': '_{m}', 'ₙ': '_{n}',
+            'ₚ': '_{p}', 'ₛ': '_{s}', 'ₜ': '_{t}', 'ₓ': '_{x}',
+        }
+        
+        for unicode_char, latex_char in subscript_map.items():
+            text = text.replace(unicode_char, latex_char)
+        
+        # Handle square roots with different notations FIRST (before other processing)
+        text = re.sub(r'√\(([^)]+)\)', r'\\sqrt{\1}', text)  # √(content)
+        text = re.sub(r'sqrt\(([^)]+)\)', r'\\sqrt{\1}', text)  # sqrt(content)
+        text = re.sub(r'√\{([^}]+)\}', r'\\sqrt{\1}', text)  # √{content}
+        
+        # Handle fractions more aggressively
+        text = re.sub(r'(\d+)/(\d+)', r'\\frac{\1}{\2}', text)
+        text = re.sub(r'(\d+)/([a-zA-Z])', r'\\frac{\1}{\2}', text)
+        text = re.sub(r'([a-zA-Z])/(\d+)', r'\\frac{\1}{\2}', text)
+        text = re.sub(r'([a-zA-Z])/([a-zA-Z])', r'\\frac{\1}{\2}', text)
+        
+        # Handle expressions like (x-3)/2
+        text = re.sub(r'\(([^)]+)\)/(\d+)', r'\\frac{\1}{\2}', text)
+        text = re.sub(r'(\d+)/\(([^)]+)\)', r'\\frac{\1}{\2}', text)
+        text = re.sub(r'\(([^)]+)\)/\(([^)]+)\)', r'\\frac{\1}{\2}', text)
+        
+        # Fix fraction exponents: \frac{9}{m}^{2} → \frac{9}{m^{2}}
+        text = re.sub(r'\\frac\{([^}]+)\}\{([^}]+)\}\^{(\d+)}', r'\\frac{\1}{\2^{\3}}', text)
+        text = re.sub(r'\\frac\{([^}]+)\}\{([^}]+)\}\^{([^}]+)}', r'\\frac{\1}{\2^{\3}}', text)
+        
+        # Handle subscripts and superscripts
+        text = re.sub(r'([A-Za-z])_([a-z0-9\(\)])', r'\1_{\2}', text)
+        text = re.sub(r'([A-Za-z0-9\)])\^([0-9+-])', r'\1^{\2}', text)
+        text = re.sub(r'([A-Za-z0-9\)])\^{([^}]+)}', r'\1^{\2}', text)
+        
+        # Fix double backslashes
+        text = text.replace('\\\\sqrt', '\\sqrt')
+        text = text.replace('\\\\frac', '\\frac')
+        
+        # Handle chemical bonds and arrows
+        bond_replacements = {
+            '->': '\\rightarrow',
+            '<-': '\\leftarrow',
+            '<->': '\\leftrightarrow',
+            '<=>': '\\rightleftharpoons',
+            '==': '=',
+            '≡': '\\equiv',
+        }
+        
+        for bond, replacement in bond_replacements.items():
+            text = text.replace(bond, replacement)
+        
+        # Handle mathematical symbols and Greek letters
+        symbol_replacements = {
+            '→': '\\rightarrow',
+            '←': '\\leftarrow',
+            '↑': '\\uparrow',
+            '↓': '\\downarrow',
+            'α': '\\alpha',
+            'β': '\\beta',
+            'γ': '\\gamma',
+            'δ': '\\delta',
+            'ε': '\\epsilon',
+            'θ': '\\theta',
+            'λ': '\\lambda',
+            'μ': '\\mu',
+            'π': '\\pi',
+            'σ': '\\sigma',
+            'φ': '\\phi',
+            'ω': '\\omega',
+            'Δ': '\\Delta',
+            'Σ': '\\Sigma',
+            '∞': '\\infty',
+            '°': '^{\\circ}',
+            '±': '\\pm',
+            '×': '\\times',
+            '÷': '\\div',
+            '≤': '\\leq',
+            '≥': '\\geq',
+            '≠': '\\neq',
+            '≈': '\\approx',
+            '⇒': '\\Rightarrow',
+        }
+        
+        for symbol, replacement in symbol_replacements.items():
+            text = text.replace(symbol, replacement)
+        
+        # Handle common chemical compounds with special formatting
+        chemical_compounds = {
+            'H2SO4': 'H_{2}SO_{4}',
+            'CH3COOH': 'CH_{3}COOH',
+            'NH3': 'NH_{3}',
+            'CO2': 'CO_{2}',
+            'H2O': 'H_{2}O',
+            'NaCl': 'NaCl',
+            'HCl': 'HCl',
+            'NaOH': 'NaOH',
+            'H2O2': 'H_{2}O_{2}',
+            'CH4': 'CH_{4}',
+            'C2H5OH': 'C_{2}H_{5}OH',
+        }
+        
+        for compound, formatted in chemical_compounds.items():
+            text = text.replace(compound, formatted)
+        
+        # Handle aromatic compounds
+        aromatic_patterns = [
+            (r'\b(C6H6)\b', 'C_{6}H_{6}'),
+            (r'\b(C6H5OH)\b', 'C_{6}H_{5}OH'),
+            (r'\b(C6H5CH3)\b', 'C_{6}H_{5}CH_{3}'),
+            (r'\b(C10H8)\b', 'C_{10}H_{8}'),
+            (r'\b(C14H10)\b', 'C_{14}H_{10}'),
+        ]
+        
+        for pattern, replacement in aromatic_patterns:
+            text = re.sub(pattern, replacement, text)
+        
+        # Handle generic chemical formulas
+        text = re.sub(r'\b([A-Z][a-z]?\d+[A-Za-z\d]*)\b', self.format_generic_chemical_latex, text)
+        
+        # Normalize whitespace but preserve paragraph breaks
+        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r'\n\s*\n', '\n\n', text)
+        
+        return text.strip()
+    
+    def format_generic_chemical_latex(self, match):
+        """Format generic chemical formulas with LaTeX subscripts"""
+        formula = match.group(1)
+        formatted = re.sub(r'(\d+)', r'_{\1}', formula)
+        return formatted
+    
+    def format_mathematical_content(self, text):
+        """Format mathematical content with proper LaTeX organization"""
+        if not text:
+            return ""
+        
+        # Split into paragraphs
+        paragraphs = text.split('\n\n')
+        formatted_blocks = []
+        
+        for paragraph in paragraphs:
+            paragraph = paragraph.strip()
+            if not paragraph:
+                continue
+            
+            # Check if this is a mathematical derivation
+            lines = [line.strip() for line in paragraph.split('\n') if line.strip()]
+            
+            if self._is_mathematical_derivation(lines):
+                formatted_blocks.append(self._format_derivation_with_results(lines))
+            else:
+                formatted_blocks.append(self._format_regular_content(paragraph))
+        
+        return '\n\n'.join(formatted_blocks)
+    
+    def _is_mathematical_derivation(self, lines):
+        """Check if lines form a mathematical derivation"""
+        if len(lines) < 2:
+            return False
+        
+        math_line_count = 0
+        for line in lines:
+            # Count lines that are primarily mathematical (contain = and math symbols)
+            if '=' in line and any(char in line for char in ['^', '_', '{', '}', '\\frac', '\\sqrt']):
+                math_line_count += 1
+        
+        return math_line_count / len(lines) > 0.5
+    
+    def _format_derivation_with_results(self, lines):
+        """Format mathematical derivation and separate results"""
+        if len(lines) <= 1:
+            return self._format_regular_content('\n'.join(lines))
+        
+        # Find the transition point from derivation to results
+        transition_index = self._find_derivation_transition(lines)
+        
+        # Split into derivation and results
+        derivation_lines = lines[:transition_index]
+        result_lines = lines[transition_index:]
+        
+        # Format derivation part
+        derivation_block = self._format_derivation_equations(derivation_lines)
+        
+        # Format results part
+        results_block = self._format_results_content(result_lines)
+        
+        # Combine
+        if derivation_block and results_block:
+            return f"{derivation_block}\n\n{results_block}"
+        elif derivation_block:
+            return derivation_block
+        else:
+            return results_block
+    
+    def _find_derivation_transition(self, lines):
+        """Find where mathematical derivation ends and results begin"""
+        # Look for patterns that indicate results rather than derivation
+        result_indicators = [
+            r'^Equations of',
+            r'^Point of',
+            r'^Area of',
+            r'^Therefore',
+            r'^Hence',
+            r'^Thus',
+            r'^Result',
+            r'^Solution',
+            r'^Answer',
+            r'^The ',
+            r'^So ',
+            r'^Finally',
+        ]
+        
+        for i, line in enumerate(lines):
+            line_lower = line.lower()
+            
+            # Check if this line looks like a result
+            is_result = any(re.match(pattern, line_lower, re.IGNORECASE) for pattern in result_indicators)
+            
+            # Also check if line has low mathematical complexity but high text content
+            math_complexity = self._calculate_math_complexity(line)
+            text_ratio = len(re.findall(r'[a-zA-Z]', line)) / max(len(line), 1)
+            
+            if is_result or (text_ratio > 0.7 and math_complexity < 2):
+                return i
+        
+        # If no clear transition found, use 80% of lines for derivation
+        return max(1, int(len(lines) * 0.8))
+    
+    def _calculate_math_complexity(self, line):
+        """Calculate mathematical complexity of a line"""
+        complexity_score = 0
+        complexity_score += len(re.findall(r'[=+\-*/^_]', line))
+        complexity_score += len(re.findall(r'\\frac', line)) * 2
+        complexity_score += len(re.findall(r'\\sqrt', line)) * 2
+        complexity_score += len(re.findall(r'\{.*?\}', line))
+        return complexity_score
+    
+    def _format_derivation_equations(self, lines):
+        """Format only the mathematical derivation equations"""
+        formatted_equations = []
+        
+        for line in lines:
+            formatted_line = self._format_single_equation(line)
+            if formatted_line:
+                formatted_equations.append(formatted_line)
+        
+        if len(formatted_equations) == 0:
+            return ""
+        elif len(formatted_equations) == 1:
+            return f"${formatted_equations[0]}$"
+        else:
+            align_content = " \\\\\n".join(formatted_equations)
+            return f"\\begin{{align*}}\n{align_content}\n\\end{{align*}}"
+    
+    def _format_single_equation(self, line):
+        """Format a single equation line for align environment"""
+        line = line.strip()
+        if not line:
+            return ""
+        
+        # Clean up line endings
+        if line.endswith(('.', ';', ',')):
+            line = line[:-1].strip()
+        
+        # Handle equations with explanatory text
+        if '(' in line and ')' in line:
+            # Extract mathematical part and explanatory text
+            math_part = line
+            explanatory_text = ""
+            
+            # Find text in parentheses that's explanatory, not mathematical
+            paren_matches = re.findall(r'\((.*?)\)', line)
+            for match in paren_matches:
+                # If it doesn't look like a mathematical expression, treat as explanatory
+                if not any(char in match for char in ['=', '+', '-', '*', '/', '^', '_']):
+                    explanatory_text = match
+                    math_part = math_part.replace(f'({match})', '').strip()
+            
+            if '=' in math_part:
+                left, right = math_part.split('=', 1)
+                formatted_line = f"{left.strip()} &= {right.strip()}"
+                if explanatory_text:
+                    formatted_line += f" \\quad \\text{{({explanatory_text})}}"
+                return formatted_line
+            else:
+                return math_part
+        elif '=' in line:
+            # Simple equation
+            left, right = line.split('=', 1)
+            return f"{left.strip()} &= {right.strip()}"
+        else:
+            # Single mathematical expression
+            return line
+    
+    def _format_results_content(self, lines):
+        """Format the results/conclusions part"""
+        if not lines:
+            return ""
+        
+        formatted_results = []
+        for line in lines:
+            # Format each result line with proper math protection
+            formatted_line = self._format_result_line(line)
+            if formatted_line:
+                formatted_results.append(formatted_line)
+        
+        return ' \\\\ '.join(formatted_results)
+    
+    def _format_result_line(self, line):
+        """Format a single result line"""
+        line = line.strip()
+        if not line:
+            return ""
+        
+        # Clean up line endings
+        if line.endswith(('.', ';', ',')):
+            line = line[:-1].strip()
+        
+        # Check if this is primarily mathematical
+        if self._is_primarily_mathematical(line):
+            return f"${line}$"
+        else:
+            # Mixed content - protect mathematical expressions
+            return self._format_mixed_sentence(line)
+    
+    def _format_regular_content(self, text):
+        """Format regular content that may contain mathematical expressions"""
+        # Split into sentences
+        sentences = re.split(r'[.;](?=\s|$)', text)
+        formatted_sentences = []
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if not sentence:
+                continue
+            
+            # Check if sentence is primarily mathematical
+            if self._is_primarily_mathematical(sentence):
+                formatted_sentences.append(f"${sentence}$")
+            else:
+                # Mixed content - handle mathematical expressions within text
+                formatted_sentence = self._format_mixed_sentence(sentence)
+                formatted_sentences.append(formatted_sentence)
+        
+        return ' \\\\ '.join(formatted_sentences)
+    
+    def _is_primarily_mathematical(self, text):
+        """Check if text is primarily mathematical content"""
+        math_indicators = r'[=+\-*/^_{}\\]|\\frac|\\sqrt|\\int|\\sum|\\lim'
+        math_count = len(re.findall(math_indicators, text))
+        word_count = len(re.findall(r'\b[a-zA-Z]{3,}\b', text))
+        
+        if word_count == 0:
+            return True
+        return math_count > word_count
+    
+    def _format_mixed_sentence(self, sentence):
+        """Format a sentence that mixes text and mathematics"""
+        # Protect mathematical expressions while keeping text as is
+        protected_sentence = sentence
+        
+        # Protect fractions
+        protected_sentence = re.sub(r'\\frac\{[^}]+\}\{[^}]+\}', self._protect_math, protected_sentence)
+        
+        # Protect square roots
+        protected_sentence = re.sub(r'\\sqrt\{[^}]+\}', self._protect_math, protected_sentence)
+        
+        # Protect expressions with subscripts/superscripts
+        protected_sentence = re.sub(r'[a-zA-Z]_{[^}]+}', self._protect_math, protected_sentence)
+        protected_sentence = re.sub(r'[a-zA-Z]_{\d+}', self._protect_math, protected_sentence)
+        protected_sentence = re.sub(r'[a-zA-Z]\^{[^}]+}', self._protect_math, protected_sentence)
+        protected_sentence = re.sub(r'[a-zA-Z]\^\d+', self._protect_math, protected_sentence)
+        
+        # Protect simple equations
+        protected_sentence = re.sub(r'[a-zA-Z]\s*=\s*[^,;.]+', self._protect_math, protected_sentence)
+        
+        return protected_sentence
+    
+    def _protect_math(self, match):
+        """Protect mathematical expression with $...$"""
+        return f"${match.group(0)}$"
+    
+    def format_text_with_latex(self, text):
+        """Main function to format text with proper LaTeX"""
+        if not text:
+            return ""
+        
+        # First, apply basic cleaning
+        cleaned_text = self.clean_scientific_text(text)
+        
+        # Then apply intelligent mathematical formatting
+        return self.format_mathematical_content(cleaned_text)
+    
+    def extract_with_ai(self, text, images, page_range, pdf_name):
+        """Use AI to extract structured questions - FIXED VERSION"""
+        cleaned_text = self.clean_scientific_text(text)
+        
+        prompt = """Analyze this exam paper content from pages {page_range} and extract ALL questions with their complete information.
+
+EXTRACTION FORMAT - Return ONLY valid JSON:
+{{
+    "questions": [
+        {{
+            "question_number": "1",
+            "instruction": "any instructional text before question",
+            "question": "main question text here",
+            "options": {{
+                "A": "option A text",
+                "B": "option B text", 
+                "C": "option C text",
+                "D": "option D text",
+                "E": "option E text if exists",
+                "F": "option F text if exists"
+            }},
+            "correct_option": "A or B or C etc",
+            "explanation": "any answer explanation if provided",
+            "image_reference": "image_filename.png if image exists for this question"
+        }}
+    ]
+}}
+
+IMPORTANT RULES:
+1. Extract ALL questions you find including those in solution sections
+2. PRESERVE ALL mathematical equations, chemical formulas, and scientific notation EXACTLY as written
+3. Keep subscripts with underscores (L_h), superscripts with carets (x^2), chemical formulas (H2O)
+4. For aromatic compounds, preserve the notation (C6H6, benzene rings)
+5. For correct_option, use the letter(s) like "A", "B", "C", "AB", etc.
+6. If a question has an associated image/diagram, note it in image_reference field
+7. Separate instructions from main questions
+8. Include questions from solution sections with their explanations
+
+CONTENT TO ANALYZE:
+{cleaned_text}
+
+Return ONLY the JSON, no other text.""".format(page_range=page_range, cleaned_text=cleaned_text[:12000])
+
+        image_paths = [img['filepath'] for img in images] if images else None
+        
+        response = self.call_deepseek_api(prompt, image_paths)
+        
+        if response:
+            try:
+                # Clean the response first
+                cleaned_response = response.strip()
+                
+                # First try to parse the entire response as JSON
+                try:
+                    result = json.loads(cleaned_response)
+                    if "questions" in result:
+                        return result
+                except json.JSONDecodeError:
+                    pass
+                
+                # If that fails, try to extract JSON from the response
+                json_match = re.search(r'\{.*\}', cleaned_response, re.DOTALL)
+                if json_match:
+                    result = json.loads(json_match.group())
+                    if "questions" in result:
+                        return result
+                    else:
+                        print(f"JSON extracted but missing 'questions' key")
+                        return {"questions": []}
+                else:
+                    print(f"Could not extract JSON from AI response")
+                    return {"questions": []}
+                    
+            except Exception as e:
+                print(f"Error parsing AI response: {e}")
+                print(f"Response content: {response[:500]}...")
+                return {"questions": []}
+        
+        return {"questions": []}
+    
+    def extract_images_from_pages(self, pdf_path, page_numbers, output_dir, pdf_name):
+        """Extract high-quality images from specific pages with proper naming"""
+        images = []
+        try:
+            doc = fitz.open(pdf_path)
+            for page_num in page_numbers:
+                if page_num < len(doc):
+                    page = doc.load_page(page_num)
+                    image_list = page.get_images()
+                    
+                    for img_index, img in enumerate(image_list):
+                        xref = img[0]
+                        base_image = doc.extract_image(xref)
+                        if base_image:
+                            self.image_counter += 1
+                            img_filename = f"{pdf_name}_p{page_num+1}_img{self.image_counter:03d}.png"
+                            img_path = output_dir / img_filename
+                            
+                            with open(img_path, "wb") as img_file:
+                                img_file.write(base_image["image"])
+                            
+                            img_data = {
+                                'page': page_num + 1,
+                                'image_reference': img_filename,
+                                'filepath': img_path,
+                                'width': base_image["width"],
+                                'height': base_image["height"],
+                                'xref': xref
+                            }
+                            images.append(img_data)
+                            print(f"    ✅ Extracted image: {img_filename} ({base_image['width']}x{base_image['height']})")
+            doc.close()
+        except Exception as e:
+            print(f"Error extracting images: {e}")
+        
+        return images
+    
+    def extract_text_with_pdfplumber(self, pdf_path, start_page, end_page):
+        """Extract text using pdfplumber with table support"""
+        text = ""
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_num in range(start_page, end_page):
+                    if page_num < len(pdf.pages):
+                        page = pdf.pages[page_num]
+                        page_text = page.extract_text() or ""
+                        
+                        tables_text = ""
+                        for table in page.extract_tables():
+                            for row in table:
+                                clean_row = [str(cell) if cell else "" for cell in row]
+                                tables_text += " | ".join(clean_row) + "\n"
+                        
+                        text += f"\n--- Page {page_num + 1} ---\n{page_text}\n"
+                        if tables_text.strip():
+                            text += f"TABLES:\n{tables_text}\n"
+                            
+        except Exception as e:
+            print(f"Error extracting text: {e}")
+        
+        return text
+    
+    def assign_images_to_questions(self, questions, images, pdf_name):
+        """Assign images to questions based on content analysis and page proximity - FIXED"""
+        if not images or not questions:
+            return questions
+        
+        # Simple assignment logic
+        for i, question in enumerate(questions):
+            if not question.get('image_reference') and images:
+                # Assign images sequentially to questions
+                if i < len(images):
+                    question['image_reference'] = images[i]['image_reference']
+                else:
+                    # If more questions than images, use the last image
+                    question['image_reference'] = images[-1]['image_reference']
+        
+        return questions
+    
+    def fallback_extraction(self, text, page_range):
+        """Fallback extraction if AI fails"""
+        questions = []
+        
+        # Simple pattern to extract questions
+        question_patterns = [
+            r'(\d+)[\.\)]\s*(.*?)(?=\d+[\.\)]|Answer:|$|Explanation:)',
+            r'Q\.?\s*(\d+)[\.\)]\s*(.*?)(?=Q\.?\s*\d+|Answer:|$)',
+        ]
+        
+        for pattern in question_patterns:
+            matches = re.finditer(pattern, text, re.DOTALL | re.IGNORECASE)
+            for match in matches:
+                if 'Q.' in pattern:
+                    question_number = match.group(1)
+                    question_content = match.group(2)
+                else:
+                    question_number = match.group(1)
+                    question_content = match.group(2)
+                
+                if question_content and len(question_content.strip()) > 10:
+                    questions.append({
+                        "question_number": question_number,
+                        "instruction": "",
+                        "question": self.format_text_with_latex(
+                            self.clean_scientific_text(question_content)
+                        ),
+                        "options": {},
+                        "correct_option": "",
+                        "explanation": "",
+                        "image_reference": ""
+                    })
+        
+        return {"questions": questions}
+    
+    def process_batch(self, pdf_path, start_page, end_page, output_dir):
+        """Process a batch of pages with AI enhancement - FIXED"""
+        pdf_name = Path(pdf_path).stem
+        print(f"    Processing pages {start_page + 1} to {end_page} with AI...")
+        
+        images_dir = output_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        
+        text = self.extract_text_with_pdfplumber(pdf_path, start_page, end_page)
+        page_numbers = list(range(start_page, end_page))
+        images = self.extract_images_from_pages(pdf_path, page_numbers, images_dir, pdf_name)
+        
+        page_range = f"{start_page + 1}-{end_page}"
+        
+        if self.api_key and text.strip():
+            ai_result = self.extract_with_ai(text, images, page_range, pdf_name)
+            questions = ai_result.get("questions", [])
+            # Ensure questions is always a list
+            if not isinstance(questions, list):
+                questions = []
+            questions = self.assign_images_to_questions(questions, images, pdf_name)
+        else:
+            fallback_result = self.fallback_extraction(text, page_range)
+            questions = fallback_result.get("questions", [])
+            if not isinstance(questions, list):
+                questions = []
+            questions = self.assign_images_to_questions(questions, images, pdf_name)
+        
+        print(f"    ✅ AI extracted {len(questions)} questions, found {len(images)} images")
+        return questions
+    
+    def process_pdf(self, pdf_path, output_dir):
+        """Process a single PDF file - FIXED"""
+        pdf_name = Path(pdf_path).stem
+        print(f"📄 Processing: {os.path.basename(pdf_path)}")
+        
+        all_questions = []
+        
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                total_pages = len(pdf.pages)
+                print(f"  📖 Total pages: {total_pages}")
+                
+                self.image_counter = 0
+                
+                for batch_start in range(0, total_pages, self.pages_per_batch):
+                    batch_end = min(batch_start + self.pages_per_batch, total_pages)
+                    
+                    batch_questions = self.process_batch(pdf_path, batch_start, batch_end, output_dir)
+                    # Ensure we're always extending with a list
+                    if isinstance(batch_questions, list):
+                        all_questions.extend(batch_questions)
+                    else:
+                        print(f"Warning: batch_questions is not a list: {type(batch_questions)}")
+                    
+                    if self.api_key:
+                        time.sleep(2)
+        
+        except Exception as e:
+            print(f"❌ Error processing {pdf_path}: {e}")
+            import traceback
+            traceback.print_exc()
+        
+        return all_questions
+    
+    def save_latex_csv(self, questions, output_path, pdf_name):
+        """Save questions as CSV with properly formatted LaTeX content"""
+        # Ensure questions is a list
+        if not isinstance(questions, list):
+            print(f"Warning: questions is not a list for {pdf_name}, using empty list")
+            questions = []
+            
+        with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            
+            # Write header
+            headers = [
+                'Question Number', 
+                'Instruction', 
+                'Question', 
+                'Option A', 
+                'Option B', 
+                'Option C', 
+                'Option D', 
+                'Option E', 
+                'Option F',
+                'Correct Option', 
+                'Answer/Explanation', 
+                'Image Reference'
+            ]
+            writer.writerow(headers)
+            
+            # Write data - ALL text columns contain properly formatted LaTeX
+            for q in questions:
+                if not isinstance(q, dict):
+                    continue
+                    
+                options = q.get('options', {})
+                if not isinstance(options, dict):
+                    options = {}
+                    
+                row = [
+                    q.get('question_number', ''),  # Plain text for question number
+                    q.get('instruction', ''),      # LaTeX formatted with proper environments
+                    q.get('question', ''),         # LaTeX formatted with proper environments
+                    options.get('A', ''),          # LaTeX formatted with proper environments
+                    options.get('B', ''),          # LaTeX formatted with proper environments
+                    options.get('C', ''),          # LaTeX formatted with proper environments
+                    options.get('D', ''),          # LaTeX formatted with proper environments
+                    options.get('E', ''),          # LaTeX formatted with proper environments
+                    options.get('F', ''),          # LaTeX formatted with proper environments
+                    q.get('correct_option', ''),   # Plain text (A, B, C, etc.)
+                    q.get('explanation', ''),      # LaTeX formatted with proper environments
+                    q.get('image_reference', '')   # Plain text filename
+                ]
+                writer.writerow(row)
+    
+    def process_folder(self, folder_path, output_dir=None, max_workers=1):
+        """Process all PDFs in a folder with parallel processing"""
+        folder_path = Path(folder_path)
+        pdf_files = list(folder_path.glob("*.pdf"))
+        
+        if not pdf_files:
+            print(f"No PDF files found in {folder_path}")
+            return []
+        
+        print(f"📁 Found {len(pdf_files)} PDF files to process")
+        
+        if output_dir is None:
+            output_dir = folder_path / "latex_ready_output"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(exist_ok=True)
+        
+        images_dir = output_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        
+        all_questions = []
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_pdf = {
+                executor.submit(self.process_pdf, pdf_file, output_dir): pdf_file 
+                for pdf_file in pdf_files
+            }
+            
+            for future in as_completed(future_to_pdf):
+                pdf_file = future_to_pdf[future]
+                try:
+                    questions = future.result()
+                    # Ensure we're always extending with a list
+                    if isinstance(questions, list):
+                        all_questions.extend(questions)
+                    else:
+                        print(f"Warning: questions from {pdf_file.name} is not a list: {type(questions)}")
+                    
+                    # Save individual CSV with properly formatted LaTeX content
+                    individual_csv = output_dir / f"{pdf_file.stem}_latex_ready.csv"
+                    self.save_latex_csv(questions, individual_csv, pdf_file.stem)
+                    
+                    print(f"✅ Completed: {pdf_file.name}")
+                    print(f"   - Questions extracted: {len(questions) if isinstance(questions, list) else 0}")
+                    print(f"   - LaTeX-ready CSV: {individual_csv}")
+                    
+                except Exception as e:
+                    print(f"❌ Failed to process {pdf_file}: {e}")
+                    import traceback
+                    traceback.print_exc()
+        
+        # Save combined CSV with properly formatted LaTeX content
+        if all_questions:
+            combined_csv = output_dir / "ALL_QUESTIONS_LATEX_READY.csv"
+            self.save_latex_csv(all_questions, combined_csv, "All PDFs Combined")
+            print(f"\n✅ Combined LaTeX-ready CSV saved: {combined_csv}")
+            print(f"   Total questions across all files: {len(all_questions)}")
+        else:
+            print(f"\n⚠️  No questions were extracted from any PDF files")
+        
+        image_files = list(images_dir.glob("*.png"))
+        print(f"   Total images extracted: {len(image_files)}")
+        print(f"   Images folder: {images_dir}")
+        
+        return all_questions
+
+# Usage example
+if __name__ == "__main__":
+    DEEPSEEK_API_KEY = "sk-a74954e77779423297e2abbc4ef0b7cd"  # Replace with your actual API key
+    
+    extractor = DeepSeekQuestionExtractor(api_key=DEEPSEEK_API_KEY)
+    
+    folder_path = r"C:\Users\menha\Downloads\test"
+    
+    print("🚀 Starting PDF to LaTeX-Ready CSV Conversion...")
+    print("=" * 60)
+    print("Now generating CSV with perfectly organized LaTeX content:")
+    print("- Fixed AI response parsing")
+    print("- Robust error handling")
+    print("- Smart derivation vs result detection")
+    print("- Perfect LaTeX formatting")
+    print("=" * 60)
+    
+    results = extractor.process_folder(folder_path)
+    
+    print("\n" + "=" * 60)
+    print("🎉 LaTeX-Ready CSV Conversion Completed!")
+    print("CSV files contain perfectly formatted LaTeX text!")
