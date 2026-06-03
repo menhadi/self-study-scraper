@@ -1,0 +1,463 @@
+import os
+import time
+import requests
+import PyPDF2
+import csv
+import concurrent.futures
+from io import BytesIO
+from urllib.parse import urlparse
+from pathlib import Path
+
+# Configuration
+DOWNLOAD_DIR = r"D:\Contents\PYQ\NTA\NTA"
+CSV_FILENAME = os.path.join(DOWNLOAD_DIR, "nta_pdfs_index.csv")
+
+# Performance settings
+MAX_WORKERS = 5  # Concurrent downloads
+REQUEST_TIMEOUT = 30
+
+def read_csv_and_check_files():
+    """Read CSV and identify missing files based on file_path column"""
+    missing_files = []
+    existing_files = []
+    invalid_paths = []
+    
+    try:
+        if not os.path.exists(CSV_FILENAME):
+            print(f"❌ CSV file not found: {CSV_FILENAME}")
+            return [], [], []
+        
+        with open(CSV_FILENAME, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            
+            # Print column names to verify structure
+            print(f"📊 CSV Columns found: {list(reader.fieldnames)}")
+            
+            for idx, row in enumerate(reader, 1):
+                pdf_url = row.get('pdf_url', '')
+                file_path = row.get('file_path', '')
+                filename = row.get('filename', '')
+                download_status = row.get('download_status', '')
+                
+                if not pdf_url:
+                    continue
+                
+                # Check if file exists at the specified path
+                file_exists = False
+                actual_path = None
+                
+                if file_path and os.path.exists(file_path):
+                    file_exists = True
+                    actual_path = file_path
+                    existing_files.append({
+                        'row': idx,
+                        'url': pdf_url,
+                        'path': file_path,
+                        'filename': filename,
+                        'status': download_status
+                    })
+                else:
+                    # Try to find the file in the expected location based on exam name
+                    exam_name = row.get('exam_name', '')
+                    if exam_name and filename:
+                        # Construct expected path
+                        expected_folder = os.path.join(DOWNLOAD_DIR, "All_Years", exam_name)
+                        expected_path = os.path.join(expected_folder, filename)
+                        
+                        if os.path.exists(expected_path):
+                            file_exists = True
+                            actual_path = expected_path
+                            existing_files.append({
+                                'row': idx,
+                                'url': pdf_url,
+                                'path': expected_path,
+                                'filename': filename,
+                                'status': download_status
+                            })
+                        else:
+                            # File is missing
+                            missing_files.append({
+                                'row': idx,
+                                'url': pdf_url,
+                                'expected_path': expected_path,
+                                'filename': filename,
+                                'exam_name': exam_name,
+                                'paper_name': row.get('paper_name', ''),
+                                'year': row.get('year', ''),
+                                'exam_date': row.get('exam_date', ''),
+                                'shift': row.get('shift', ''),
+                                'current_status': download_status
+                            })
+                    else:
+                        invalid_paths.append({
+                            'row': idx,
+                            'url': pdf_url,
+                            'filename': filename,
+                            'exam_name': row.get('exam_name', 'Unknown'),
+                            'issue': 'Missing file_path and exam_name/filename'
+                        })
+        
+        print(f"\n📊 SCAN RESULTS:")
+        print(f"   ✅ Files already existing: {len(existing_files)}")
+        print(f"   ❌ Missing files: {len(missing_files)}")
+        print(f"   ⚠ Invalid/Incomplete CSV entries: {len(invalid_paths)}")
+        
+        return missing_files, existing_files, invalid_paths
+        
+    except Exception as e:
+        print(f"❌ Error reading CSV: {e}")
+        import traceback
+        traceback.print_exc()
+        return [], [], []
+
+def validate_pdf(pdf_data):
+    """Validate PDF and return status"""
+    try:
+        if not pdf_data.startswith(b'%PDF'):
+            return "Invalid_Header"
+        
+        if len(pdf_data) < 100:
+            return f"Small_File_{len(pdf_data)}_bytes"
+        
+        try:
+            pdf_file = BytesIO(pdf_data)
+            reader = PyPDF2.PdfReader(pdf_file)
+            num_pages = len(reader.pages)
+            return f"Valid_{num_pages}pages"
+        except Exception as e:
+            return f"Readability_Issue"
+            
+    except Exception as e:
+        return f"Validation_Error"
+
+def download_pdf(url, exam_name, filename, expected_path, timeout=REQUEST_TIMEOUT):
+    """Download PDF with error handling"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+        'Accept': 'application/pdf, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Referer': 'https://nta.ac.in/'
+    }
+    
+    # Ensure URL is absolute
+    if url.startswith('/'):
+        url = "https://nta.ac.in" + url
+    
+    try:
+        print(f"   ⬇ Downloading: {filename}")
+        response = requests.get(url, headers=headers, timeout=timeout, stream=True)
+        response.raise_for_status()
+        
+        # Get content
+        pdf_data = response.content
+        
+        # Validate
+        validation_status = validate_pdf(pdf_data)
+        
+        # Save if valid or has reasonable size
+        if len(pdf_data) > 100:
+            # Ensure directory exists
+            os.makedirs(os.path.dirname(expected_path), exist_ok=True)
+            
+            # Save file
+            with open(expected_path, "wb") as f:
+                f.write(pdf_data)
+            
+            print(f"   ✅ Saved: {filename} ({len(pdf_data)} bytes) - {validation_status}")
+            return True, validation_status, len(pdf_data)
+        else:
+            print(f"   ❌ File too small: {filename} ({len(pdf_data)} bytes)")
+            return False, f"Too_small_{len(pdf_data)}_bytes", len(pdf_data)
+            
+    except requests.exceptions.Timeout:
+        print(f"   ⏰ Timeout: {filename}")
+        return False, "Timeout", 0
+    except requests.exceptions.RequestException as e:
+        print(f"   ❌ Request failed: {filename} - {str(e)}")
+        return False, f"Request_Failed", 0
+    except Exception as e:
+        print(f"   ❌ Unexpected error: {filename} - {str(e)}")
+        return False, f"Error_{str(e)[:50]}", 0
+
+def download_multiple_pdfs(pdf_list):
+    """Download multiple PDFs concurrently"""
+    results = []
+    
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        future_to_pdf = {
+            executor.submit(
+                download_pdf, 
+                pdf['url'], 
+                pdf['exam_name'], 
+                pdf['filename'], 
+                pdf['expected_path']
+            ): pdf for pdf in pdf_list
+        }
+        
+        for future in concurrent.futures.as_completed(future_to_pdf):
+            pdf_info = future_to_pdf[future]
+            try:
+                success, validation_status, size = future.result()
+                results.append({
+                    **pdf_info,
+                    'success': success,
+                    'validation_status': validation_status,
+                    'size': size
+                })
+            except Exception as e:
+                results.append({
+                    **pdf_info,
+                    'success': False,
+                    'validation_status': f"Exception: {str(e)}",
+                    'size': 0
+                })
+    
+    return results
+
+def update_csv_status(csv_filename, pdf_url, new_status, validation_status, file_path, file_size):
+    """Update CSV with new download status"""
+    try:
+        rows = []
+        updated = False
+        
+        with open(csv_filename, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            
+            # Ensure all required fields exist
+            required_fields = ['sno', 'exam_name', 'paper_name', 'year', 'exam_date', 
+                             'shift', 'filename', 'pdf_url', 'download_status', 
+                             'file_path', 'validation_status']
+            
+            for field in required_fields:
+                if field not in fieldnames:
+                    fieldnames.append(field)
+            
+            for row in reader:
+                if row.get('pdf_url') == pdf_url:
+                    row['download_status'] = new_status
+                    row['validation_status'] = validation_status
+                    row['file_path'] = file_path
+                    if file_size:
+                        row['file_size'] = str(file_size)
+                    updated = True
+                rows.append(row)
+        
+        if updated:
+            with open(csv_filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            return True
+        else:
+            print(f"   ⚠ URL not found in CSV for update: {pdf_url}")
+            return False
+            
+    except Exception as e:
+        print(f"   ⚠ Could not update CSV: {e}")
+        return False
+
+def append_missing_to_csv(csv_filename, missing_file):
+    """Append a completely missing entry to CSV"""
+    try:
+        with open(csv_filename, 'a', newline='', encoding='utf-8') as f:
+            writer = csv.DictWriter(f, fieldnames=[
+                'sno', 'exam_name', 'paper_name', 'year', 'exam_date', 'shift',
+                'filename', 'pdf_url', 'download_status', 'file_path', 'validation_status'
+            ])
+            
+            writer.writerow({
+                'sno': missing_file.get('row', 'NEW'),
+                'exam_name': missing_file.get('exam_name', 'Unknown'),
+                'paper_name': missing_file.get('paper_name', ''),
+                'year': missing_file.get('year', ''),
+                'exam_date': missing_file.get('exam_date', ''),
+                'shift': missing_file.get('shift', ''),
+                'filename': missing_file.get('filename', ''),
+                'pdf_url': missing_file.get('url', ''),
+                'download_status': 'Downloaded',
+                'file_path': missing_file.get('expected_path', ''),
+                'validation_status': missing_file.get('validation_status', 'Not_Validated')
+            })
+        return True
+    except Exception as e:
+        print(f"   ⚠ Could not append to CSV: {e}")
+        return False
+
+def process_missing_files(missing_files):
+    """Process all missing files and download them"""
+    if not missing_files:
+        print("\n✅ No missing files to download!")
+        return 0, 0
+    
+    print(f"\n{'='*60}")
+    print(f"🔄 STARTING DOWNLOAD FOR {len(missing_files)} MISSING FILES")
+    print(f"{'='*60}\n")
+    
+    successful = 0
+    failed = 0
+    
+    # Process in batches for better performance
+    batch_size = MAX_WORKERS * 2
+    total_batches = (len(missing_files) + batch_size - 1) // batch_size
+    
+    for batch_num in range(0, len(missing_files), batch_size):
+        batch = missing_files[batch_num:batch_num + batch_size]
+        print(f"\n📦 Processing batch {batch_num//batch_size + 1}/{total_batches} ({len(batch)} files)")
+        
+        # Download batch
+        results = download_multiple_pdfs(batch)
+        
+        # Update CSV for each result
+        for result in results:
+            if result['success']:
+                successful += 1
+                status = 'Downloaded'
+            else:
+                failed += 1
+                status = f"Retry_Failed_{result['validation_status']}"
+            
+            # Update CSV
+            if update_csv_status(
+                CSV_FILENAME, 
+                result['url'], 
+                status, 
+                result['validation_status'],
+                result['expected_path'],
+                result.get('size', 0)
+            ):
+                if result['success']:
+                    print(f"   ✅ Updated CSV for: {result['filename']}")
+                else:
+                    print(f"   ❌ Failed and updated CSV for: {result['filename']}")
+            else:
+                print(f"   ⚠ Could not update CSV for: {result['filename']}")
+        
+        # Small delay between batches
+        if batch_num + batch_size < len(missing_files):
+            time.sleep(2)
+    
+    return successful, failed
+
+def verify_after_download():
+    """Verify that downloaded files actually exist"""
+    print(f"\n{'='*60}")
+    print("🔍 VERIFYING DOWNLOADED FILES")
+    print(f"{'='*60}")
+    
+    verified = 0
+    missing_after_download = []
+    
+    try:
+        with open(CSV_FILENAME, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('download_status') == 'Downloaded':
+                    file_path = row.get('file_path')
+                    if file_path and os.path.exists(file_path):
+                        verified += 1
+                    else:
+                        missing_after_download.append({
+                            'url': row.get('pdf_url'),
+                            'expected_path': file_path,
+                            'filename': row.get('filename')
+                        })
+        
+        print(f"\n📊 VERIFICATION RESULTS:")
+        print(f"   ✅ Verified existing files: {verified}")
+        print(f"   ❌ Still missing: {len(missing_after_download)}")
+        
+        if missing_after_download:
+            missing_log = os.path.join(DOWNLOAD_DIR, "still_missing_after_retry.txt")
+            with open(missing_log, 'w', encoding='utf-8') as f:
+                for item in missing_after_download:
+                    f.write(f"{item['url']}\t{item['expected_path']}\n")
+            print(f"   💾 Still missing URLs saved to: {missing_log}")
+        
+        return missing_after_download
+        
+    except Exception as e:
+        print(f"⚠ Error during verification: {e}")
+        return []
+
+def generate_report(successful, failed, missing_after_verify):
+    """Generate a detailed report"""
+    print(f"\n{'='*60}")
+    print("📊 FINAL REPORT")
+    print(f"{'='*60}")
+    
+    report_file = os.path.join(DOWNLOAD_DIR, "download_report.txt")
+    
+    with open(report_file, 'w', encoding='utf-8') as f:
+        f.write("NTA PDF DOWNLOAD REPORT\n")
+        f.write("="*60 + "\n\n")
+        f.write(f"Successful downloads: {successful}\n")
+        f.write(f"Failed downloads: {failed}\n")
+        f.write(f"Still missing after retry: {len(missing_after_verify)}\n\n")
+        
+        if missing_after_verify:
+            f.write("STILL MISSING FILES:\n")
+            f.write("-"*40 + "\n")
+            for item in missing_after_verify:
+                f.write(f"URL: {item['url']}\n")
+                f.write(f"Path: {item['expected_path']}\n")
+                f.write(f"File: {item['filename']}\n")
+                f.write("-"*40 + "\n")
+    
+    print(f"\n✅ Report saved to: {report_file}")
+    print(f"\n📈 SUMMARY:")
+    print(f"   ✅ Successfully downloaded: {successful}")
+    print(f"   ❌ Failed to download: {failed}")
+    print(f"   ⚠ Still missing: {len(missing_after_verify)}")
+
+def main():
+    """Main execution function"""
+    print("🔄 NTA PDF Downloader - Missing Files Retriever")
+    print("="*60)
+    print(f"📁 Download Directory: {DOWNLOAD_DIR}")
+    print(f"📊 CSV File: {CSV_FILENAME}")
+    print()
+    
+    # Step 1: Read CSV and identify missing files
+    missing_files, existing_files, invalid_paths = read_csv_and_check_files()
+    
+    # Display invalid entries if any
+    if invalid_paths:
+        print(f"\n⚠ Found {len(invalid_paths)} entries with incomplete path information:")
+        for inv in invalid_paths[:5]:  # Show first 5
+            print(f"   Row {inv['row']}: {inv['issue']} - {inv['exam_name']}")
+        if len(invalid_paths) > 5:
+            print(f"   ... and {len(invalid_paths) - 5} more")
+    
+    # Step 2: Download missing files
+    if missing_files:
+        successful, failed = process_missing_files(missing_files)
+    else:
+        successful, failed = 0, 0
+    
+    # Step 3: Verify downloads
+    missing_after_verify = verify_after_download()
+    
+    # Step 4: Generate report
+    generate_report(successful, failed, missing_after_verify)
+    
+    # Final summary
+    print(f"\n{'='*60}")
+    print("✅ PROCESS COMPLETED!")
+    print(f"{'='*60}")
+    print(f"💾 Check your files in: {DOWNLOAD_DIR}")
+    print(f"📊 Check CSV for status: {CSV_FILENAME}")
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\n\n⚠ Process interrupted by user!")
+    except Exception as e:
+        print(f"\n❌ Critical error: {e}")
+        import traceback
+        traceback.print_exc()
+    finally:
+        print("\n👋 Script finished!")
