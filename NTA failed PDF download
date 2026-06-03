@@ -1,0 +1,345 @@
+import os
+import time
+import requests
+import PyPDF2
+import csv
+import concurrent.futures
+from io import BytesIO
+from urllib.parse import urlparse
+
+# Configuration
+BASE_URL = "https://nta.ac.in"
+DOWNLOAD_DIR = r"D:\Contents\PYQ\NTA\NTA"
+CSV_FILENAME = os.path.join(DOWNLOAD_DIR, "nta_pdfs_index.csv")
+FAILED_URLS_FILE = os.path.join(DOWNLOAD_DIR, "all_failed_downloads.txt")
+
+# Performance settings
+MAX_WORKERS = 3
+REQUEST_TIMEOUT = 30
+
+def load_failed_urls():
+    """Load failed URLs from the text file"""
+    failed_urls = []
+    try:
+        if os.path.exists(FAILED_URLS_FILE):
+            with open(FAILED_URLS_FILE, 'r', encoding='utf-8') as f:
+                failed_urls = [line.strip() for line in f if line.strip()]
+            print(f"📖 Loaded {len(failed_urls)} failed URLs from {FAILED_URLS_FILE}")
+        else:
+            print(f"⚠ Failed URLs file not found: {FAILED_URLS_FILE}")
+    except Exception as e:
+        print(f"⚠ Could not load failed URLs: {e}")
+    return failed_urls
+
+def update_csv_with_retry_status(csv_filename, pdf_url, new_status, validation_status="Not_Validated"):
+    """Update the CSV with the retry status"""
+    try:
+        # Read all rows
+        rows = []
+        updated = False
+        
+        with open(csv_filename, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            fieldnames = reader.fieldnames
+            for row in reader:
+                if row.get('pdf_url') == pdf_url:
+                    row['download_status'] = new_status
+                    row['validation_status'] = validation_status
+                    updated = True
+                rows.append(row)
+        
+        # Write back updated rows
+        if updated:
+            with open(csv_filename, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(rows)
+            return True
+        else:
+            print(f"⚠ URL not found in CSV: {pdf_url}")
+            return False
+            
+    except Exception as e:
+        print(f"⚠ Could not update CSV: {e}")
+        return False
+
+def get_exam_info_from_csv(csv_filename, pdf_url):
+    """Get exam name and folder info from CSV for a given URL"""
+    try:
+        with open(csv_filename, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('pdf_url') == pdf_url:
+                    return {
+                        'exam_name': row.get('exam_name', 'Unknown'),
+                        'filename': row.get('filename', ''),
+                        'file_path': row.get('file_path', '')
+                    }
+    except Exception as e:
+        print(f"⚠ Could not read CSV for URL info: {e}")
+    return None
+
+def validate_pdf(pdf_data):
+    """Validate PDF and return status"""
+    try:
+        # Basic PDF signature check
+        if not pdf_data.startswith(b'%PDF'):
+            return "Invalid_Header"
+        
+        # Check file size
+        if len(pdf_data) < 100:
+            return "Small_File"
+        
+        # Try to read with PyPDF2
+        try:
+            pdf_file = BytesIO(pdf_data)
+            reader = PyPDF2.PdfReader(pdf_file)
+            num_pages = len(reader.pages)
+            return f"Valid_{num_pages}pages"
+        except Exception as e:
+            return f"Readability_Issue"
+            
+    except Exception as e:
+        return f"Validation_Error"
+
+def download_pdf_with_retry(url, exam_name, original_filename, original_path, cookies=None):
+    """Download PDF with retry logic"""
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'application/pdf, */*',
+        'Accept-Language': 'en-US,en;q=0.9',
+        'Connection': 'keep-alive'
+    }
+    
+    # Ensure URL is absolute
+    if url.startswith('/'):
+        url = "https://nta.ac.in" + url
+    
+    # Try multiple times with increasing delays
+    for attempt in range(3):
+        try:
+            print(f"   🔄 Attempt {attempt + 1}/3 for: {original_filename}")
+            
+            response = requests.get(url, headers=headers, timeout=REQUEST_TIMEOUT)
+            response.raise_for_status()
+            
+            pdf_data = response.content
+            
+            # Validate PDF
+            validation_status = validate_pdf(pdf_data)
+            print(f"   ✅ Downloaded {len(pdf_data)} bytes, validation: {validation_status}")
+            
+            # Save file if it's valid or at least has content
+            if len(pdf_data) > 100:  # Accept files with at least 100 bytes
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(original_path), exist_ok=True)
+                
+                # Save with retry if original exists
+                save_path = original_path
+                if os.path.exists(save_path):
+                    # Create backup of existing file
+                    backup_path = save_path.replace('.pdf', '_backup.pdf')
+                    os.rename(save_path, backup_path)
+                    print(f"   📋 Backed up existing file to: {backup_path}")
+                
+                with open(save_path, "wb") as f:
+                    f.write(pdf_data)
+                
+                print(f"   💾 Saved to: {save_path}")
+                return pdf_data, "Downloaded", validation_status
+            else:
+                return None, f"File_too_small_{len(pdf_data)}_bytes", "Invalid_Size"
+                
+        except requests.exceptions.Timeout:
+            if attempt < 2:
+                time.sleep(3)
+                continue
+            return None, "Timeout_after_3_attempts", "Not_Validated"
+        except requests.exceptions.RequestException as e:
+            if attempt < 2:
+                time.sleep(2)
+                continue
+            return None, f"Failed: {str(e)}", "Not_Validated"
+    
+    return None, "Failed_after_all_attempts", "Not_Validated"
+
+def process_failed_urls():
+    """Process all failed URLs and update CSV"""
+    
+    # Load failed URLs
+    failed_urls = load_failed_urls()
+    
+    if not failed_urls:
+        print("✅ No failed URLs to process!")
+        return
+    
+    # Check if CSV exists
+    if not os.path.exists(CSV_FILENAME):
+        print(f"❌ CSV file not found: {CSV_FILENAME}")
+        return
+    
+    print(f"\n{'='*60}")
+    print(f"🔄 STARTING RETRY PROCESS FOR {len(failed_urls)} FAILED URLs")
+    print(f"{'='*60}\n")
+    
+    successful_downloads = 0
+    still_failed = []
+    
+    # Process each failed URL
+    for idx, url in enumerate(failed_urls, 1):
+        print(f"\n📌 Processing {idx}/{len(failed_urls)}")
+        print(f"   URL: {url}")
+        
+        # Get exam info from CSV
+        exam_info = get_exam_info_from_csv(CSV_FILENAME, url)
+        
+        if not exam_info:
+            print(f"   ⚠ Could not find URL in CSV, adding to still_failed list")
+            still_failed.append(url)
+            continue
+        
+        exam_name = exam_info['exam_name']
+        filename = exam_info['filename']
+        original_path = exam_info['file_path']
+        
+        # Construct proper folder path based on original path or exam name
+        if original_path and os.path.dirname(original_path):
+            folder = os.path.dirname(original_path)
+        else:
+            folder = os.path.join(DOWNLOAD_DIR, "All_Years", exam_name)
+        
+        # Ensure folder exists
+        os.makedirs(folder, exist_ok=True)
+        
+        # If filename is not available, extract from URL
+        if not filename or filename == 'None':
+            filename = url.split("/")[-1]
+            if not filename.endswith('.pdf'):
+                filename = f"{exam_name}_{idx}.pdf"
+            filename = "".join(c for c in filename if c.isalnum() or c in ('.', '-', '_')).rstrip()
+            original_path = os.path.join(folder, filename)
+        
+        print(f"   📁 Target folder: {folder}")
+        print(f"   📄 Target file: {filename}")
+        
+        # Try to download
+        pdf_data, status, validation = download_pdf_with_retry(url, exam_name, filename, original_path)
+        
+        # Update CSV
+        if update_csv_with_retry_status(CSV_FILENAME, url, status, validation):
+            if status == "Downloaded":
+                successful_downloads += 1
+                print(f"   ✅ SUCCESS: {filename} - Status: {status}, Validation: {validation}")
+            else:
+                still_failed.append(url)
+                print(f"   ❌ FAILED: {filename} - Status: {status}, Validation: {validation}")
+        else:
+            still_failed.append(url)
+            print(f"   ⚠ Could not update CSV for: {url}")
+        
+        # Small delay between requests
+        time.sleep(1)
+    
+    # Summary
+    print(f"\n{'='*60}")
+    print(f"📊 RETRY SUMMARY")
+    print(f"{'='*60}")
+    print(f"   Total processed: {len(failed_urls)}")
+    print(f"   ✅ Successful: {successful_downloads}")
+    print(f"   ❌ Still failed: {len(still_failed)}")
+    
+    # Save still failed URLs
+    if still_failed:
+        new_failed_file = os.path.join(DOWNLOAD_DIR, "still_failed_downloads.txt")
+        with open(new_failed_file, 'w', encoding='utf-8') as f:
+            for url in still_failed:
+                f.write(f"{url}\n")
+        print(f"\n💾 Still failed URLs saved to: {new_failed_file}")
+        
+        # Also create a manual download script
+        manual_script = os.path.join(DOWNLOAD_DIR, "manual_download_script.bat")
+        with open(manual_script, 'w', encoding='utf-8') as f:
+            f.write("@echo off\n")
+            f.write("echo Manual Download Required\n")
+            f.write("echo =========================\n")
+            for url in still_failed[:10]:  # First 10 URLs
+                f.write(f'echo {url}\n')
+            f.write("pause\n")
+        print(f"📝 Manual download script created: {manual_script}")
+    else:
+        print(f"\n🎉 ALL FAILED URLs HAVE BEEN SUCCESSFULLY DOWNLOADED!")
+        # Remove the original failed file if all succeeded
+        if os.path.exists(FAILED_URLS_FILE):
+            os.remove(FAILED_URLS_FILE)
+            print(f"🧹 Removed original failed URLs file")
+    
+    print(f"\n📊 Check the updated CSV for complete status: {CSV_FILENAME}")
+
+def verify_downloaded_files():
+    """Optional: Verify that all files in CSV with 'Downloaded' status actually exist"""
+    print(f"\n{'='*60}")
+    print("🔍 VERIFYING DOWNLOADED FILES")
+    print(f"{'='*60}")
+    
+    missing_files = []
+    
+    try:
+        with open(CSV_FILENAME, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if row.get('download_status') == 'Downloaded':
+                    file_path = row.get('file_path')
+                    if file_path and not os.path.exists(file_path):
+                        missing_files.append({
+                            'url': row.get('pdf_url'),
+                            'file_path': file_path,
+                            'exam': row.get('exam_name')
+                        })
+        
+        if missing_files:
+            print(f"⚠ Found {len(missing_files)} files marked as downloaded but missing:")
+            for missing in missing_files[:10]:  # Show first 10
+                print(f"   - {missing['file_path']}")
+            
+            # Save missing files list
+            missing_file = os.path.join(DOWNLOAD_DIR, "missing_files.txt")
+            with open(missing_file, 'w', encoding='utf-8') as f:
+                for missing in missing_files:
+                    f.write(f"{missing['url']}\t{missing['file_path']}\n")
+            print(f"\n💾 Missing files list saved to: {missing_file}")
+        else:
+            print("✅ All files marked as 'Downloaded' exist on disk!")
+            
+    except Exception as e:
+        print(f"⚠ Error during verification: {e}")
+
+def cleanup_backup_files():
+    """Remove any backup files created during retry"""
+    backup_count = 0
+    for root, dirs, files in os.walk(DOWNLOAD_DIR):
+        for file in files:
+            if file.endswith('_backup.pdf'):
+                backup_path = os.path.join(root, file)
+                try:
+                    os.remove(backup_path)
+                    backup_count += 1
+                except:
+                    pass
+    
+    if backup_count:
+        print(f"🧹 Cleaned up {backup_count} backup files")
+
+if __name__ == "__main__":
+    print("🔄 NTA PDF Downloader - Failed URLs Retry Script")
+    print("="*60)
+    
+    # Process failed URLs
+    process_failed_urls()
+    
+    # Optional verification
+    verify_downloaded_files()
+    
+    # Clean up backup files
+    cleanup_backup_files()
+    
+    print("\n✅ Retry process completed!")
