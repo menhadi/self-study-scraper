@@ -1,0 +1,514 @@
+import os
+import base64
+import requests
+import pdfplumber
+import fitz  # PyMuPDF
+import re
+import json
+import pandas as pd
+from pathlib import Path
+import time
+import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+class DeepSeekQuestionExtractor:
+    def __init__(self, api_key=None):
+        self.api_key = api_key
+        self.pages_per_batch = 3
+        self.base_url = "https://api.deepseek.com/v1/chat/completions"
+        self.image_counter = 0
+        
+    def encode_image(self, image_path):
+        """Encode image to base64"""
+        with open(image_path, "rb") as image_file:
+            return base64.b64encode(image_file.read()).decode('utf-8')
+    
+    def call_deepseek_api(self, prompt, images=None, max_tokens=4000):
+        """Call DeepSeek API with text and optional images"""
+        if not self.api_key:
+            print("DeepSeek API key not provided. Using fallback extraction.")
+            return None
+            
+        headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}"
+        }
+        
+        messages = [{"role": "user", "content": []}]
+        
+        messages[0]["content"].append({
+            "type": "text",
+            "text": prompt
+        })
+        
+        if images:
+            for image_path in images:
+                base64_image = self.encode_image(image_path)
+                messages[0]["content"].append({
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:image/png;base64,{base64_image}"
+                    }
+                })
+        
+        payload = {
+            "model": "deepseek-chat",
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": 0.1
+        }
+        
+        try:
+            response = requests.post(self.base_url, headers=headers, json=payload, timeout=60)
+            response.raise_for_status()
+            return response.json()["choices"][0]["message"]["content"]
+        except Exception as e:
+            print(f"DeepSeek API Error: {e}")
+            return None
+    
+    def clean_scientific_text(self, text):
+        """Clean and convert scientific notation to HTML"""
+        if not text:
+            return ""
+            
+        # Handle chemical formulas with numbers: H2O → H<sub>2</sub>O, CH3 → CH<sub>3</sub>
+        text = re.sub(r'\b([A-Z][a-z]?)(\d+)\b', r'\1<sub>\2</sub>', text)
+        
+        # Handle aromatic compounds: C6H6, C6H5OH, etc.
+        aromatic_patterns = [
+            (r'\b(C6H6)\b', 'C<sub>6</sub>H<sub>6</sub>'),  # Benzene
+            (r'\b(C6H5OH)\b', 'C<sub>6</sub>H<sub>5</sub>OH'),  # Phenol
+            (r'\b(C6H5CH3)\b', 'C<sub>6</sub>H<sub>5</sub>CH<sub>3</sub>'),  # Toluene
+            (r'\b(C10H8)\b', 'C<sub>10</sub>H<sub>8</sub>'),  # Naphthalene
+            (r'\b(C14H10)\b', 'C<sub>14</sub>H<sub>10</sub>'),  # Anthracene
+        ]
+        
+        for pattern, replacement in aromatic_patterns:
+            text = re.sub(pattern, replacement, text)
+        
+        # Handle subscripts: L_h → L<sub>h</sub>, x_i → x<sub>i</sub>
+        text = re.sub(r'([A-Za-z])_([a-z0-9\(\)])', r'\1<sub>\2</sub>', text)
+        
+        # Handle superscripts: x^2 → x<sup>2</sup>, x^{n+1} → x<sup>n+1</sup>
+        text = re.sub(r'([A-Za-z0-9\)])\^([0-9+-])', r'\1<sup>\2</sup>', text)
+        text = re.sub(r'([A-Za-z0-9\)])\^{([^}]+)}', r'\1<sup>\2</sup>', text)
+        
+        # Handle chemical bonds and arrows
+        bond_replacements = {
+            '->': '&rarr;',
+            '<-': '&larr;',
+            '<->': '&harr;',
+            '<=>': '&hArr;',
+            '==': '&hArr;',  # Double bond representation
+            '≡': '&equiv;',  # Triple bond
+        }
+        
+        for bond, replacement in bond_replacements.items():
+            text = text.replace(bond, replacement)
+        
+        # Handle mathematical symbols and Greek letters
+        symbol_replacements = {
+            '→': '&rarr;',
+            '←': '&larr;',
+            '↑': '&uarr;',
+            '↓': '&darr;',
+            'α': '&alpha;',
+            'β': '&beta;',
+            'γ': '&gamma;',
+            'δ': '&delta;',
+            'ε': '&epsilon;',
+            'θ': '&theta;',
+            'λ': '&lambda;',
+            'μ': '&mu;',
+            'π': '&pi;',
+            'σ': '&sigma;',
+            'φ': '&phi;',
+            'ω': '&omega;',
+            'Δ': '&Delta;',
+            'Σ': '&Sigma;',
+            '√': '&radic;',
+            '∞': '&infin;',
+            '°': '&deg;',
+            '±': '&plusmn;',
+            '×': '&times;',
+            '÷': '&divide;',
+            '≤': '&le;',
+            '≥': '&ge;',
+            '≠': '&ne;',
+            '≈': '&asymp;',
+        }
+        
+        for symbol, replacement in symbol_replacements.items():
+            text = text.replace(symbol, replacement)
+        
+        # Handle common chemical compounds with special formatting
+        chemical_compounds = {
+            'H2SO4': 'H<sub>2</sub>SO<sub>4</sub>',
+            'CH3COOH': 'CH<sub>3</sub>COOH',
+            'NH3': 'NH<sub>3</sub>',
+            'CO2': 'CO<sub>2</sub>',
+            'H2O': 'H<sub>2</sub>O',
+            'NaCl': 'NaCl',
+            'HCl': 'HCl',
+            'NaOH': 'NaOH',
+            'H2O2': 'H<sub>2</sub>O<sub>2</sub>',
+            'CH4': 'CH<sub>4</sub>',
+            'C2H5OH': 'C<sub>2</sub>H<sub>5</sub>OH',
+        }
+        
+        for compound, formatted in chemical_compounds.items():
+            text = text.replace(compound, formatted)
+        
+        # Handle generic chemical formulas (catch-all)
+        text = re.sub(r'\b([A-Z][a-z]?\d+[A-Za-z\d]*)\b', self.format_generic_chemical, text)
+        
+        # Normalize whitespace
+        text = re.sub(r'[ \t]+', ' ', text)
+        text = re.sub(r'\s+', ' ', text)
+        
+        return text.strip()
+    
+    def format_generic_chemical(self, match):
+        """Format generic chemical formulas with subscripts"""
+        formula = match.group(1)
+        # Add subscripts to all numbers in chemical formulas
+        formatted = re.sub(r'(\d+)', r'<sub>\1</sub>', formula)
+        return formatted
+    
+    def extract_with_ai(self, text, images, page_range, pdf_name):
+        """Use AI to extract structured questions"""
+        cleaned_text = self.clean_scientific_text(text)
+        
+        prompt = """Analyze this exam paper content from pages {page_range} and extract ALL questions with their complete information.
+
+EXTRACTION FORMAT - Return ONLY valid JSON:
+{{
+    "questions": [
+        {{
+            "question_number": "1",
+            "instruction": "any instructional text before question",
+            "question": "main question text here",
+            "options": {{
+                "A": "option A text",
+                "B": "option B text", 
+                "C": "option C text",
+                "D": "option D text",
+                "E": "option E text if exists",
+                "F": "option F text if exists"
+            }},
+            "correct_option": "A or B or C etc",
+            "explanation": "any answer explanation if provided",
+            "image_reference": "image_filename.png if image exists for this question"
+        }}
+    ]
+}}
+
+IMPORTANT RULES:
+1. Extract ALL questions you find including those in solution sections
+2. PRESERVE ALL mathematical equations, chemical formulas, and scientific notation EXACTLY as written
+3. Keep subscripts with underscores (L_h), superscripts with carets (x^2), chemical formulas (H2O)
+4. For aromatic compounds, preserve the notation (C6H6, benzene rings)
+5. For correct_option, use the letter(s) like "A", "B", "C", "AB", etc.
+6. If a question has an associated image/diagram, note it in image_reference field
+7. Separate instructions from main questions
+8. Include questions from solution sections with their explanations
+
+CONTENT TO ANALYZE:
+{cleaned_text}
+
+Return ONLY the JSON, no other text.""".format(page_range=page_range, cleaned_text=cleaned_text[:12000])
+
+        image_paths = [img['filepath'] for img in images] if images else None
+        
+        response = self.call_deepseek_api(prompt, image_paths)
+        
+        if response:
+            try:
+                json_match = re.search(r'\{.*\}', response, re.DOTALL)
+                if json_match:
+                    result = json.loads(json_match.group())
+                    # Apply scientific text cleaning to all fields
+                    for question in result.get("questions", []):
+                        question["instruction"] = self.clean_scientific_text(question.get("instruction", ""))
+                        question["question"] = self.clean_scientific_text(question.get("question", ""))
+                        question["explanation"] = self.clean_scientific_text(question.get("explanation", ""))
+                        # Clean options
+                        for key in question.get("options", {}):
+                            question["options"][key] = self.clean_scientific_text(question["options"][key])
+                    return result
+            except Exception as e:
+                print(f"Error parsing AI response: {e}")
+        
+        return {"questions": []}
+    
+    def extract_images_from_pages(self, pdf_path, page_numbers, output_dir, pdf_name):
+        """Extract high-quality images from specific pages with proper naming"""
+        images = []
+        try:
+            doc = fitz.open(pdf_path)
+            for page_num in page_numbers:
+                if page_num < len(doc):
+                    page = doc.load_page(page_num)
+                    image_list = page.get_images()
+                    
+                    for img_index, img in enumerate(image_list):
+                        xref = img[0]
+                        base_image = doc.extract_image(xref)
+                        if base_image:
+                            self.image_counter += 1
+                            img_filename = f"{pdf_name}_p{page_num+1}_img{self.image_counter:03d}.png"
+                            img_path = output_dir / img_filename
+                            
+                            with open(img_path, "wb") as img_file:
+                                img_file.write(base_image["image"])
+                            
+                            img_data = {
+                                'page': page_num + 1,
+                                'image_reference': img_filename,
+                                'filepath': img_path,
+                                'width': base_image["width"],
+                                'height': base_image["height"],
+                                'xref': xref
+                            }
+                            images.append(img_data)
+                            print(f"    ✅ Extracted image: {img_filename} ({base_image['width']}x{base_image['height']})")
+            doc.close()
+        except Exception as e:
+            print(f"Error extracting images: {e}")
+        
+        return images
+    
+    def extract_text_with_pdfplumber(self, pdf_path, start_page, end_page):
+        """Extract text using pdfplumber with table support"""
+        text = ""
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                for page_num in range(start_page, end_page):
+                    if page_num < len(pdf.pages):
+                        page = pdf.pages[page_num]
+                        page_text = page.extract_text() or ""
+                        
+                        tables_text = ""
+                        for table in page.extract_tables():
+                            for row in table:
+                                clean_row = [self.clean_scientific_text(str(cell)) if cell else "" for cell in row]
+                                tables_text += " | ".join(clean_row) + "\n"
+                        
+                        cleaned_page_text = self.clean_scientific_text(page_text)
+                        text += f"\n--- Page {page_num + 1} ---\n{cleaned_page_text}\n"
+                        if tables_text.strip():
+                            text += f"TABLES:\n{tables_text}\n"
+                            
+        except Exception as e:
+            print(f"Error extracting text: {e}")
+        
+        return text
+    
+    def assign_images_to_questions(self, questions, images, pdf_name):
+        """Assign images to questions based on content analysis and page proximity"""
+        if not images:
+            return questions
+            
+        for question in questions:
+            if not question.get('image_reference') and images:
+                question['image_reference'] = images[0]['image_reference']
+        
+        return questions
+    
+    def fallback_extraction(self, text, page_range):
+        """Fallback extraction if AI fails"""
+        questions = []
+        
+        question_pattern = r'(\d+)[\.\)]\s*(.*?)(?=\d+[\.\)]|Answer:|$|Explanation:)'
+        matches = re.finditer(question_pattern, text, re.DOTALL | re.IGNORECASE)
+        
+        for match in matches:
+            question_number = match.group(1)
+            question_content = self.clean_scientific_text(match.group(2))
+            
+            questions.append({
+                "question_number": question_number,
+                "instruction": "",
+                "question": question_content,
+                "options": {},
+                "correct_option": "",
+                "explanation": "",
+                "image_reference": ""
+            })
+        
+        return {"questions": questions}
+    
+    def process_batch(self, pdf_path, start_page, end_page, output_dir):
+        """Process a batch of pages with AI enhancement"""
+        pdf_name = Path(pdf_path).stem
+        print(f"    Processing pages {start_page + 1} to {end_page} with AI...")
+        
+        images_dir = output_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        
+        text = self.extract_text_with_pdfplumber(pdf_path, start_page, end_page)
+        page_numbers = list(range(start_page, end_page))
+        images = self.extract_images_from_pages(pdf_path, page_numbers, images_dir, pdf_name)
+        
+        page_range = f"{start_page + 1}-{end_page}"
+        
+        if self.api_key and text.strip():
+            ai_result = self.extract_with_ai(text, images, page_range, pdf_name)
+            questions = ai_result.get("questions", [])
+            questions = self.assign_images_to_questions(questions, images, pdf_name)
+        else:
+            questions = self.fallback_extraction(text, page_range).get("questions", [])
+            questions = self.assign_images_to_questions(questions, images, pdf_name)
+        
+        print(f"    ✅ AI extracted {len(questions)} questions, found {len(images)} images")
+        return questions
+    
+    def process_pdf(self, pdf_path, output_dir):
+        """Process a single PDF file"""
+        pdf_name = Path(pdf_path).stem
+        print(f"📄 Processing: {os.path.basename(pdf_path)}")
+        
+        all_questions = []
+        
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                total_pages = len(pdf.pages)
+                print(f"  📖 Total pages: {total_pages}")
+                
+                self.image_counter = 0
+                
+                for batch_start in range(0, total_pages, self.pages_per_batch):
+                    batch_end = min(batch_start + self.pages_per_batch, total_pages)
+                    
+                    batch_questions = self.process_batch(pdf_path, batch_start, batch_end, output_dir)
+                    all_questions.extend(batch_questions)
+                    
+                    if self.api_key:
+                        time.sleep(2)
+        
+        except Exception as e:
+            print(f"❌ Error processing {pdf_path}: {e}")
+        
+        return all_questions
+    
+    def save_database_csv(self, questions, output_path, pdf_name):
+        """Save questions as CSV with HTML-formatted content in each column"""
+        with open(output_path, 'w', newline='', encoding='utf-8') as csvfile:
+            writer = csv.writer(csvfile)
+            
+            # Write header
+            headers = [
+                'Question Number', 
+                'Instruction', 
+                'Question', 
+                'Option A', 
+                'Option B', 
+                'Option C', 
+                'Option D', 
+                'Option E', 
+                'Option F',
+                'Correct Option', 
+                'Answer/Explanation', 
+                'Image Reference'
+            ]
+            writer.writerow(headers)
+            
+            # Write data - ALL columns contain HTML-formatted text
+            for q in questions:
+                options = q.get('options', {})
+                row = [
+                    q.get('question_number', ''),  # Plain text for question number
+                    q.get('instruction', ''),      # HTML formatted
+                    q.get('question', ''),         # HTML formatted
+                    options.get('A', ''),          # HTML formatted
+                    options.get('B', ''),          # HTML formatted
+                    options.get('C', ''),          # HTML formatted
+                    options.get('D', ''),          # HTML formatted
+                    options.get('E', ''),          # HTML formatted
+                    options.get('F', ''),          # HTML formatted
+                    q.get('correct_option', ''),   # Plain text (A, B, C, etc.)
+                    q.get('explanation', ''),      # HTML formatted
+                    q.get('image_reference', '')   # Plain text filename
+                ]
+                writer.writerow(row)
+    
+    def process_folder(self, folder_path, output_dir=None, max_workers=2):
+        """Process all PDFs in a folder with parallel processing"""
+        folder_path = Path(folder_path)
+        pdf_files = list(folder_path.glob("*.pdf"))
+        
+        if not pdf_files:
+            print(f"No PDF files found in {folder_path}")
+            return []
+        
+        print(f"📁 Found {len(pdf_files)} PDF files to process")
+        
+        if output_dir is None:
+            output_dir = folder_path / "html_ready_output"
+        output_dir = Path(output_dir)
+        output_dir.mkdir(exist_ok=True)
+        
+        images_dir = output_dir / "images"
+        images_dir.mkdir(exist_ok=True)
+        
+        all_questions = []
+        
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_pdf = {
+                executor.submit(self.process_pdf, pdf_file, output_dir): pdf_file 
+                for pdf_file in pdf_files
+            }
+            
+            for future in as_completed(future_to_pdf):
+                pdf_file = future_to_pdf[future]
+                try:
+                    questions = future.result()
+                    all_questions.extend(questions)
+                    
+                    # Save individual CSV with HTML-formatted content
+                    individual_csv = output_dir / f"{pdf_file.stem}_html_ready.csv"
+                    self.save_database_csv(questions, individual_csv, pdf_file.stem)
+                    
+                    print(f"✅ Completed: {pdf_file.name}")
+                    print(f"   - Questions extracted: {len(questions)}")
+                    print(f"   - HTML-ready CSV: {individual_csv}")
+                    
+                except Exception as e:
+                    print(f"❌ Failed to process {pdf_file}: {e}")
+        
+        # Save combined CSV with HTML-formatted content
+        if all_questions:
+            combined_csv = output_dir / "ALL_QUESTIONS_HTML_READY.csv"
+            self.save_database_csv(all_questions, combined_csv, "All PDFs Combined")
+            print(f"\n✅ Combined HTML-ready CSV saved: {combined_csv}")
+            print(f"   Total questions across all files: {len(all_questions)}")
+        
+        image_files = list(images_dir.glob("*.png"))
+        print(f"   Total images extracted: {len(image_files)}")
+        print(f"   Images folder: {images_dir}")
+        
+        return all_questions
+
+# Usage example
+if __name__ == "__main__":
+    DEEPSEEK_API_KEY = "your_deepseek_api_key_here"
+    
+    extractor = DeepSeekQuestionExtractor(api_key=DEEPSEEK_API_KEY)
+    
+    folder_path = r"C:\Users\menha\Downloads\test"
+    
+    print("🚀 Starting PDF to HTML-Ready CSV Conversion...")
+    print("=" * 60)
+    print("Now generating CSV with HTML-formatted content in each column:")
+    print("- All text columns contain HTML-ready content")
+    print("- Scientific notation: L<sub>h</sub>, H<sub>2</sub>O")
+    print("- Aromatic compounds: C<sub>6</sub>H<sub>6</sub>")
+    print("- Mathematical symbols: α, β, →")
+    print("- Ready for direct database import and web parsing")
+    print("=" * 60)
+    
+    results = extractor.process_folder(folder_path)
+    
+    print("\n" + "=" * 60)
+    print("🎉 HTML-Ready CSV Conversion Completed!")
+    print("CSV files contain HTML-formatted text ready for database import!")
